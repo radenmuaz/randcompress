@@ -140,7 +140,7 @@ def train_step(
     loss, grads = jax.value_and_grad(loss_fn)(params)
     
     updates, optimizer_state = optimizer.update(grads, optimizer_state, params)
-    params = jax.tree_map(lambda p, u: p + u, params, updates)
+    params = jax.tree_util.tree_map(lambda p, u: p + u, params, updates)
     
     return params, optimizer_state, loss
 
