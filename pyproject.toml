@@ -10,16 +10,23 @@ readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "Raden Muaz Munim"}]
 requires-python = ">=3.10"
-dependencies = ["jax"]
+dependencies = ["jax", "tqdm", "optax"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
 
+[project.optional-dependencies]
+compress = ["zstandard", "lz4"]
+bench = ["zstandard", "lz4"]
+dev = ["zstandard", "lz4", "pytest"]
+
 [project.urls]
 Repository = "https://github.com/yourusername/randcompress"
+
+[tool.setuptools]
+packages = ["randcompress"]

@@ -1,0 +1,78 @@
+{
+  "file": "/Users/muaz/code/randcompress/datasets/quran-uthmani.txt",
+  "original_size": 1359946,
+  "algorithms": [
+    {
+      "name": "store (no compression)",
+      "original_size": 1359946,
+      "compressed_size": 1359946,
+      "compression_ratio": 1.0,
+      "compress_time_ms": 0.0002910001057898626,
+      "decompress_time_ms": 0.00020800052880076692,
+      "total_time_ms": 0.0004990006345906295,
+      "throughput_compress_mbps": 4456856.015151989,
+      "throughput_decompress_mbps": 6235299.397443802,
+      "space_saved_percent": 0.0
+    },
+    {
+      "name": "gzip (level 9)",
+      "original_size": 1359946,
+      "compressed_size": 267206,
+      "compression_ratio": 5.089503978204082,
+      "compress_time_ms": 241.7890829992757,
+      "decompress_time_ms": 0.9141660002569552,
+      "total_time_ms": 242.70324899953266,
+      "throughput_compress_mbps": 5.3639542191543,
+      "throughput_decompress_mbps": 278.7540767410089,
+      "space_saved_percent": 80.35171984769983
+    },
+    {
+      "name": "bzip2 (level 9)",
+      "original_size": 1359946,
+      "compressed_size": 156578,
+      "compression_ratio": 8.685421962216914,
+      "compress_time_ms": 75.20424999984243,
+      "decompress_time_ms": 17.620499999793537,
+      "total_time_ms": 92.82474999963597,
+      "throughput_compress_mbps": 17.245641993665668,
+      "throughput_decompress_mbps": 8.474471048835587,
+      "space_saved_percent": 88.48645460922712
+    },
+    {
+      "name": "lzma/xz (preset 9)",
+      "original_size": 1359946,
+      "compressed_size": 177412,
+      "compression_ratio": 7.665467950307758,
+      "compress_time_ms": 321.0731659992234,
+      "decompress_time_ms": 7.4756250005521,
+      "total_time_ms": 328.5487909997755,
+      "throughput_compress_mbps": 4.039408176211621,
+      "throughput_decompress_mbps": 22.632658514809147,
+      "space_saved_percent": 86.9544820161977
+    },
+    {
+      "name": "zstandard (level 22)",
+      "original_size": 1359946,
+      "compressed_size": 178727,
+      "compression_ratio": 7.60906857945358,
+      "compress_time_ms": 345.64491599940084,
+      "decompress_time_ms": 0.6087089996071882,
+      "total_time_ms": 346.253624999008,
+      "throughput_compress_mbps": 3.7522483678066374,
+      "throughput_decompress_mbps": 280.01450554917517,
+      "space_saved_percent": 86.85778700036619
+    },
+    {
+      "name": "LZ4 (level 12)",
+      "original_size": 1359946,
+      "compressed_size": 289172,
+      "compression_ratio": 4.7028965460003045,
+      "compress_time_ms": 142.19908300037787,
+      "decompress_time_ms": 0.38912499985599425,
+      "total_time_ms": 142.58820800023386,
+      "throughput_compress_mbps": 9.120632457917944,
+      "throughput_decompress_mbps": 708.7077662085092,
+      "space_saved_percent": 78.73650865549074
+    }
+  ]
+}

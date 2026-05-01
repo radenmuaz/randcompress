@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Compression Benchmark Report</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            background-color: #f5f5f5;
+        }
+        h1, h2 {
+            color: #333;
+        }
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            background-color: white;
+            margin: 20px 0;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        th, td {
+            border: 1px solid #ddd;
+            padding: 12px;
+            text-align: left;
+        }
+        th {
+            background-color: #4CAF50;
+            color: white;
+            font-weight: bold;
+        }
+        tr:nth-child(even) {
+            background-color: #f9f9f9;
+        }
+        tr:hover {
+            background-color: #f0f0f0;
+        }
+        .metric-info {
+            background-color: #e8f5e9;
+            padding: 10px;
+            border-radius: 4px;
+            margin: 10px 0;
+        }
+        .best {
+            background-color: #fff9c4;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <h1>Compression Algorithm Benchmark Report</h1>
+    
+    <div class="metric-info">
+        <p><strong>Dataset:</strong> /Users/muaz/code/randcompress/datasets/quran-uthmani.txt</p>
+        <p><strong>Original Size:</strong> 1,359,946 bytes (1.30 MB)</p>
+    </div>
+    
+    <h2>Algorithm Comparison</h2>
+    <table>
+        <tr>
+            <th>Algorithm</th>
+            <th>Compressed Size (B)</th>
+            <th>Compression Ratio</th>
+            <th>Space Saved (%)</th>
+            <th>Compress Time (ms)</th>
+            <th>Decompress Time (ms)</th>
+            <th>Total Time (ms)</th>
+            <th>Compress Throughput (MB/s)</th>
+        </tr>
+        <tr>
+            <td>bzip2 (level 9)</td>
+            <td>156,578</td>
+            <td class="best">8.69x</td>
+            <td>88.5%</td>
+            <td>75.20</td>
+            <td>17.62</td>
+            <td>92.82</td>
+            <td>17.25</td>
+        </tr>
+        <tr>
+            <td>lzma/xz (preset 9)</td>
+            <td>177,412</td>
+            <td>7.67x</td>
+            <td>87.0%</td>
+            <td>321.07</td>
+            <td>7.48</td>
+            <td>328.55</td>
+            <td>4.04</td>
+        </tr>
+        <tr>
+            <td>zstandard (level 22)</td>
+            <td>178,727</td>
+            <td>7.61x</td>
+            <td>86.9%</td>
+            <td>345.64</td>
+            <td>0.61</td>
+            <td>346.25</td>
+            <td>3.75</td>
+        </tr>
+        <tr>
+            <td>gzip (level 9)</td>
+            <td>267,206</td>
+            <td>5.09x</td>
+            <td>80.4%</td>
+            <td>241.79</td>
+            <td>0.91</td>
+            <td>242.70</td>
+            <td>5.36</td>
+        </tr>
+        <tr>
+            <td>LZ4 (level 12)</td>
+            <td>289,172</td>
+            <td>4.70x</td>
+            <td>78.7%</td>
+            <td>142.20</td>
+            <td>0.39</td>
+            <td>142.59</td>
+            <td>9.12</td>
+        </tr>
+        <tr>
+            <td>store (no compression)</td>
+            <td>1,359,946</td>
+            <td>1.00x</td>
+            <td>0.0%</td>
+            <td class="best">0.00</td>
+            <td>0.00</td>
+            <td>0.00</td>
+            <td>4456856.02</td>
+        </tr>
+    </table>
+</body>
+</html>
