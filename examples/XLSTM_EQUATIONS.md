@@ -147,7 +147,8 @@ For efficient computation over full sequences, mLSTM can be parallelized:
 
 For timesteps $i, j$ within a chunk where $j \leq i$:
 
-$$\text{log\_fg\_matrix}[i, j] = \sum_{k=j}^{i-1} \log\sigma(f_{\text{raw}}_k) + i_{\text{raw}}_i$$
+<!-- $$\text{log\_fg\_matrix}[i, j] = \sum_{k=j}^{i-1} \log\sigma(f_{\text{raw}}_k) + i_{\text{raw}}_i$$ -->
+$$\text{log\_fg\_matrix}[i, j] = \sum_{k=j}^{i-1} \log\sigma(f_rawk) + i_rawk_i$$
 
 ### Decay Matrix with Stabilization
 

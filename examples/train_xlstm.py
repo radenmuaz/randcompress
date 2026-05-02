@@ -492,13 +492,10 @@ def forward_pass(params: xLSTMParams, tokens: jnp.ndarray, states: xLSTMStates):
     # Embedding lookup
     x = params.embedding[tokens]  # [B, T, d_model]
     
-    # Process through blocks
-    for block_idx, block in enumerate(params.blocks):
-        # Process sequence
-        outputs = []
-        for t in range(T):
-            x_t = x[:, t, :]  # [B, d_model]
-            
+    outputs = []
+    for t in range(T):
+        x_t = x[:, t, :]  # [B, d_model]
+        for block_idx, block in enumerate(params.blocks):
             # sLSTM path
             slstm_state, slstm_out = slstm_step(block.slstm, slstm_states[block_idx], x_t)
             mlstm_state, mlstm_out = mlstm_step(block.mlstm, mlstm_states[block_idx], x_t)
@@ -514,9 +511,9 @@ def forward_pass(params: xLSTMParams, tokens: jnp.ndarray, states: xLSTMStates):
             ffn_out = jnp.dot(hidden, block.ff_w2.T) + block.ff_b2
             
             # Residual connection
-            x_t_out = x_t + combined + ffn_out
+            x_t = x_t + combined + ffn_out
             
-            outputs.append(x_t_out)
+        outputs.append(x_t)
         
         x = jnp.stack(outputs, axis=1)  # [B, T, d_model]
     
@@ -705,9 +702,10 @@ def train_step(
     # Split into input and target
     inputs = batch[:, :-1]
     targets = batch[:, 1:]
+    states = init_xlstm_states(config, batch_size=batch.shape[0])
     
     def loss_fn(p):
-        logits = forward_pass(p, inputs, config)
+        logits, _ = forward_pass(p, inputs, states)
         return cross_entropy_loss(logits, targets)
     
     loss, grads = jax.value_and_grad(loss_fn)(params)
@@ -723,7 +721,8 @@ def eval_step(params: xLSTMParams, batch: jnp.ndarray, config: Config):
     inputs = batch[:, :-1]
     targets = batch[:, 1:]
     
-    logits = forward_pass(params, inputs, config)
+    states = init_xlstm_states(config, batch_size=batch.shape[0])
+    logits, _ = forward_pass(params, inputs, states)
     loss = cross_entropy_loss(logits, targets)
     
     return loss
@@ -801,8 +800,8 @@ def main():
     print(f"Steps per epoch: {steps_per_epoch}")
     print("=" * 60)
     
-    # for epoch in range(num_epochs):
-    if False:
+    for epoch in range(num_epochs):
+    # if False:
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
         
         # ========== Training ==========
