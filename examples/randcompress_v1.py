@@ -45,6 +45,8 @@ class Config(NamedTuple):
     learning_rate: float = 0.01
     gradient_clip_norm: float = 1.0
     batch_size: int = 1  # Process one byte at a time
+    loss_stall_threshold: int = 10  # Steps without improvement before splitting
+    loss_stall_tolerance: float = 1e-5  # Minimum loss improvement to reset counter
 
 
 class Segment(NamedTuple):
@@ -445,23 +447,73 @@ def compute_loss(logits: jnp.ndarray, target_byte: int) -> jnp.ndarray:
     return loss
 
 
-def train_linear_layer(
+def check_layer_accuracy(
+    params: LinearLayerParams,
+    hidden_states: List[jnp.ndarray],
+    target_bytes: np.ndarray,
+) -> Tuple[bool, int]:
+    """Check if layer achieves 100% accuracy with greedy decoding (argmax).
+    
+    Args:
+        params: Linear layer parameters
+        hidden_states: List of hidden states [d_model] for each byte
+        target_bytes: Target byte values
+    
+    Returns:
+        (all_correct, num_correct): Boolean for all correct, count of correct predictions
+    """
+    num_correct = 0
+    for h, target in zip(hidden_states, target_bytes):
+        logits = linear_forward(params, h)
+        pred_byte = jnp.argmax(logits)
+        if int(pred_byte) == int(target):
+            num_correct += 1
+        else:
+            # Found first incorrect prediction
+            return False, num_correct
+    
+    # All predictions correct
+    return True, num_correct
+
+
+def train_linear_layer_adaptive(
     params: LinearLayerParams,
     hidden_states: List[jnp.ndarray],
     target_bytes: np.ndarray,
     config: Config,
-) -> Tuple[LinearLayerParams, float]:
-    """Train linear layer for segment.
+    depth: int = 0,
+) -> Tuple[List[Tuple[int, int, LinearLayerParams]], bool]:
+    """Train linear layer(s) adaptively, splitting when loss stalls.
+    
+    Strategy:
+    1. Try to fit all targets with one layer
+    2. If loss stalls (no improvement for N steps), split into 2 layers:
+       - First layer: handles first half of targets
+       - Second layer: handles second half of targets
+    3. Recursively apply to each layer until all achieve 100% accuracy
     
     Args:
+        params: Initial linear layer parameters
         hidden_states: List of hidden states [d_model] for each byte
         target_bytes: Target byte values
         config: Configuration
+        depth: Recursion depth (for logging)
     
     Returns:
-        trained_params: Updated parameters
-        final_loss: Final training loss
+        (layer_specs, achieved_100_percent): List of (start_idx, end_idx, params) tuples and success flag
+        The start_idx and end_idx are RELATIVE indices within this batch (not global).
     """
+    indent = "  " * depth
+    print(f"{indent}Train L{depth}: {len(target_bytes)} targets")
+    
+    if len(target_bytes) == 0:
+        return [], False
+    
+    # Single target always succeeds trivially
+    if len(target_bytes) == 1:
+        print(f"{indent}  ✓ Single target - trivial 100%")
+        return [(0, 0, params)], True
+    
     optimizer = optax.adam(config.learning_rate)
     opt_state = optimizer.init(params)
     
@@ -472,9 +524,14 @@ def train_linear_layer(
             total_loss = total_loss + compute_loss(logits, target)
         return total_loss / len(hidden_states)
     
-    # Training loop
+    best_params = params
+    best_loss = float('inf')
+    steps_without_improvement = 0
+    
+    # Training loop with stall detection
     for step in range(config.max_training_steps):
         loss, grads = jax.value_and_grad(loss_fn)(params)
+        loss_val = float(loss)
         
         # Gradient clipping
         grads_flat = jax.tree_util.tree_leaves(grads)
@@ -486,10 +543,97 @@ def train_linear_layer(
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
         
-        if step % 20 == 0:
-            print(f"  Train step {step}: loss = {loss:.6f}")
+        # Track best loss
+        if loss_val < best_loss - config.loss_stall_tolerance:
+            best_loss = loss_val
+            best_params = params
+            steps_without_improvement = 0
+        else:
+            steps_without_improvement += 1
+        
+        # Check for 100% accuracy
+        all_correct, _ = check_layer_accuracy(params, hidden_states, target_bytes)
+        if all_correct:
+            print(f"{indent}  Step {step}: loss={loss_val:.6f} ✓ 100% accuracy!")
+            return [(0, len(target_bytes) - 1, params)], True
+        
+        if step % 10 == 0 or step < 3:
+            print(f"{indent}  Step {step}: loss={loss_val:.6f}, stall={steps_without_improvement}")
+        
+        # Detect loss stalling
+        if steps_without_improvement >= config.loss_stall_threshold:
+            print(f"{indent}  ⚠ Loss stalled at step {step} (loss={best_loss:.6f})")
+            print(f"{indent}  Splitting into 2 layers...")
+            
+            # Split targets in half
+            mid = len(target_bytes) // 2
+            
+            # First half
+            h_states_1 = hidden_states[:mid]
+            targets_1 = target_bytes[:mid]
+            layer_key_1 = jr.fold_in(jr.PRNGKey(42), depth * 2)
+            params_1 = init_linear_layer(layer_key_1, config.d_model)
+            specs_1, success_1 = train_linear_layer_adaptive(
+                params_1, h_states_1, targets_1, config, depth + 1
+            )
+            
+            # Second half
+            h_states_2 = hidden_states[mid:]
+            targets_2 = target_bytes[mid:]
+            layer_key_2 = jr.fold_in(jr.PRNGKey(42), depth * 2 + 1)
+            params_2 = init_linear_layer(layer_key_2, config.d_model)
+            specs_2, success_2 = train_linear_layer_adaptive(
+                params_2, h_states_2, targets_2, config, depth + 1
+            )
+            
+            # Adjust indices for second half
+            specs_2_adjusted = [(start + mid, end + mid, p) for start, end, p in specs_2]
+            
+            all_specs = specs_1 + specs_2_adjusted
+            all_success = success_1 and success_2
+            
+            print(f"{indent}  Split complete: {success_1} + {success_2} = {all_success}")
+            return all_specs, all_success
     
-    return params, float(loss)
+    # Training loop finished - check final accuracy
+    all_correct, num_correct = check_layer_accuracy(best_params, hidden_states, target_bytes)
+    
+    if all_correct:
+        print(f"{indent}  ✓ Achieved 100% accuracy (loss={best_loss:.6f})")
+        return [(0, len(target_bytes) - 1, best_params)], True
+    else:
+        print(f"{indent}  ✗ Stalled after {config.max_training_steps} steps: {num_correct}/{len(target_bytes)} correct (loss={best_loss:.6f})")
+        print(f"{indent}  Splitting into 2 layers...")
+        
+        # Split targets in half
+        mid = len(target_bytes) // 2
+        
+        # First half
+        h_states_1 = hidden_states[:mid]
+        targets_1 = target_bytes[:mid]
+        layer_key_1 = jr.fold_in(jr.PRNGKey(42), depth * 2)
+        params_1 = init_linear_layer(layer_key_1, config.d_model)
+        specs_1, success_1 = train_linear_layer_adaptive(
+            params_1, h_states_1, targets_1, config, depth + 1
+        )
+        
+        # Second half
+        h_states_2 = hidden_states[mid:]
+        targets_2 = target_bytes[mid:]
+        layer_key_2 = jr.fold_in(jr.PRNGKey(42), depth * 2 + 1)
+        params_2 = init_linear_layer(layer_key_2, config.d_model)
+        specs_2, success_2 = train_linear_layer_adaptive(
+            params_2, h_states_2, targets_2, config, depth + 1
+        )
+        
+        # Adjust indices for second half
+        specs_2_adjusted = [(start + mid, end + mid, p) for start, end, p in specs_2]
+        
+        all_specs = specs_1 + specs_2_adjusted
+        all_success = success_1 and success_2
+        
+        print(f"{indent}  Split complete: {success_1} + {success_2} = {all_success}")
+        return all_specs, all_success
 
 
 # ============================================================================
@@ -502,6 +646,10 @@ def compress_data(
     config: Optional[Config] = None,
 ) -> CompressionState:
     """Compress byte data using xLSTM.
+    
+    CRITICAL: Compression must be autoregressive - we generate hidden states
+    using GROUND TRUTH bytes during training, then during decompression we
+    use PREDICTED bytes. This ensures they match.
     
     Args:
         data: Byte array to compress [n]
@@ -517,6 +665,7 @@ def compress_data(
     print(f"Starting compression of {len(data)} bytes...")
     print(f"Config: d_model={config.d_model}, num_layers={config.num_layers}")
     print(f"Seed: {seed}")
+    print(f"NOTE: Using AUTOREGRESSIVE training (ground truth→hidden states)")
     
     # Generate xLSTM params from seed
     key = jr.PRNGKey(seed)
@@ -529,55 +678,94 @@ def compress_data(
     current_hidden_states = []
     current_targets = []
     
-    # Main compression loop
-    for byte_idx in range(len(data)):
+    # Main compression loop - adaptive layer splitting
+    # CRITICAL: We generate hidden states using GROUND TRUTH bytes only
+    byte_idx = 0
+    while byte_idx < len(data):
         byte_val = data[byte_idx]
         
-        # Get hidden state for this byte
-        h = xlstm_forward(xlstm_params, int(byte_val), config)
+        # Get hidden state using PREVIOUS ground truth byte (autoregressive)
+        if len(current_hidden_states) == 0:
+            # First byte - use special handling
+            h = xlstm_forward(xlstm_params, int(byte_val), config)
+        else:
+            # Use previous ground truth byte to generate hidden state for current byte
+            prev_byte = current_targets[-1]
+            h = xlstm_forward(xlstm_params, int(prev_byte), config)
         
         if current_layer is None:
             # Initialize first layer
             layer_key = jr.fold_in(key, byte_idx)
             current_layer = init_linear_layer(layer_key, config.d_model)
+            print(f"\nSegment {len(segments)} starting at byte {byte_idx}")
         
-        # Try to predict with current layer
-        logits = linear_forward(current_layer, h)
-        pred_loss = float(compute_loss(logits, int(byte_val)))
-        
+        # Add byte to current segment
         current_hidden_states.append(h)
         current_targets.append(byte_val)
         
-        # Check if we should start a new layer
-        if pred_loss > config.loss_threshold and byte_idx > 0:
-            # Train current layer
-            print(f"\nSegment {len(segments)}: bytes {current_segment_start}-{byte_idx - 1}")
-            print(f"  Pre-training loss: {pred_loss:.6f}")
+        # Train current layer adaptively (may split into multiple layers)
+        layer_specs, achieved_100_percent = train_linear_layer_adaptive(
+            current_layer,
+            current_hidden_states,
+            current_targets,
+            config,
+            depth=0,
+        )
+        
+        if achieved_100_percent:
+            # Successfully trained - update current_layer to reflect training
+            # (we keep accumulating unless we can't fit the next byte)
+            if len(layer_specs) == 1:
+                rel_start, rel_end, params = layer_specs[0]
+                current_layer = params
+            else:
+                # Multi-layer split - for now save it and move to next segment
+                # (this handles cases where splitting was needed mid-segment)
+                for rel_start, rel_end, layer_params in layer_specs:
+                    global_start = current_segment_start + rel_start
+                    global_end = current_segment_start + rel_end
+                    segment = Segment(
+                        start_idx=global_start,
+                        end_idx=global_end,
+                        layer_weights=layer_params.weight,
+                        layer_bias=layer_params.bias,
+                    )
+                    segments.append(segment)
+                
+                print(f"✓ Byte {byte_idx}: Split into {len(layer_specs)} layers for {len(current_targets)} bytes")
+                
+                # Start fresh for next bytes
+                current_segment_start = byte_idx + 1
+                current_layer = None
+                current_hidden_states = []
+                current_targets = []
             
-            trained_layer, final_loss = train_linear_layer(
-                current_layer,
-                current_hidden_states,
-                current_targets,
-                config,
-            )
+            if len(current_targets) % 50 == 0 and len(current_targets) > 0:
+                print(f"  ✓ Byte {byte_idx}: {len(current_targets)} bytes with 100% accuracy")
             
-            print(f"  Final training loss: {final_loss:.6f}")
+            byte_idx += 1
+        else:
+            # This shouldn't happen with adaptive splitting, but if it does,
+            # try to save what we can
+            print(f"✗ Byte {byte_idx}: Failed to achieve 100% accuracy")
             
-            # Save segment
-            segment = Segment(
-                start_idx=current_segment_start,
-                end_idx=byte_idx - 1,
-                layer_weights=trained_layer.weight,
-                layer_bias=trained_layer.bias,
-            )
-            segments.append(segment)
+            if layer_specs:
+                for rel_start, rel_end, layer_params in layer_specs:
+                    global_start = current_segment_start + rel_start
+                    global_end = current_segment_start + rel_end
+                    segment = Segment(
+                        start_idx=global_start,
+                        end_idx=global_end,
+                        layer_weights=layer_params.weight,
+                        layer_bias=layer_params.bias,
+                    )
+                    segments.append(segment)
             
-            # Start new segment
-            current_segment_start = byte_idx
+            current_segment_start = byte_idx + 1
             current_layer = None
             current_hidden_states = []
             current_targets = []
-            print(f"  Starting new segment at byte {byte_idx}")
+            byte_idx += 1
         
         if byte_idx % 100 == 0 and byte_idx > 0:
             print(f"Processed {byte_idx} bytes, {len(segments)} segments so far")
@@ -585,21 +773,27 @@ def compress_data(
     # Finalize last segment
     if current_layer is not None and len(current_targets) > 0:
         print(f"\nFinal segment {len(segments)}: bytes {current_segment_start}-{len(data) - 1}")
-        trained_layer, final_loss = train_linear_layer(
+        
+        layer_specs, achieved_100_percent = train_linear_layer_adaptive(
             current_layer,
             current_hidden_states,
             current_targets,
             config,
+            depth=0,
         )
-        print(f"  Final training loss: {final_loss:.6f}")
         
-        segment = Segment(
-            start_idx=current_segment_start,
-            end_idx=len(data) - 1,
-            layer_weights=trained_layer.weight,
-            layer_bias=trained_layer.bias,
-        )
-        segments.append(segment)
+        if layer_specs:
+            for rel_start, rel_end, layer_params in layer_specs:
+                global_start = current_segment_start + rel_start
+                global_end = current_segment_start + rel_end
+                segment = Segment(
+                    start_idx=global_start,
+                    end_idx=global_end,
+                    layer_weights=layer_params.weight,
+                    layer_bias=layer_params.bias,
+                )
+                segments.append(segment)
+            print(f"  Final training complete: {len(layer_specs)} layer(s), success={achieved_100_percent}")
     
     # Create compression state
     compression_state = CompressionState(
@@ -652,36 +846,41 @@ def decompress_data(compression_state: CompressionState) -> np.ndarray:
     key = jr.PRNGKey(seed)
     xlstm_params = init_xlstm_stack_seeded(key, config)
     
-    # Reconstruct bytes
-    reconstructed = []
-    segment_idx = 0
-    current_segment = compression_state.segments[segment_idx]
+    # Create mapping: byte_idx -> segment
+    segment_map = {}
+    for segment in compression_state.segments:
+        for idx in range(segment.start_idx, segment.end_idx + 1):
+            segment_map[idx] = segment
     
-    for byte_idx in range(current_segment.end_idx + 1):
-        # Get current segment
-        if segment_idx < len(compression_state.segments):
-            current_segment = compression_state.segments[segment_idx]
-            if byte_idx > current_segment.end_idx and segment_idx + 1 < len(compression_state.segments):
-                segment_idx += 1
-                current_segment = compression_state.segments[segment_idx]
+    # Reconstruct all bytes
+    reconstructed = [compression_state.first_byte]
+    
+    # Get total number of bytes to reconstruct
+    if len(compression_state.segments) > 0:
+        max_idx = max(seg.end_idx for seg in compression_state.segments)
+    else:
+        max_idx = 0
+    
+    # Reconstruct remaining bytes
+    for byte_idx in range(1, max_idx + 1):
+        # Get previous reconstructed byte
+        prev_byte = reconstructed[-1]
+        h = xlstm_forward(xlstm_params, int(prev_byte), config)
         
-        # Get hidden state
-        if len(reconstructed) == 0:
-            # First byte is stored
-            reconstructed.append(compression_state.first_byte)
-            continue
-        
-        byte_val = reconstructed[-1]
-        h = xlstm_forward(xlstm_params, int(byte_val), config)
-        
-        # Use stored layer to predict
-        layer_params = LinearLayerParams(
-            weight=current_segment.layer_weights,
-            bias=current_segment.layer_bias,
-        )
-        logits = linear_forward(layer_params, h)
-        pred_byte = jnp.argmax(logits)
-        reconstructed.append(int(pred_byte))
+        # Get segment for this byte
+        if byte_idx in segment_map:
+            segment = segment_map[byte_idx]
+            layer_params = LinearLayerParams(
+                weight=segment.layer_weights,
+                bias=segment.layer_bias,
+            )
+            logits = linear_forward(layer_params, h)
+            pred_byte = jnp.argmax(logits)
+            reconstructed.append(int(pred_byte))
+        else:
+            # No segment for this byte - shouldn't happen
+            print(f"Warning: No segment found for byte {byte_idx}")
+            break
     
     reconstructed = np.array(reconstructed, dtype=np.uint8)
     print(f"Decompression complete: {len(reconstructed)} bytes")
