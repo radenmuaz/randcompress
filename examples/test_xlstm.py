@@ -209,7 +209,7 @@ def test_gradient_flow():
         d_head=32,
         d_ff=256,
         num_layers=1,
-        max_seq_len=256,
+        max_seq_len=1024,
         batch_size=2,
     )
     

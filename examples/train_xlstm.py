@@ -13,19 +13,7 @@ import time
 from tqdm import tqdm
 from pathlib import Path
 import optax
-
-"""
-Pure JAX implementation of xLSTM (Extended LSTM).
-Includes sLSTM, mLSTM, and combined xLSTM blocks.
-Based on: https://arxiv.org/abs/2405.04517
-"""
-
-import jax
-import jax.numpy as jnp
-import jax.random as jr
-import numpy as np
 from typing import Dict, Tuple, NamedTuple, Optional
-from functools import partial
 import math
 
 
@@ -127,18 +115,26 @@ def init_slstm_params(key, d_in, d_hidden, scale=0.01):
     
     ln_weight = jnp.ones((d_hidden,))
     ln_bias = jnp.zeros((d_hidden,))
-    
-    return sLSTMParams(Wx, Ry, b, ln_weight, ln_bias)
+    return sLSTMParams(Wx.astype(jnp.bfloat16), Ry.astype(jnp.bfloat16),
+                       b.astype(jnp.bfloat16), ln_weight.astype(jnp.bfloat16),
+                       ln_bias.astype(jnp.bfloat16))
+    # return sLSTMParams(Wx, Ry, b, ln_weight, ln_bias)
 
 
 def init_slstm_state(batch_size, d_hidden):
     """Initialize sLSTM state."""
     return sLSTMState(
-        y=jnp.zeros((batch_size, d_hidden)),
-        c=jnp.zeros((batch_size, d_hidden)),
-        n=jnp.zeros((batch_size, d_hidden)),
-        m=jnp.zeros((batch_size, d_hidden)),
+        y=jnp.zeros((batch_size, d_hidden)).astype(jnp.bfloat16),
+        c=jnp.zeros((batch_size, d_hidden)).astype(jnp.bfloat16),
+        n=jnp.zeros((batch_size, d_hidden)).astype(jnp.bfloat16),
+        m=jnp.zeros((batch_size, d_hidden)).astype(jnp.bfloat16),
     )
+    # return sLSTMState(
+    #     y=jnp.zeros((batch_size, d_hidden)),
+    #     c=jnp.zeros((batch_size, d_hidden)),
+    #     n=jnp.zeros((batch_size, d_hidden)),
+    #     m=jnp.zeros((batch_size, d_hidden)),
+    # )
 
 
 def slstm_step(params: sLSTMParams, state: sLSTMState, x: jnp.ndarray) -> Tuple[sLSTMState, jnp.ndarray]:
@@ -232,7 +228,6 @@ class mLSTMParams(NamedTuple):
     ln_weight: jnp.ndarray
     ln_bias: jnp.ndarray
 
-
 def init_mlstm_params(key, d_in, d_model, num_heads):
     """Initialize mLSTM parameters."""
     d_h = d_model // num_heads
@@ -242,26 +237,43 @@ def init_mlstm_params(key, d_in, d_model, num_heads):
     scale_in = 1.0 / math.sqrt(d_in)
     scale_out = 1.0 / math.sqrt(d_model)
     scale_gate = 1.0 / math.sqrt(d_in)
-    
+
     return mLSTMParams(
-        W_q=jr.normal(keys[0], (num_heads, d_h, d_in)) * scale_in,
-        W_k=jr.normal(keys[1], (num_heads, d_h, d_in)) * scale_in,
-        W_v=jr.normal(keys[2], (num_heads, d_h, d_in)) * scale_in,
-        W_i=jr.normal(keys[3], (num_heads, d_in)) * scale_gate,
-        W_f=jr.normal(keys[4], (num_heads, d_in)) * scale_gate,
-        W_out=jr.normal(keys[5], (d_model, num_heads * d_h)) * scale_out,
-        ln_weight=jnp.ones((d_model,)),
-        ln_bias=jnp.zeros((d_model,)),
+        W_q=jr.normal(keys[0], (num_heads, d_h, d_in)).astype(jnp.bfloat16) * scale_in,
+        W_k=jr.normal(keys[1], (num_heads, d_h, d_in)).astype(jnp.bfloat16) * scale_in,
+        W_v=jr.normal(keys[2], (num_heads, d_h, d_in)).astype(jnp.bfloat16) * scale_in,
+        W_i=jr.normal(keys[3], (num_heads, d_in)).astype(jnp.bfloat16) * scale_gate,
+        W_f=jr.normal(keys[4], (num_heads, d_in)).astype(jnp.bfloat16) * scale_gate,
+        W_out=jr.normal(keys[5], (d_model, num_heads * d_h)).astype(jnp.bfloat16) * scale_out,
+        ln_weight=jnp.ones((d_model,)).astype(jnp.bfloat16),
+        ln_bias=jnp.zeros((d_model,)).astype(jnp.bfloat16),
     )
+    
+    # return mLSTMParams(
+    #     W_q=jr.normal(keys[0], (num_heads, d_h, d_in)) * scale_in,
+    #     W_k=jr.normal(keys[1], (num_heads, d_h, d_in)) * scale_in,
+    #     W_v=jr.normal(keys[2], (num_heads, d_h, d_in)) * scale_in,
+    #     W_i=jr.normal(keys[3], (num_heads, d_in)) * scale_gate,
+    #     W_f=jr.normal(keys[4], (num_heads, d_in)) * scale_gate,
+    #     W_out=jr.normal(keys[5], (d_model, num_heads * d_h)) * scale_out,
+    #     ln_weight=jnp.ones((d_model,)),
+    #     ln_bias=jnp.zeros((d_model,)),
+    # )
+
 
 
 def init_mlstm_state(batch_size, num_heads, d_h):
     """Initialize mLSTM state."""
     return mLSTMState(
-        C=jnp.zeros((batch_size, num_heads, d_h, d_h)),
-        n=jnp.zeros((batch_size, num_heads, d_h)),
-        m=jnp.zeros((batch_size, num_heads)),
+        C=jnp.zeros((batch_size, num_heads, d_h, d_h)).astype(jnp.bfloat16),
+        n=jnp.zeros((batch_size, num_heads, d_h)).astype(jnp.bfloat16),
+        m=jnp.zeros((batch_size, num_heads)).astype(jnp.bfloat16),
     )
+    # return mLSTMState(
+    #     C=jnp.zeros((batch_size, num_heads, d_h, d_h)),
+    #     n=jnp.zeros((batch_size, num_heads, d_h)),
+    #     m=jnp.zeros((batch_size, num_heads)),
+    # )
 
 
 def mlstm_step(
@@ -375,6 +387,9 @@ class xLSTMParams(NamedTuple):
     blocks: list  # List of xLSTMBlockParams
     output_proj: jnp.ndarray  # [d_model, vocab_size]
 
+class xLSTMStates(NamedTuple):
+    slstm_states: list
+    mlstm_states: list
 
 def init_xlstm_params(key, config: Config) -> xLSTMParams:
     """Initialize all xLSTM parameters."""
@@ -385,18 +400,14 @@ def init_xlstm_params(key, config: Config) -> xLSTMParams:
     
     # Embedding
     embedding = jr.normal(keys[0], (config.vocab_size, config.d_model)) * 0.01
+    embedding = embedding.astype(jnp.bfloat16)
     
     # Initialize blocks
     blocks = []
     for i in range(config.num_layers):
         block_keys = jr.split(keys[1 + i], 6)
         
-        slstm_params = None
-        mlstm_params = None
-        
-        # if config.use_slstm:
         slstm_params = init_slstm_params(block_keys[0], d_in, d_in)
-        # if config.use_mlstm:
         mlstm_params = init_mlstm_params(block_keys[1], d_in, config.d_model, config.num_heads)
         
         # FFN parameters
@@ -411,18 +422,26 @@ def init_xlstm_params(key, config: Config) -> xLSTMParams:
         block = xLSTMBlockParams(
             slstm=slstm_params,
             mlstm=mlstm_params,
-            ff_w1=ff_w1,
-            ff_b1=ff_b1,
-            ff_w2=ff_w2,
-            ff_b2=ff_b2,
+            ff_w1=ff_w1.astype(jnp.bfloat16),
+            ff_b1=ff_b1.astype(jnp.bfloat16),
+            ff_w2=ff_w2.astype(jnp.bfloat16),
+            ff_b2=ff_b2.astype(jnp.bfloat16),
         )
         blocks.append(block)
     
     # Output projection
     output_proj = jr.normal(keys[-1], (config.d_model, config.vocab_size)) * 0.01
     
-    return xLSTMParams(embedding=embedding, blocks=blocks, output_proj=output_proj)
+    return xLSTMParams(embedding=embedding, blocks=blocks, output_proj=output_proj.astype(jnp.bfloat16))
 
+def init_xlstm_states(config: Config, batch_size: int) -> xLSTMParams:
+    slstm_states = []
+    mlstm_states = []
+
+    for _ in range(config.num_layers):
+        slstm_states += [init_slstm_state(batch_size, config.d_model)]
+        mlstm_states += [init_mlstm_state(batch_size, config.num_heads, config.d_model // config.num_heads)]
+    return xLSTMStates(slstm_states=slstm_states, mlstm_states=mlstm_states)
 
 # ============================================================================
 # Training
@@ -454,7 +473,7 @@ def cross_entropy_loss(logits, targets, ignore_index=-1):
     return loss
 
 
-def forward_pass(params: xLSTMParams, tokens: jnp.ndarray, config: Config, key=None):
+def forward_pass(params: xLSTMParams, tokens: jnp.ndarray, states: xLSTMStates):
     """Forward pass through xLSTM model.
     
     Args:
@@ -467,24 +486,24 @@ def forward_pass(params: xLSTMParams, tokens: jnp.ndarray, config: Config, key=N
         logits: [B, T, vocab_size]
     """
     B, T = tokens.shape
+    slstm_states = states.slstm_states
+    mlstm_states = states.mlstm_states
     
     # Embedding lookup
     x = params.embedding[tokens]  # [B, T, d_model]
     
     # Process through blocks
     for block_idx, block in enumerate(params.blocks):
-        # Initialize states
-        slstm_state = init_slstm_state(B, config.d_model)# if config.use_slstm else None
-        mlstm_state = init_mlstm_state(B, config.num_heads, config.d_model // config.num_heads)# if config.use_mlstm else None
-        
         # Process sequence
         outputs = []
         for t in range(T):
             x_t = x[:, t, :]  # [B, d_model]
             
             # sLSTM path
-            slstm_state, slstm_out = slstm_step(block.slstm, slstm_state, x_t)
-            mlstm_state, mlstm_out = mlstm_step(block.mlstm, mlstm_state, x_t)
+            slstm_state, slstm_out = slstm_step(block.slstm, slstm_states[block_idx], x_t)
+            mlstm_state, mlstm_out = mlstm_step(block.mlstm, mlstm_states[block_idx], x_t)
+            slstm_states[block_idx] = slstm_state
+            mlstm_states[block_idx] = mlstm_state
             
             # Combine paths: simple concatenation then projection
             combined = slstm_out + mlstm_out  # Residual-like combination
@@ -504,10 +523,10 @@ def forward_pass(params: xLSTMParams, tokens: jnp.ndarray, config: Config, key=N
     # Output projection to vocabulary
     logits = jnp.dot(x, params.output_proj)  # [B, T, vocab_size]
     
-    return logits
+    return logits, xLSTMStates(slstm_states=slstm_states, mlstm_states=mlstm_states)
 
 
-@jax.jit
+# @jax.jit(static_argnames=["config"])
 def compute_loss(params: xLSTMParams, tokens: jnp.ndarray, config: Config):
     """Compute language modeling loss."""
     # Use all but last token as input, all but first as target
@@ -536,6 +555,7 @@ def update_step(params, optimizer_state, tokens, config, optimizer):
 
 def generate(
     params: xLSTMParams,
+    states: xLSTMStates,
     seed_tokens: jnp.ndarray,
     max_length: int,
     config: Config,
@@ -545,30 +565,34 @@ def generate(
 ):
     """Generate text from seed."""
     generated = list(seed_tokens.flatten())
+    forward_pass_ = jax.jit(forward_pass)
+    context = jnp.array([generated[-config.max_seq_len:]], dtype=jnp.int32)
+    # _, states = forward_pass_(params, context, states)
     
+    t0 = time.monotonic()
     for _ in range(max_length - len(generated)):
+        print(_, time.monotonic()-t0)
+        t0 = time.monotonic()
         # Get last config.max_seq_len tokens
-        context = jnp.array([generated[-config.max_seq_len:]], dtype=jnp.int32)
-        
         # Forward pass
-        logits = forward_pass(params, context, config, key)
+        # logits = forward_pass(params, context, config, key)
+        logits, states = forward_pass_(params, context, states)
         
         # Get last token logits
-        next_logits = logits[0, -1, :] / temperature
-        
+        next_logits = logits[:, -1:, :] / temperature
+        next_token = jnp.argmax(next_logits, axis=-1)
         # Top-k sampling
-        if top_k is not None:
-            indices = jnp.argsort(next_logits)[-top_k:]
-            next_logits = jnp.where(
-                jnp.arange(config.vocab_size) >= indices[0],
-                next_logits,
-                -jnp.inf,
-            )
-        
-        # Sample
-        key, subkey = jr.split(key)
-        next_token = jr.categorical(subkey, next_logits)
-        generated.append(int(next_token))
+        # if top_k is not None:
+        #     indices = jnp.argsort(next_logits)[-top_k:]
+        #     next_logits = jnp.where(
+        #         jnp.arange(config.vocab_size) >= indices[0],
+        #         next_logits,
+        #         -jnp.inf,
+        #     )
+        # key, subkey = jr.split(key)
+        # next_token = jr.categorical(subkey, next_logits)
+        generated.append(int(next_token.squeeze()))
+        context = next_token
     
     return jnp.array(generated, dtype=jnp.int32)
 
@@ -658,6 +682,7 @@ def create_optimizer(learning_rate: float, weight_decay: float):
     )
 
 
+@jax.jit(static_argnames=["config", "optimizer"])
 def train_step(
     params: xLSTMParams,
     optimizer_state,
@@ -692,8 +717,7 @@ def train_step(
     
     return params, optimizer_state, loss
 
-
-@jax.jit
+@jax.jit(static_argnames=["config"])
 def eval_step(params: xLSTMParams, batch: jnp.ndarray, config: Config):
     """Evaluation step."""
     inputs = batch[:, :-1]
@@ -715,12 +739,12 @@ def main():
         d_head=32,
         d_ff=1024,
         num_layers=4,
-        max_seq_len=256,
-        # use_slstm=True,
-        # use_mlstm=True,
+        # max_seq_len=1024,
+        # max_seq_len=128,
+        max_seq_len=64,
         soft_cap=15.0,
         dropout_rate=0.1,
-        batch_size=8,
+        batch_size=1,
         learning_rate=1e-4,
         weight_decay=1e-6,
         grad_clip_norm=1.0,
@@ -754,6 +778,7 @@ def main():
     key, subkey = jr.split(key)
     
     params = init_xlstm_params(subkey, config)
+    # states = init_xlstm_states(config)
     
     # Count parameters
     num_params = sum(
@@ -776,7 +801,8 @@ def main():
     print(f"Steps per epoch: {steps_per_epoch}")
     print("=" * 60)
     
-    for epoch in range(num_epochs):
+    # for epoch in range(num_epochs):
+    if False:
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
         
         # ========== Training ==========
@@ -784,6 +810,7 @@ def main():
         train_losses = []
         
         with tqdm(total=steps_per_epoch, desc="Training") as pbar:
+        # if False:
             for batch in create_batches(
                 train_tokens,
                 config.batch_size,
@@ -810,18 +837,20 @@ def main():
         # ========== Validation ==========
         print("Evaluating on validation set...")
         val_losses = []
-        
-        for batch in create_batches(
-            val_tokens,
-            config.batch_size,
-            config.max_seq_len,
-            shuffle=False,
-        ):
-            if batch.shape[0] < config.batch_size:
-                continue
-            
-            val_loss = eval_step(params, batch, config)
-            val_losses.append(float(val_loss))
+       
+        with tqdm(total= (len(val_tokens) - 1) // config.max_seq_len, desc="Val") as pbar:
+            for batch in create_batches(
+                val_tokens,
+                config.batch_size,
+                config.max_seq_len,
+                shuffle=False,
+            ):
+                if batch.shape[0] < config.batch_size:
+                    continue
+                
+                val_loss = eval_step(params, batch, config)
+                val_losses.append(float(val_loss))
+                pbar.update(1)
         
         mean_val_loss = np.mean(val_losses)
         print(f"Mean validation loss: {mean_val_loss:.4f}")
@@ -845,8 +874,10 @@ def main():
     print(f"Generating... (this may be slow on CPU)")
     
     key, subkey = jr.split(key)
+    states = init_xlstm_states(config, 1)
     generated = generate(
         params,
+        states,
         jnp.array(seed_tokens),
         max_length=100,
         config=config,
