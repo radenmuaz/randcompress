@@ -28,24 +28,18 @@ class Config(NamedTuple):
     num_layers: int = 4
     max_seq_len: int = 512
     
-    # xLSTM specific
-    use_slstm: bool = True
-    use_mlstm: bool = True
     soft_cap: float = 15.0
     
-    # Regularization
-    dropout_rate: float = 0.1
+    # # Training
+    # batch_size: int = 16
+    # learning_rate: float = 1e-4
+    # weight_decay: float = 1e-6
+    # grad_clip_norm: float = 1.0
     
-    # Training
-    batch_size: int = 16
-    learning_rate: float = 1e-4
-    weight_decay: float = 1e-6
-    grad_clip_norm: float = 1.0
-    
-    # Inference
-    temperature: float = 0.8
-    top_k: int = 40
-    top_p: float = 0.9
+    # # Inference
+    # temperature: float = 0.8
+    # top_k: int = 40
+    # top_p: float = 0.9
 
 
 # ============================================================================
@@ -88,7 +82,7 @@ class sLSTMState(NamedTuple):
     m: jnp.ndarray  # Stability max value [B, H]
 
 
-class sLSTMParams(NamedTuple):
+class sLSTMCellParams(NamedTuple):
     """sLSTM parameters."""
     Wx: jnp.ndarray  # Input to hidden [4*H, d_in]
     Ry: jnp.ndarray  # Recurrent [4*H, H]
@@ -97,7 +91,7 @@ class sLSTMParams(NamedTuple):
     layer_norm_bias: jnp.ndarray    # Layer norm bias [H]
 
 
-def init_slstm_params(key, d_in, d_hidden, scale=0.01):
+def init_slstm_cell_params(key, d_in, d_hidden, scale=0.01):
     """Initialize sLSTM parameters."""
     key_wx, key_ry, key_ln = jr.split(key, 3)
     
@@ -112,7 +106,7 @@ def init_slstm_params(key, d_in, d_hidden, scale=0.01):
     ln_weight = jnp.ones((d_hidden,))
     ln_bias = jnp.zeros((d_hidden,))
     
-    return sLSTMParams(Wx, Ry, b, ln_weight, ln_bias)
+    return sLSTMCellParams(Wx, Ry, b, ln_weight, ln_bias)
 
 
 def init_slstm_state(batch_size, d_hidden):
@@ -188,180 +182,27 @@ def slstm_step(params: sLSTMParams, state: sLSTMState, x: jnp.ndarray) -> Tuple[
 
 
 # ============================================================================
-# mLSTM: Matrix LSTM with Covariance Memory
-# ============================================================================
-
-class mLSTMState(NamedTuple):
-    """mLSTM state."""
-    C: jnp.ndarray      # Covariance matrix [B, L, D_h, D_h]
-    n: jnp.ndarray      # Normalization vector [B, L, D_h]
-    m: jnp.ndarray      # Stability constant [B, L]
-
-
-class mLSTMParams(NamedTuple):
-    """mLSTM parameters."""
-    # Query, Key, Value projections
-    W_q: jnp.ndarray
-    W_k: jnp.ndarray
-    W_v: jnp.ndarray
-    
-    # Gate projections (input and forget)
-    W_i: jnp.ndarray
-    W_f: jnp.ndarray
-    
-    # Output projection
-    W_out: jnp.ndarray
-    
-    # Layer norm
-    ln_weight: jnp.ndarray
-    ln_bias: jnp.ndarray
-
-
-def init_mlstm_params(key, d_in, d_model, num_heads):
-    """Initialize mLSTM parameters."""
-    d_h = d_model // num_heads
-    
-    keys = jr.split(key, 8)
-    
-    scale_in = 1.0 / math.sqrt(d_in)
-    scale_out = 1.0 / math.sqrt(d_model)
-    scale_gate = 1.0 / math.sqrt(d_in)
-    
-    return mLSTMParams(
-        W_q=jr.normal(keys[0], (num_heads, d_h, d_in)) * scale_in,
-        W_k=jr.normal(keys[1], (num_heads, d_h, d_in)) * scale_in,
-        W_v=jr.normal(keys[2], (num_heads, d_h, d_in)) * scale_in,
-        W_i=jr.normal(keys[3], (num_heads, d_in)) * scale_gate,
-        W_f=jr.normal(keys[4], (num_heads, d_in)) * scale_gate,
-        W_out=jr.normal(keys[5], (d_model, num_heads * d_h)) * scale_out,
-        ln_weight=jnp.ones((d_model,)),
-        ln_bias=jnp.zeros((d_model,)),
-    )
-
-
-def init_mlstm_state(batch_size, num_heads, d_h):
-    """Initialize mLSTM state."""
-    return mLSTMState(
-        C=jnp.zeros((batch_size, num_heads, d_h, d_h)),
-        n=jnp.zeros((batch_size, num_heads, d_h)),
-        m=jnp.zeros((batch_size, num_heads)),
-    )
-
-
-def mlstm_step(
-    params: mLSTMParams,
-    state: mLSTMState,
-    x: jnp.ndarray,
-) -> Tuple[mLSTMState, jnp.ndarray]:
-    """Single mLSTM step (recurrent form).
-    
-    Implements the recurrent (single-step) form described in xlstm_equations.md Section 3.
-    
-    Args:
-        params: mLSTM parameters
-        state: Previous state (C, n, m)
-        x: Input [B, d_in]
-    
-    Returns:
-        new_state: Updated mLSTM state
-        output: Output [B, d_model]
-    """
-    B = x.shape[0]
-    C_prev, n_prev, m_prev = state
-    
-    num_heads = params.W_q.shape[0]
-    d_h = params.W_q.shape[1]
-    d_model = d_h * num_heads
-    
-    # ========== Compute Q, K, V ==========
-    # Q: [B, L, D_h]
-    Q = jnp.einsum('ldi,bi->bld', params.W_q, x)
-    K = jnp.einsum('ldi,bi->bld', params.W_k, x)
-    V = jnp.einsum('ldi,bi->bld', params.W_v, x)
-    
-    # ========== Gate pre-activations ==========
-    # i_raw, f_raw: [B, L]
-    i_raw = jnp.einsum('ld,bd->bl', params.W_i, x)  # [B, L]
-    f_raw = jnp.einsum('ld,bd->bl', params.W_f, x)  # [B, L]
-    
-    # ========== Exponential gate stabilization ==========
-    log_f = logsigmoid(f_raw)  # [B, L]
-    
-    # m_t = max(log_f + m_prev, i_raw)
-    m_t = jnp.maximum(log_f + m_prev, i_raw)  # [B, L]
-    
-    # Gate values
-    f_t = jnp.minimum(1.0, jnp.exp(log_f + m_prev - m_t))  # [B, L]
-    i_t = jnp.minimum(1.0, jnp.exp(i_raw - m_t))  # [B, L]
-    
-    # ========== Scale keys ==========
-    K_scaled = K / jnp.sqrt(d_h)  # [B, L, D_h]
-    
-    # ========== Update C (covariance matrix) ==========
-    # C_t = f_t * C_prev + i_t * (K_scaled^T @ V)
-    # Shape: [B, L, D_h, D_h]
-    f_t_expanded = f_t[:, :, jnp.newaxis, jnp.newaxis]  # [B, L, 1, 1]
-    i_t_expanded = i_t[:, :, jnp.newaxis, jnp.newaxis]  # [B, L, 1, 1]
-    
-    kv_product = jnp.einsum('bld,blh->blhd', K_scaled, V)  # [B, L, D_h, D_h]
-    C_t = f_t_expanded * C_prev + i_t_expanded * kv_product
-    
-    # ========== Update n (normalization vector) ==========
-    # n_t = f_t * n_prev + i_t * K_scaled
-    n_t = f_t[:, :, jnp.newaxis] * n_prev + i_t[:, :, jnp.newaxis] * K_scaled  # [B, L, D_h]
-    
-    # ========== Compute output ==========
-    # h_num = Q^T @ C_t: [B, L, D_h]
-    h_num = jnp.einsum('bld,blhd->blh', Q, C_t)
-    
-    # h_denom = max(|Q^T @ n_t|, exp(-m_t))
-    qn_prod = jnp.sum(Q * n_t, axis=2)  # [B, L]
-    max_val = jnp.exp(-m_t)  # [B, L]
-    h_denom = jnp.maximum(jnp.abs(qn_prod), max_val)  # [B, L]
-    
-    # h = h_num / h_denom
-    epsilon = 1e-8
-    h = h_num / (h_denom[:, :, jnp.newaxis] + epsilon)  # [B, L, D_h]
-    
-    # ========== Project output ==========
-    # Reshape [B, L, D_h] -> [B, L*D_h]
-    h_flat = h.reshape((B, d_model))
-    
-    # Output projection
-    output = jnp.dot(h_flat, params.W_out.T)
-    
-    # Apply layer normalization
-    output = layer_norm(output, params.ln_weight, params.ln_bias)
-    
-    # Create new state
-    new_state = mLSTMState(C=C_t, n=n_t, m=m_t)
-    
-    return new_state, output
-
-
-# ============================================================================
 # Full xLSTM Block and Model
 # ============================================================================
 
-class xLSTMBlockParams(NamedTuple):
-    """Single xLSTM block."""
+class sLSTMBlockParams(NamedTuple):
+    """Single sLSTM block."""
     slstm: Optional[sLSTMParams] = None
-    mlstm: Optional[mLSTMParams] = None
     ff_w1: Optional[jnp.ndarray] = None
     ff_b1: Optional[jnp.ndarray] = None
     ff_w2: Optional[jnp.ndarray] = None
     ff_b2: Optional[jnp.ndarray] = None
 
 
-class xLSTMParams(NamedTuple):
+class sLSTMParams(NamedTuple):
     """Full xLSTM model parameters."""
     embedding: jnp.ndarray  # [vocab_size, d_model]
     blocks: list  # List of xLSTMBlockParams
     output_proj: jnp.ndarray  # [d_model, vocab_size]
 
 
-def init_xlstm_params(key, config: Config) -> xLSTMParams:
-    """Initialize all xLSTM parameters."""
+def init_slstm_params(key, config: Config) -> sLSTMParams:
+    """Initialize all sLSTM parameters."""
     keys = jr.split(key, 10)
     
     d_in = config.d_model
@@ -375,14 +216,7 @@ def init_xlstm_params(key, config: Config) -> xLSTMParams:
     for i in range(config.num_layers):
         block_keys = jr.split(keys[1 + i], 6)
         
-        slstm_params = None
-        mlstm_params = None
-        
-        if config.use_slstm:
-            slstm_params = init_slstm_params(block_keys[0], d_in, d_in)
-        
-        if config.use_mlstm:
-            mlstm_params = init_mlstm_params(block_keys[1], d_in, config.d_model, config.num_heads)
+        slstm_cell_params = init_slstm_cell_params(block_keys[0], d_in, d_in)
         
         # FFN parameters
         scale_ff1 = 1.0 / math.sqrt(d_in)
@@ -393,9 +227,8 @@ def init_xlstm_params(key, config: Config) -> xLSTMParams:
         ff_w2 = jr.normal(block_keys[3], (d_in, config.d_ff)) * scale_ff2
         ff_b2 = jnp.zeros((d_in,))
         
-        block = xLSTMBlockParams(
-            slstm=slstm_params,
-            mlstm=mlstm_params,
+        block = sLSTMBlockParams(
+            slstm=slstm_cell_params,
             ff_w1=ff_w1,
             ff_b1=ff_b1,
             ff_w2=ff_w2,
@@ -406,7 +239,7 @@ def init_xlstm_params(key, config: Config) -> xLSTMParams:
     # Output projection
     output_proj = jr.normal(keys[-1], (config.d_model, config.vocab_size)) * 0.01
     
-    return xLSTMParams(embedding=embedding, blocks=blocks, output_proj=output_proj)
+    return sLSTMParams(embedding=embedding, blocks=blocks, output_proj=output_proj)
 
 
 # ============================================================================
@@ -438,15 +271,15 @@ def cross_entropy_loss(logits, targets, ignore_index=-1):
     
     return loss
 
+
 @jax.jit(static_argnames=["config"])
-def forward_pass(params: xLSTMParams, tokens: jnp.ndarray, config: Config, key=None):
+def forward_pass(params: sLSTMParams, tokens: jnp.ndarray, config: Config):
     """Forward pass through xLSTM model.
     
     Args:
         params: Model parameters
         tokens: Input tokens [B, T]
         config: Configuration
-        key: PRNG key (for dropout)
     
     Returns:
         logits: [B, T, vocab_size]
@@ -459,8 +292,7 @@ def forward_pass(params: xLSTMParams, tokens: jnp.ndarray, config: Config, key=N
     # Process through blocks
     for block_idx, block in enumerate(params.blocks):
         # Initialize states
-        slstm_state = init_slstm_state(B, config.d_model) if config.use_slstm else None
-        mlstm_state = init_mlstm_state(B, config.num_heads, config.d_model // config.num_heads) if config.use_mlstm else None
+        slstm_state = init_slstm_state(B, config.d_model)# if config.use_slstm else None
         
         # Process sequence
         outputs = []
@@ -468,27 +300,15 @@ def forward_pass(params: xLSTMParams, tokens: jnp.ndarray, config: Config, key=N
             x_t = x[:, t, :]  # [B, d_model]
             
             # sLSTM path
-            if config.use_slstm:
-                slstm_state, slstm_out = slstm_step(block.slstm, slstm_state, x_t)
-            else:
-                slstm_out = x_t
-            
-            # mLSTM path
-            if config.use_mlstm:
-                mlstm_state, mlstm_out = mlstm_step(block.mlstm, mlstm_state, x_t)
-            else:
-                mlstm_out = x_t
-            
-            # Combine paths: simple concatenation then projection
-            combined = slstm_out + mlstm_out  # Residual-like combination
+            slstm_state, slstm_out = slstm_step(block.slstm, slstm_state, x_t)
             
             # FFN
-            hidden = jnp.dot(combined, block.ff_w1.T) + block.ff_b1
+            hidden = jnp.dot(slstm_out, block.ff_w1.T) + block.ff_b1
             hidden = jax.nn.gelu(hidden)
             ffn_out = jnp.dot(hidden, block.ff_w2.T) + block.ff_b2
             
             # Residual connection
-            x_t_out = x_t + combined + ffn_out
+            x_t_out = x_t + slstm_out + ffn_out
             
             outputs.append(x_t_out)
         
@@ -501,7 +321,7 @@ def forward_pass(params: xLSTMParams, tokens: jnp.ndarray, config: Config, key=N
 
 
 @jax.jit(static_argnames=["config"])
-def compute_loss(params: xLSTMParams, tokens: jnp.ndarray, config: Config):
+def compute_loss(params: sLSTMParams, tokens: jnp.ndarray, config: Config):
     """Compute language modeling loss."""
     # Use all but last token as input, all but first as target
     inputs = tokens[:, :-1]
@@ -528,7 +348,7 @@ def update_step(params, optimizer_state, tokens, config, optimizer):
 # ============================================================================
 
 def generate(
-    params: xLSTMParams,
+    params: sLSTMParams,
     seed_tokens: jnp.ndarray,
     max_length: int,
     config: Config,
@@ -576,10 +396,9 @@ if __name__ == "__main__":
         d_ff=512,
         num_layers=2,
         max_seq_len=256,
-        batch_size=4,
     )
-    params = init_xlstm_params(key, config)
-    tokens = jr.randint(key, (config.batch_size, 64), 0, config.vocab_size)
+    params = init_slstm_params(key, config)
+    tokens = jr.randint(key, (1, 64), 0, config.vocab_size)
     # logits = forward_pass(params, tokens, config)
 
     loss = compute_loss(params, tokens, config)
