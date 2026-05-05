@@ -35,7 +35,7 @@ class Config(NamedTuple):
     
     # Training
     batch_size: int = 16
-    learning_rate: float = 1e-2
+    learning_rate: float = 1e-4
     weight_decay: float = 1e-6
     grad_clip_norm: float = 1.0
 
@@ -353,6 +353,7 @@ class xLSTMStates(NamedTuple):
 class RandCompressParams(NamedTuple):
     """Full xLSTM model parameters."""
     output_proj: jnp.ndarray  # [d_model, vocab_size]
+    seed: jnp.ndarray
 
 def init_xlstm_params(key, config: Config) -> xLSTMParams:
     """Initialize all xLSTM parameters."""
@@ -403,7 +404,8 @@ def init_xlstm_states(config: Config, batch_size: int) -> xLSTMParams:
 
 def init_randcompress_params(key, config: Config):
     output_proj = jr.normal(key, (config.d_model, config.vocab_size)) * 0.01
-    return RandCompressParams(output_proj=output_proj.astype(jnp.bfloat16)) 
+    return RandCompressParams(output_proj=output_proj.astype(jnp.bfloat16),
+                              seed=jnp.array(config.seed)) 
 
 
 # ============================================================================
@@ -519,10 +521,10 @@ def generate(
     forward_pass_jit = jax.jit(forward_pass, static_argnames=["config"])
     token = tokens[None]
     generated = []
-    # t0 = time.monotonic()
+    t0 = time.monotonic()
     for _ in range(max_length):
-        # print(_, time.monotonic()-t0)
-        # t0 = time.monotonic()
+        print(_, time.monotonic()-t0)
+        t0 = time.monotonic()
         logits, states = forward_pass_jit(xlstm_key, config, params, token, states)
         token = jnp.argmax(logits[:, -1:, :], axis=-1)
         generated += [token.squeeze()]
@@ -664,7 +666,7 @@ def train_step(
     states = init_xlstm_states(config, batch_size=batch.shape[0])
     
     def loss_fn(p):
-        logits, _ = forward_pass(xlstm_key, config, p, inputs, states)
+        logits, _ = forward_pass(xlstm_key, p, inputs, states)
         return cross_entropy_loss(logits, targets)
     
     loss, grads = jax.value_and_grad(loss_fn)(params)
@@ -675,13 +677,13 @@ def train_step(
     return params, optimizer_state, loss
 
 @jax.jit(static_argnames=["config"])
-def eval_step(xlstm_key, params: xLSTMParams, batch: jnp.ndarray, config: Config):
+def eval_step(params: xLSTMParams, batch: jnp.ndarray, config: Config):
     """Evaluation step."""
     inputs = batch[:, :-1]
     targets = batch[:, 1:]
     
     states = init_xlstm_states(config, batch_size=batch.shape[0])
-    logits, _ = forward_pass(xlstm_key, config, params, inputs, states)
+    logits, _ = forward_pass(params, inputs, states)
     loss = cross_entropy_loss(logits, targets)
     
     return loss
@@ -713,9 +715,8 @@ def main():
         num_layers=2,
         max_seq_len=512,
         batch_size=1,
-        learning_rate=1e-3,
-        weight_decay=0,
-        # weight_decay=1e-6,
+        learning_rate=1e-4,
+        weight_decay=1e-6,
         grad_clip_norm=1.0,
         # dtype="bfloat16",
     )
@@ -756,7 +757,7 @@ def main():
     optimizer_state = optimizer.init(params)
     
     # ========== Training Loop ==========
-    num_epochs = 2000
+    num_epochs = 3
     steps_per_epoch = (len(train_tokens) - 1) // config.max_seq_len // config.batch_size
     
     global_step = 0
@@ -766,8 +767,8 @@ def main():
     print(f"Steps per epoch: {steps_per_epoch}")
     print("=" * 60)
     
-    for epoch in range(num_epochs):
-    # if False:
+    # for epoch in range(num_epochs):
+    if False:
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
         
         # ========== Training ==========
@@ -786,7 +787,7 @@ def main():
                 if batch.shape[0] < config.batch_size:
                     continue
                 
-                params, optimizer_state, loss = train_step(xlstm_key,
+                params, optimizer_state, loss = train_step(
                     params, optimizer_state, batch, config, optimizer
                 )
                 
@@ -798,8 +799,11 @@ def main():
         
         mean_train_loss = np.mean(train_losses)
         print(f"Mean training loss: {mean_train_loss:.4f}")
+        
         # ========== Validation ==========
+        print("Evaluating on validation set...")
         val_losses = []
+       
         with tqdm(total= (len(val_tokens) - 1) // config.max_seq_len, desc="Val") as pbar:
             for batch in create_batches(
                 val_tokens,
@@ -810,19 +814,18 @@ def main():
                 if batch.shape[0] < config.batch_size:
                     continue
                 
-                val_loss = eval_step(xlstm_key, params, batch, config)
+                val_loss = eval_step(params, batch, config)
                 val_losses.append(float(val_loss))
                 pbar.update(1)
         
         mean_val_loss = np.mean(val_losses)
-        nats = np.exp(mean_val_loss)
-        bpc = nats/math.log(2)
-        print(f"val_loss: {mean_val_loss:.4f} bpc: {bpc:.2f} nats: {nats:.2f} ")
+        print(f"Mean validation loss: {mean_val_loss:.4f}")
+        print(f"Perplexity: {np.exp(mean_val_loss):.2f}")
         
         # Save if best
         if mean_val_loss < best_val_loss:
             best_val_loss = mean_val_loss
-            # print(f"✓ New best validation loss!")
+            print(f"✓ New best validation loss!")
         
         print("-" * 60)
     
@@ -830,11 +833,10 @@ def main():
     print("\nGeneration example:")
     print("-" * 60)
     
-    # context_text = ""
-    # tokens = jnp.array(ByteTokenizer.encode(context_text))
-    # print(f"Context: {context_text}")
-    # print(f"Generating... (this may be slow on CPU)")
-    tokens = jnp.array(tokens[:1])
+    context_text = "The quick brown"
+    tokens = jnp.array(ByteTokenizer.encode(context_text))
+    print(f"Context: {context_text}")
+    print(f"Generating... (this may be slow on CPU)")
     
     key, subkey = jr.split(key)
     states = init_xlstm_states(config, 1)
