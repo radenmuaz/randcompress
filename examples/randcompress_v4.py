@@ -698,6 +698,42 @@ def train_step(base_xlstm, params, batch, config):
 
 
 # ============================================================================
+# Checkpoint save / load
+# ============================================================================
+
+def save_checkpoint(ckpt_dir, params, config, n_seed, n_output,
+                    seed_bytes, warmup_tokens):
+    import os, json, pickle
+    os.makedirs(ckpt_dir, exist_ok=True)
+    meta = {**config._asdict(),
+            "n_seed": n_seed, "n_output": n_output,
+            "warmup_tokens": warmup_tokens}
+    with open(os.path.join(ckpt_dir, "config.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+    with open(os.path.join(ckpt_dir, "params.pkl"), "wb") as f:
+        pickle.dump(jax.tree_util.tree_map(np.array, params), f)
+    with open(os.path.join(ckpt_dir, "seed.bin"), "wb") as f:
+        f.write(bytes(seed_bytes))
+    print(f"Checkpoint saved to {ckpt_dir}/")
+
+
+def load_checkpoint(ckpt_dir):
+    import os, json, pickle
+    with open(os.path.join(ckpt_dir, "config.json")) as f:
+        meta = json.load(f)
+    n_seed        = meta.pop("n_seed")
+    n_output      = meta.pop("n_output")
+    warmup_tokens = meta.pop("warmup_tokens")
+    config        = Config(**meta)
+    with open(os.path.join(ckpt_dir, "params.pkl"), "rb") as f:
+        params = pickle.load(f)
+    params = jax.tree_util.tree_map(jnp.array, params)
+    with open(os.path.join(ckpt_dir, "seed.bin"), "rb") as f:
+        seed_bytes = list(f.read())
+    return config, params, seed_bytes, n_seed, n_output, warmup_tokens
+
+
+# ============================================================================
 # Data
 # ============================================================================
 
@@ -813,14 +849,14 @@ def main():
     train_log_file = open(train_log_path, "w", buffering=1)
     sys.stdout     = _Tee(sys.__stdout__, train_log_file)
 
-    # dataset_path = "datasets/juz1.txt"
-    dataset_path     = "datasets/surat_al-fatihah.txt"
+    dataset_path = "datasets/juz1.txt"
+    # dataset_path     = "datasets/surat_al-fatihah.txt"
     val_path     = "datasets/surat_al-fatihah.txt"
     tokens     = load_dataset(dataset_path)
     val_tokens = load_dataset(val_path)
     n_real = len(tokens)
     n_val  = len(val_tokens)
-    chunk_size = 128
+    chunk_size = 1024
     print(f"Train: {n_real} bytes   Val: {n_val} bytes   chunk_size={chunk_size}")
 
     # config = Config(
@@ -831,11 +867,19 @@ def main():
     #     random_shuffle=True,
     # )
 
+    # config = Config(
+    #     vocab_size=256, d_model=32, num_heads=4, d_ff=64,
+    #     num_layers=4, max_seq_len=chunk_size, seed=0, conv_kernel=4,
+    #     block_map="smsm", lora_r=4, batch_size=1,
+    #     learning_rate=5e-3, weight_decay=0.0, grad_clip_norm=100.0,
+    #     random_shuffle=True,
+    # )
+
     config = Config(
-        vocab_size=256, d_model=32, num_heads=4, d_ff=64,
+        vocab_size=256, d_model=64, num_heads=4, d_ff=128,
         num_layers=4, max_seq_len=chunk_size, seed=0, conv_kernel=4,
-        block_map="smsm", lora_r=4, batch_size=1,
-        learning_rate=5e-3, weight_decay=0.0, grad_clip_norm=100.0,
+        block_map="smsm", lora_r=8, batch_size=1,
+        learning_rate=1e-3, weight_decay=0.0, grad_clip_norm=100.0,
         random_shuffle=True,
     )
 
@@ -871,7 +915,7 @@ def main():
     val_inputs_jnp  = jnp.array(val_tokens[:-1][None,:], dtype=jnp.int32)
     val_targets_jnp = jnp.array(val_tokens[1:][None,:],  dtype=jnp.int32)
 
-    num_epochs  = 10000
+    num_epochs  = 2000
     total_steps = num_epochs * steps_per_epoch
     global_step = 0
     t_total     = 0.0
@@ -924,13 +968,13 @@ def main():
             val_loss   = float(cross_entropy_loss(val_logits, val_targets_jnp))
             val_bpc    = math.exp(val_loss) / math.log(2)
 
-            n_seed = 32
+            n_seed = chunk_size // 4
             val_target_gen = np.array(val_tokens[n_seed:], dtype=np.uint8)
             val_gen, val_wrong, val_acc, _, val_first = _eval_generative(
                 base_xlstm, params, config,
                 seed_bytes=[int(b) for b in val_tokens[:n_seed]],
                 target_np=val_target_gen,
-                chunk_size=chunk_size, warmup_tokens=32)
+                chunk_size=chunk_size, warmup_tokens=chunk_size // 4)
             val_first_str = f"byte {val_first}" if val_first is not None else "none (perfect)"
             print(f"  [VAL] bpc={val_bpc:.4f}  acc={val_acc*100:.2f}%  "
                   f"wrong={val_wrong}/{len(val_target_gen)}  first_wrong={val_first_str}")
@@ -976,14 +1020,14 @@ def main():
     train_bpc = math.exp(total_eval_loss / num_chunks) / math.log(2)
     print(f"Train BPC (teacher-forced): {train_bpc:.4f}")
 
-    n_seed = 32
+    n_seed = chunk_size // 4
     train_target = np.array(tokens[n_seed:], dtype=np.uint8)
     n_train_pred = len(train_target)
     print(f"Generating {n_train_pred} bytes seeded with first {n_seed} bytes...")
     train_generated, train_wrong, train_acc, train_cer, train_first = _eval_generative(
         base_xlstm, params, config,
         seed_bytes=[int(b) for b in tokens[:n_seed]], target_np=train_target,
-        chunk_size=chunk_size, warmup_tokens=32)
+        chunk_size=chunk_size, warmup_tokens=chunk_size // 4)
     train_first_str = f"byte {train_first}" if train_first is not None else "none (perfect)"
 
     train_seed_text = ByteTokenizer.decode(tokens[:n_seed])
@@ -1003,6 +1047,12 @@ def main():
     print(f"  Accuracy:             {train_acc*100:.4f}%")
     print(f"  CER:                  {train_cer*100:.4f}%")
     print(f"{'='*60}")
+
+    ckpt_dir = os.path.join(log_dir, "checkpoint")
+    save_checkpoint(ckpt_dir, params, config,
+                    n_seed=n_seed, n_output=n_train_pred,
+                    seed_bytes=[int(b) for b in tokens[:n_seed]],
+                    warmup_tokens=chunk_size // 4)
 
     eval_log_file.close()
     train_log_file.close()

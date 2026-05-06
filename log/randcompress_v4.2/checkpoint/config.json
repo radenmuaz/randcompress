@@ -1,0 +1,20 @@
+{
+  "vocab_size": 256,
+  "d_model": 32,
+  "num_heads": 4,
+  "d_ff": 64,
+  "num_layers": 4,
+  "max_seq_len": 128,
+  "seed": 0,
+  "conv_kernel": 4,
+  "block_map": "smsm",
+  "lora_r": 4,
+  "batch_size": 1,
+  "learning_rate": 0.005,
+  "weight_decay": 0.0,
+  "grad_clip_norm": 100.0,
+  "random_shuffle": false,
+  "n_seed": 32,
+  "n_output": 530,
+  "warmup_tokens": 0
+}

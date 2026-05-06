@@ -1,12 +1,20 @@
 """
-randcompress v3.1 — v3 + chunk-reset generation
+randcompress v4.2 — exact BPTT with gradient rematerialisation
 
-Change from v3
---------------
-_eval_generative now resets hidden state every chunk_size steps to match the
-training distribution (each training forward pass starts from zero state).
-Without this, generation beyond chunk_size tokens enters a hidden-state regime
-the model was never trained on and reconstruction degrades.
+Changes from v4.1
+-----------------
+Training : exact BPTT — no stop_gradient between chunks.  All sequential
+           chunks for the epoch are stacked into one array and processed via
+           jax.lax.scan with jax.checkpoint on the scan body.  Gradients
+           flow back through every chunk boundary to the very first token.
+           Memory cost is O(state_size * num_chunks + activations_one_chunk)
+           instead of O(activations * num_chunks) thanks to remat.
+
+Generation: same as v4.1 — persistent state, no reset.
+
+Dataset : surat_al-fatihah.txt   (562 bytes)
+chunk_size : 128
+n_seed     : 32
 """
 
 import jax
@@ -49,7 +57,7 @@ class Config(NamedTuple):
     learning_rate: float = 1e-3
     weight_decay:  float = 0.0
     grad_clip_norm:float = 1.0
-    random_shuffle:bool  = True   # True → random segments; False → sequential
+    random_shuffle:bool  = True
 
 
 # ============================================================================
@@ -386,6 +394,128 @@ def forward_train(base_xlstm, rc, tokens, num_heads, block_map):
     x = layer_norm(x, xlstm.norm_w, xlstm.norm_b)
     return jnp.dot(x, rc.output_proj)
 
+# ---- TBPTT helpers: forward with initial state carry-in ----
+
+def causal_conv1d_with_buf(x, w, buf):
+    C, K = w.shape
+    w    = w.astype(x.dtype)
+    x_pad= jnp.concatenate([buf, x], axis=1)
+    x_t  = x_pad.transpose(0,2,1)
+    w_t  = w[:,None,:]
+    out  = jax.lax.conv_general_dilated(
+        x_t, w_t, window_strides=(1,), padding='VALID',
+        feature_group_count=C, dimension_numbers=('NCH','OIH','NCH'),
+    )
+    return out.transpose(0,2,1)
+
+def mlstm_layer_parallel_with_init(p, x, num_heads, state):
+    C0, n0, m0, conv_buf = state
+    B, S, _ = x.shape
+    inner   = p.W_up.shape[0] // 2
+    K       = p.conv_w.shape[1]
+    xz      = jnp.dot(x, p.W_up.T)
+    x_m, z  = xz[...,:inner], xz[...,inner:]
+    x_conv_a= jax.nn.silu(causal_conv1d_with_buf(x_m, p.conv_w, conv_buf))
+    q,k,v,i_p,f_p = _mlstm_preacts(p, x_conv_a, x_m)
+
+    # parallel scan with init state
+    NH, DH = C0.shape[1], C0.shape[2]
+    log_f  = jax.nn.log_sigmoid(f_p)
+    lf_cs  = jnp.concatenate([jnp.zeros((B,NH,1,1),log_f.dtype),
+                               jnp.cumsum(log_f, axis=2)], axis=2)
+    rep    = lf_cs[...,0]
+    log_fg = rep[:,:,1:,None] - rep[:,:,None,1:]
+    log_fg = jnp.where(jnp.tril(jnp.ones((S,S),bool)), log_fg, -jnp.inf)
+    log_D_seq  = log_fg + i_p.transpose(0,1,3,2)
+    log_w_init = m0[:,:,None] + lf_cs[:,:,1:,0]
+    max_log_D  = jnp.maximum(log_D_seq.max(axis=-1), log_w_init)[:,:,:,None]
+    D_seq  = jnp.exp(log_D_seq - max_log_D)
+    d_init = jnp.exp(log_w_init - max_log_D[:,:,:,0])
+    k_s    = k / jnp.sqrt(jnp.array(DH, k.dtype))
+    qk     = jnp.einsum('bnsd,bntd->bnst', q, k_s)
+    h_num  = (jnp.einsum('bnst,bntd->bnsd', qk*D_seq, v)
+              + jnp.einsum('bnsd,bnde->bnse', q, C0)*d_init[:,:,:,None])
+    n_full = (jnp.einsum('bnst,bntd->bnsd', D_seq, k_s)
+              + n0[:,:,None,:]*d_init[:,:,:,None])
+    qn     = (q*n_full).sum(axis=-1)
+    denom  = jnp.maximum(jnp.abs(qn), jnp.exp(-max_log_D[:,:,:,0]))
+    h      = h_num / (denom[:,:,:,None]+1e-8)
+
+    w_T  = D_seq[:,:,-1,:]
+    d_T  = d_init[:,:,-1]
+    C_T  = jnp.einsum('bns,bnsd,bnse->bnde', w_T, k_s, v) + d_T[:,:,None,None]*C0
+    n_T  = n_full[:,:,-1,:]
+    m_T  = max_log_D[:,:,-1,0]
+
+    h_flat = h.transpose(0,2,1,3).reshape(B,S,inner)
+    h_out  = (h_flat + p.skip*x_conv_a)*jax.nn.silu(z)
+    h_norm = multihead_layer_norm(h_out, p.ln_w, p.ln_b, num_heads)
+    return jnp.dot(h_norm, p.W_down.T), (C_T, n_T, m_T, x_m[:,-(K-1):,:])
+
+def slstm_layer_with_init(p, x, num_heads, state):
+    y0, c0, n0, m0, conv_buf = state
+    K        = p.conv_w.shape[1]
+    x_conv_a = jax.nn.silu(causal_conv1d_with_buf(x, p.conv_w, conv_buf))
+    gates    = jnp.concatenate([
+        jnp.dot(x_conv_a,p.W_i.T), jnp.dot(x_conv_a,p.W_f.T),
+        jnp.dot(x,p.W_z.T),        jnp.dot(x,p.W_o.T),
+    ], axis=-1)
+    def step(state, gate_t):
+        sy,sc,sn,sm = state
+        y_t,c_t,n_t,m_t = slstm_cell(gate_t+jnp.dot(sy,p.Ry.T)+p.b, sc,sn,sm)
+        return (y_t,c_t,n_t,m_t), y_t
+    (y_T,c_T,n_T,m_T),ys = jax.lax.scan(step,(y0,c0,n0,m0),gates.transpose(1,0,2))
+    out = multihead_layer_norm(ys.transpose(1,0,2), p.gn_w, p.gn_b, num_heads)
+    return out, (y_T, c_T, n_T, m_T, x[:,-(K-1):,:])
+
+def forward_train_chunked(base_xlstm, rc, inputs, layer_states, num_heads, block_map):
+    xlstm      = apply_xlstm_hira(base_xlstm, rc)
+    x          = xlstm.embedding[inputs]
+    new_states = []
+    for block, btype, state in zip(xlstm.blocks, block_map, layer_states):
+        x_n = layer_norm(x, block.norm1_w, block.norm1_b)
+        if btype == 'm':
+            cell_out, ns = mlstm_layer_parallel_with_init(block.mlstm, x_n, num_heads, state)
+        else:
+            cell_out, ns = slstm_layer_with_init(block.slstm, x_n, num_heads, state)
+        new_states.append(ns)
+        x   = x + cell_out
+        x_n = layer_norm(x, block.norm2_w, block.norm2_b)
+        x   = x + gated_ffn(block.ffn_up, block.ffn_down, x_n)
+    x = layer_norm(x, xlstm.norm_w, xlstm.norm_b)
+    return jnp.dot(x, rc.output_proj), new_states
+
+@jax.jit(static_argnames=["config"])
+def exact_bptt_step(base_xlstm, params, all_chunks, config):
+    """Exact BPTT over all chunks via scan + remat.
+
+    all_chunks : [num_chunks, chunk_size+1] int32
+    Gradients flow through every chunk boundary.  jax.checkpoint on the scan
+    body recomputes per-chunk activations in the backward pass instead of
+    storing them, so peak memory is O(state * num_chunks + acts_one_chunk).
+    """
+    num_heads = config.num_heads
+    block_map = config.block_map
+
+    def loss_fn(p):
+        init_states = init_step_states(config, batch_size=1)
+
+        @jax.checkpoint
+        def scan_body(states, chunk):
+            inputs  = chunk[None, :-1]
+            targets = chunk[None, 1:]
+            logits, new_states = forward_train_chunked(
+                base_xlstm, p, inputs, states, num_heads, block_map)
+            loss = cross_entropy_loss(logits, targets)
+            return new_states, loss
+
+        _, per_chunk_losses = jax.lax.scan(scan_body, init_states, all_chunks)
+        return per_chunk_losses.mean()
+
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    return loss, grads
+
+
 def init_step_states(config, batch_size):
     B, K   = batch_size, config.conv_kernel
     NH, DH = config.num_heads, config.d_model // config.num_heads
@@ -698,6 +828,42 @@ def train_step(base_xlstm, params, batch, config):
 
 
 # ============================================================================
+# Checkpoint save / load
+# ============================================================================
+
+def save_checkpoint(ckpt_dir, params, config, n_seed, n_output,
+                    seed_bytes, warmup_tokens):
+    import os, json, pickle
+    os.makedirs(ckpt_dir, exist_ok=True)
+    meta = {**config._asdict(),
+            "n_seed": n_seed, "n_output": n_output,
+            "warmup_tokens": warmup_tokens}
+    with open(os.path.join(ckpt_dir, "config.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+    with open(os.path.join(ckpt_dir, "params.pkl"), "wb") as f:
+        pickle.dump(jax.tree_util.tree_map(np.array, params), f)
+    with open(os.path.join(ckpt_dir, "seed.bin"), "wb") as f:
+        f.write(bytes(seed_bytes))
+    print(f"Checkpoint saved to {ckpt_dir}/")
+
+
+def load_checkpoint(ckpt_dir):
+    import os, json, pickle
+    with open(os.path.join(ckpt_dir, "config.json")) as f:
+        meta = json.load(f)
+    n_seed        = meta.pop("n_seed")
+    n_output      = meta.pop("n_output")
+    warmup_tokens = meta.pop("warmup_tokens")
+    config        = Config(**meta)
+    with open(os.path.join(ckpt_dir, "params.pkl"), "rb") as f:
+        params = pickle.load(f)
+    params = jax.tree_util.tree_map(jnp.array, params)
+    with open(os.path.join(ckpt_dir, "seed.bin"), "rb") as f:
+        seed_bytes = list(f.read())
+    return config, params, seed_bytes, n_seed, n_output, warmup_tokens
+
+
+# ============================================================================
 # Data
 # ============================================================================
 
@@ -720,75 +886,25 @@ def load_dataset(path):
 # Evaluation helpers
 # ============================================================================
 
-def _warmup_state(base_xlstm, params, config, context_tokens):
-    """Feed context_tokens into a fresh zero state; return warmed-up state.
-    The last token is returned as cur_token (not yet stepped through).
-    If context_tokens is empty, returns zero state and None.
+def _eval_generative(base_xlstm, params, config, seed_bytes, target_np):
+    """Persistent-state autoregressive generation — no chunk reset, no warmup.
+
+    State flows continuously from the first seed byte through the full output,
+    mirroring TBPTT training where state also carries across chunk boundaries.
     """
-    states = init_step_states(config, batch_size=1)
-    if len(context_tokens) == 0:
-        return states, None
-    cur_token = jnp.array([context_tokens[0]])
-    for t in context_tokens[1:]:
+    n         = len(target_np)
+    states    = init_step_states(config, batch_size=1)
+    cur_token = jnp.array([seed_bytes[0]])
+    for sb in seed_bytes[1:]:
         _, states = _forward_step_jit(
             base_xlstm, params, cur_token, states, config.num_heads, config.block_map)
-        cur_token = jnp.array([t])
-    return states, cur_token
-
-
-def _eval_generative(base_xlstm, params, config, seed_bytes, target_np,
-                     chunk_size, warmup_tokens=32):
-    """Autoregressive generation with chunk-reset + optional overlap warmup.
-
-    At each chunk boundary (every chunk_size steps) the hidden state resets to
-    zero and the last warmup_tokens already-generated tokens are re-fed to warm
-    up the state before new predictions are trusted.
-
-    warmup_tokens=0 → pure cold reset (no context re-feeding).
-    warmup_tokens must be < chunk_size.
-    """
-    assert warmup_tokens < chunk_size, "warmup_tokens must be < chunk_size"
-    stride        = chunk_size - warmup_tokens  # new tokens produced per chunk
-    n             = len(target_np)
-
-    # history holds all tokens fed so far (seed + generated); used for warmup
-    history       = list(seed_bytes)
-    step_in_chunk = 0
-
-    # Warm up on seed bytes, respecting chunk boundaries
-    states, cur_token = _warmup_state(base_xlstm, params, config,
-                                      history[:warmup_tokens] if warmup_tokens else [])
-    if cur_token is None:
-        cur_token = jnp.array([history[0]])
-
-    for sb in history[1:]:
-        _, states = _forward_step_jit(
-            base_xlstm, params, cur_token, states, config.num_heads, config.block_map)
-        step_in_chunk += 1
-        if step_in_chunk >= chunk_size:
-            ctx = history[max(0, len(history) - warmup_tokens):] if warmup_tokens else []
-            states, wt = _warmup_state(base_xlstm, params, config, ctx)
-            step_in_chunk = len(ctx)
-            if wt is not None:
-                cur_token = wt
         cur_token = jnp.array([sb])
-
     gen_result = []
     for _ in tqdm(range(n), desc="  gen", unit="tok", leave=False):
-        if step_in_chunk >= chunk_size:
-            ctx = history[max(0, len(history) - warmup_tokens):] if warmup_tokens else []
-            states, wt = _warmup_state(base_xlstm, params, config, ctx)
-            step_in_chunk = len(ctx)
-            if wt is not None:
-                cur_token = wt
         logit, states = _forward_step_jit(
             base_xlstm, params, cur_token, states, config.num_heads, config.block_map)
-        step_in_chunk += 1
         cur_token = jnp.argmax(logit, axis=-1)
-        tok = int(cur_token[0])
-        gen_result.append(tok)
-        history.append(tok)
-
+        gen_result.append(int(cur_token[0]))
     generated   = np.array(gen_result, dtype=np.uint8)
     wrong_mask  = generated != target_np
     bytes_wrong = int(np.sum(wrong_mask))
@@ -813,30 +929,22 @@ def main():
     train_log_file = open(train_log_path, "w", buffering=1)
     sys.stdout     = _Tee(sys.__stdout__, train_log_file)
 
-    # dataset_path = "datasets/juz1.txt"
-    dataset_path     = "datasets/surat_al-fatihah.txt"
+    dataset_path = "datasets/surat_al-fatihah.txt"
     val_path     = "datasets/surat_al-fatihah.txt"
     tokens     = load_dataset(dataset_path)
     val_tokens = load_dataset(val_path)
     n_real = len(tokens)
     n_val  = len(val_tokens)
     chunk_size = 128
-    print(f"Train: {n_real} bytes   Val: {n_val} bytes   chunk_size={chunk_size}")
-
-    # config = Config(
-    #     vocab_size=256, d_model=16, num_heads=4, d_ff=32,
-    #     num_layers=2, max_seq_len=chunk_size, seed=0, conv_kernel=4,
-    #     block_map="sm", lora_r=4, batch_size=1,
-    #     learning_rate=5e-3, weight_decay=0.0, grad_clip_norm=100.0,
-    #     random_shuffle=True,
-    # )
+    n_seed     = 32
+    print(f"Train: {n_real} bytes   Val: {n_val} bytes   chunk_size={chunk_size}  n_seed={n_seed}")
 
     config = Config(
         vocab_size=256, d_model=32, num_heads=4, d_ff=64,
         num_layers=4, max_seq_len=chunk_size, seed=0, conv_kernel=4,
         block_map="smsm", lora_r=4, batch_size=1,
         learning_rate=5e-3, weight_decay=0.0, grad_clip_norm=100.0,
-        random_shuffle=True,
+        random_shuffle=False,
     )
 
     key = jr.key(config.seed)
@@ -864,73 +972,64 @@ def main():
 
     opt_state = adamw_init(params)
 
-    # steps per epoch: cover the dataset once at batch_size=1
-    steps_per_epoch = max(1, (n_real - 1) // chunk_size)
-    print(f"steps/epoch={steps_per_epoch}  random_shuffle={config.random_shuffle}")
+    # Pad dataset to next chunk boundary so every byte is trained on.
+    # PAD_TOKEN=0 is already masked from loss (safe for Arabic UTF-8).
+    num_chunks  = math.ceil((n_real - 1) / chunk_size)
+    pad_len     = num_chunks * chunk_size + 1 - n_real
+    tokens_padded = np.concatenate([tokens, np.zeros(pad_len, dtype=np.uint8)])
+    eval_chunks = [tokens_padded[i*chunk_size : i*chunk_size + chunk_size + 1]
+                   for i in range(num_chunks)]
+    # stacked array for exact BPTT scan: [num_chunks, chunk_size+1]
+    all_chunks_jnp = jnp.array(
+        np.stack(eval_chunks), dtype=jnp.int32)
+    print(f"n_real={n_real}  pad={pad_len}  num_chunks={num_chunks}  exact BPTT + remat")
 
     val_inputs_jnp  = jnp.array(val_tokens[:-1][None,:], dtype=jnp.int32)
     val_targets_jnp = jnp.array(val_tokens[1:][None,:],  dtype=jnp.int32)
 
-    num_epochs  = 10000
-    total_steps = num_epochs * steps_per_epoch
+    num_epochs  = 2000
     global_step = 0
     t_total     = 0.0
+    lr          = config.learning_rate
 
-    print(f"\nStateless training  epochs={num_epochs}  log -> {train_log_path}")
+    print(f"\nExact BPTT + remat  epochs={num_epochs}  log -> {train_log_path}")
     print("-" * 60)
 
     for epoch in range(num_epochs):
-        epoch_loss = 0.0
-        recent     = []
+        t0 = time.perf_counter()
+        loss, grads = exact_bptt_step(base_xlstm, params, all_chunks_jnp, config)
+        params, opt_state = adamw_update(
+            opt_state, grads, params,
+            lr=lr, weight_decay=config.weight_decay, max_norm=config.grad_clip_norm)
+        t_total += (time.perf_counter() - t0) * 1000
+        global_step += 1
 
-        pbar = tqdm(total=steps_per_epoch, desc=f"E{epoch+1:04d}", unit="step",
-                    dynamic_ncols=True, leave=True)
-
-        for si in range(steps_per_epoch):
-            lr  = config.learning_rate
-            key, batch_key = jr.split(key)
-            batch = make_batch(tokens, config.batch_size, chunk_size,
-                               batch_key if config.random_shuffle else si,
-                               random_shuffle=config.random_shuffle)
-            t0 = time.perf_counter()
-            loss, grads = train_step(base_xlstm, params, batch, config)
-            params, opt_state = adamw_update(
-                opt_state, grads, params,
-                lr=lr, weight_decay=config.weight_decay, max_norm=config.grad_clip_norm)
-            t_total += (time.perf_counter() - t0) * 1000
-            global_step += 1
-
-            loss_f = float(loss)
-            epoch_loss += loss_f
-            recent.append(loss_f)
-            if len(recent) > 50: recent.pop(0)
-            bpc     = math.exp(loss_f) / math.log(2)
-            avg_bpc = math.exp(sum(recent)/len(recent)) / math.log(2)
-            pbar.update(1)
-            pbar.set_postfix(loss=f"{loss_f:.4f}", bpc=f"{bpc:.3f}",
-                             avg_bpc=f"{avg_bpc:.3f}",
-                             ms=f"{t_total/max(global_step,1):.1f}")
-
-        pbar.close()
-        avg_loss = epoch_loss / steps_per_epoch
-        bpc      = math.exp(avg_loss) / math.log(2)
-        avg_ms   = t_total / max(global_step, 1)
-        print(f"  epoch {epoch+1:4d}  loss={avg_loss:.5f}  bpc={bpc:.4f}"
-              f"  lr={float(lr):.2e}  avg_ms/step={avg_ms:.1f}")
+        loss_f = float(loss)
+        bpc    = math.exp(loss_f) / math.log(2)
+        avg_ms = t_total / global_step
+        print(f"  epoch {epoch+1:4d}  loss={loss_f:.5f}  bpc={bpc:.4f}"
+              f"  lr={lr:.2e}  ms/epoch={avg_ms:.1f}")
 
         if epoch % 50 == 0:
-            val_logits = forward_train(base_xlstm, params, val_inputs_jnp,
-                                       config.num_heads, config.block_map)
-            val_loss   = float(cross_entropy_loss(val_logits, val_targets_jnp))
-            val_bpc    = math.exp(val_loss) / math.log(2)
+            # teacher-forced BPC on val (chunked, persistent state)
+            val_states = init_step_states(config, batch_size=1)
+            val_loss_sum = 0.0
+            val_chunks_n = max(1, (n_val - 1) // chunk_size)
+            for vci in range(val_chunks_n):
+                vseg = val_tokens[vci*chunk_size : vci*chunk_size + chunk_size + 1]
+                vinp = jnp.array(vseg[:-1][None,:], dtype=jnp.int32)
+                vtgt = jnp.array(vseg[1:][None,:],  dtype=jnp.int32)
+                frozen_vs = jax.lax.stop_gradient(val_states)
+                vlogits, val_states = forward_train_chunked(
+                    base_xlstm, params, vinp, frozen_vs, config.num_heads, config.block_map)
+                val_loss_sum += float(cross_entropy_loss(vlogits, vtgt))
+            val_bpc = math.exp(val_loss_sum / val_chunks_n) / math.log(2)
 
-            n_seed = 32
             val_target_gen = np.array(val_tokens[n_seed:], dtype=np.uint8)
             val_gen, val_wrong, val_acc, _, val_first = _eval_generative(
                 base_xlstm, params, config,
                 seed_bytes=[int(b) for b in val_tokens[:n_seed]],
-                target_np=val_target_gen,
-                chunk_size=chunk_size, warmup_tokens=32)
+                target_np=val_target_gen)
             val_first_str = f"byte {val_first}" if val_first is not None else "none (perfect)"
             print(f"  [VAL] bpc={val_bpc:.4f}  acc={val_acc*100:.2f}%  "
                   f"wrong={val_wrong}/{len(val_target_gen)}  first_wrong={val_first_str}")
@@ -952,7 +1051,7 @@ def main():
                     f"\n--- generated ---\n{val_gen_text}\n"
                 )
 
-        if avg_loss < 0.01:
+        if loss_f < 0.01:
             print(f"\n  Converged at epoch {epoch+1}")
             break
 
@@ -964,26 +1063,26 @@ def main():
     eval_log_file = open(eval_log_path, "w", buffering=1)
     sys.stdout    = _Tee(sys.__stdout__, train_log_file, eval_log_file)
 
-    print("Computing train BPC (teacher-forced, sequential chunks)...")
-    num_chunks = (n_real - 1) // chunk_size
+    print("Computing train BPC (teacher-forced, persistent state)...")
+    eval_states     = init_step_states(config, batch_size=1)
     total_eval_loss = 0.0
     for ci in tqdm(range(num_chunks), desc="  tf-bpc", unit="chunk"):
-        seg = tokens[ci*chunk_size : ci*chunk_size + chunk_size + 1]
-        inp = jnp.array(seg[:-1][None,:], dtype=jnp.int32)
-        tgt = jnp.array(seg[1:][None,:],  dtype=jnp.int32)
-        logits = forward_train(base_xlstm, params, inp, config.num_heads, config.block_map)
-        total_eval_loss += float(cross_entropy_loss(logits, tgt))
+        seg           = eval_chunks[ci]
+        chunk_batch   = jnp.array(seg[None,:], dtype=jnp.int32)
+        frozen_es     = jax.lax.stop_gradient(eval_states)
+        logits_c, eval_states = forward_train_chunked(
+            base_xlstm, params, chunk_batch[:,:-1], frozen_es,
+            config.num_heads, config.block_map)
+        total_eval_loss += float(cross_entropy_loss(logits_c, chunk_batch[:,1:]))
     train_bpc = math.exp(total_eval_loss / num_chunks) / math.log(2)
-    print(f"Train BPC (teacher-forced): {train_bpc:.4f}")
+    print(f"Train BPC (teacher-forced, persistent): {train_bpc:.4f}")
 
-    n_seed = 32
     train_target = np.array(tokens[n_seed:], dtype=np.uint8)
     n_train_pred = len(train_target)
-    print(f"Generating {n_train_pred} bytes seeded with first {n_seed} bytes...")
+    print(f"Generating {n_train_pred} bytes seeded with first {n_seed} bytes (persistent state)...")
     train_generated, train_wrong, train_acc, train_cer, train_first = _eval_generative(
         base_xlstm, params, config,
-        seed_bytes=[int(b) for b in tokens[:n_seed]], target_np=train_target,
-        chunk_size=chunk_size, warmup_tokens=32)
+        seed_bytes=[int(b) for b in tokens[:n_seed]], target_np=train_target)
     train_first_str = f"byte {train_first}" if train_first is not None else "none (perfect)"
 
     train_seed_text = ByteTokenizer.decode(tokens[:n_seed])
@@ -1003,6 +1102,12 @@ def main():
     print(f"  Accuracy:             {train_acc*100:.4f}%")
     print(f"  CER:                  {train_cer*100:.4f}%")
     print(f"{'='*60}")
+
+    ckpt_dir = os.path.join(log_dir, "checkpoint")
+    save_checkpoint(ckpt_dir, params, config,
+                    n_seed=n_seed, n_output=n_train_pred,
+                    seed_bytes=[int(b) for b in tokens[:n_seed]],
+                    warmup_tokens=0)
 
     eval_log_file.close()
     train_log_file.close()
