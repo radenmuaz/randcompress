@@ -805,10 +805,11 @@ def _eval_generative(base_xlstm, params, config, seed_bytes, target_np,
 
 def main():
     import os
-    log_dir = "log"
+    _script = os.path.splitext(os.path.basename(__file__))[0]
+    log_dir = os.path.join("log", _script)
     os.makedirs(log_dir, exist_ok=True)
-    train_log_path = f"{log_dir}/train_v3.log"
-    eval_log_path  = f"{log_dir}/eval_v3_final.log"
+    train_log_path = f"{log_dir}/train.log"
+    eval_log_path  = f"{log_dir}/eval_final.log"
     train_log_file = open(train_log_path, "w", buffering=1)
     sys.stdout     = _Tee(sys.__stdout__, train_log_file)
 
@@ -923,7 +924,7 @@ def main():
             val_loss   = float(cross_entropy_loss(val_logits, val_targets_jnp))
             val_bpc    = math.exp(val_loss) / math.log(2)
 
-            n_seed = 10
+            n_seed = 32
             val_target_gen = np.array(val_tokens[n_seed:], dtype=np.uint8)
             val_gen, val_wrong, val_acc, _, val_first = _eval_generative(
                 base_xlstm, params, config,
@@ -965,7 +966,7 @@ def main():
     train_bpc = math.exp(total_eval_loss / num_chunks) / math.log(2)
     print(f"Train BPC (teacher-forced): {train_bpc:.4f}")
 
-    n_seed = 10
+    n_seed = 32
     train_target = np.array(tokens[n_seed:], dtype=np.uint8)
     n_train_pred = len(train_target)
     print(f"Generating {n_train_pred} bytes seeded with first {n_seed} bytes...")
