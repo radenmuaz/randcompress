@@ -936,7 +936,8 @@ def main():
     train_log_file = open(train_log_path, "w", buffering=1)
     sys.stdout     = _Tee(sys.__stdout__, train_log_file)
 
-    dataset_path = "datasets/quran-uthmani.txt"
+    # dataset_path = "datasets/quran-uthmani.txt"
+    dataset_path     = "datasets/juz1.txt"
     val_path     = "datasets/surat_al-fatihah.txt"
     tokens     = load_dataset(dataset_path)
     val_tokens = load_dataset(val_path)
@@ -946,11 +947,11 @@ def main():
     print(f"Train: {n_real} bytes   Val: {n_val} bytes   chunk_size={chunk_size}")
 
     config = Config(
-        vocab_size=256, d_model=256, num_heads=8, d_ff=512,
-        num_layers=4, max_seq_len=chunk_size, seed=0, conv_kernel=4,
-        block_map="msms", lora_r=8, batch_size=1,
-        learning_rate=1e-4, weight_decay=0.0, grad_clip_norm=10.0,
-        grad_accum_k=4,
+        vocab_size=256, d_model=16, num_heads=4, d_ff=32,
+        num_layers=2, max_seq_len=chunk_size, seed=0, conv_kernel=4,
+        block_map="sm", lora_r=4, batch_size=1,
+        learning_rate=5e-3, weight_decay=0.0, grad_clip_norm=100.0,
+        grad_accum_k=1,
     )
 
     key = jr.key(config.seed)
@@ -988,7 +989,7 @@ def main():
     val_inputs_jnp  = jnp.array(val_tokens[:-1][None,:], dtype=jnp.int32)
     val_targets_jnp = jnp.array(val_tokens[1:][None,:],  dtype=jnp.int32)
 
-    num_epochs  = 200
+    num_epochs  = 10000
     total_steps = num_epochs * num_chunks
     global_step = 0
     t_total     = 0.0
@@ -1056,21 +1057,22 @@ def main():
               f"  lr={float(lr):.2e}  avg_ms/chunk={avg_ms:.1f}")
 
         # ---- validation: surat al-Fatihah ----
-        val_logits = forward_train(base_xlstm, params, val_inputs_jnp,
-                                   config.num_heads, config.block_map)
-        val_loss   = float(cross_entropy_loss(val_logits, val_targets_jnp))
-        val_bpc    = math.exp(val_loss) / math.log(2)
+        if epoch % 50 == 0:
+            val_logits = forward_train(base_xlstm, params, val_inputs_jnp,
+                                    config.num_heads, config.block_map)
+            val_loss   = float(cross_entropy_loss(val_logits, val_targets_jnp))
+            val_bpc    = math.exp(val_loss) / math.log(2)
 
-        n_seed = 10
-        val_target_gen = np.array(val_tokens[n_seed:], dtype=np.uint8)
-        val_gen, val_wrong, val_acc, _, val_first = _eval_generative(
-            base_xlstm, params, config,
-            seed_bytes=[int(b) for b in val_tokens[:n_seed]],
-            target_np=val_target_gen)
-        val_first_str = f"byte {val_first}" if val_first is not None else "none (perfect)"
-        print(f"  [VAL] bpc={val_bpc:.4f}  acc={val_acc*100:.2f}%  "
-              f"wrong={val_wrong}/{len(val_target_gen)}  first_wrong={val_first_str}")
-        print(f"  [GEN] {ByteTokenizer.decode(val_gen)}")
+            n_seed = 10
+            val_target_gen = np.array(val_tokens[n_seed:], dtype=np.uint8)
+            val_gen, val_wrong, val_acc, _, val_first = _eval_generative(
+                base_xlstm, params, config,
+                seed_bytes=[int(b) for b in val_tokens[:n_seed]],
+                target_np=val_target_gen)
+            val_first_str = f"byte {val_first}" if val_first is not None else "none (perfect)"
+            print(f"  [VAL] bpc={val_bpc:.4f}  acc={val_acc*100:.2f}%  "
+                f"wrong={val_wrong}/{len(val_target_gen)}  first_wrong={val_first_str}")
+            print(f"{ByteTokenizer.decode(val_gen)}")
 
         if avg_loss < 0.01:
             print(f"\n  Converged at epoch {epoch+1}")

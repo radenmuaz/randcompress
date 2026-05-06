@@ -1,60 +1,113 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+This file provides guidance to Claude Code when working with code in this repository.
 
 ## What this project is
 
 Neural compression via memorization: freeze a randomly-initialized xLSTM, then train only HiRA adapters to overfit a single file. The trained adapter weights *are* the compressed representation. Decompression reconstructs the file autoregressively from a zero hidden state seeded with the first byte.
 
-The active development file is `examples/randcompress_v1.py`. The `randcompress/` package and other `examples/` scripts are earlier experiments.
+**Active file**: `examples/randcompress_v2.py`. v1 is kept for reference. The `randcompress/` package and other `examples/` scripts are earlier experiments.
 
 ## Running
 
 ```bash
-# install (uv preferred)
 uv sync
-
-# train (edits config inside main())
-uv run python examples/randcompress_v1.py
-
-# dataset lives at
-datasets/quran-uthmani.txt      # training
-datasets/surat_al-fatihah.txt   # validation (al-Fatihah, first surah)
+uv run python examples/randcompress_v2.py
 ```
 
-No test suite exists. `pytest` is listed as a dev dep but unused.
+Logs: `train_v2_persistent.log` (training + validation each epoch), `eval_v2_final.log` (post-training evaluation on full train set).
 
-## Architecture (`randcompress_v1.py`)
+Datasets:
+```
+datasets/quran-uthmani.txt      # training
+datasets/surat_al-fatihah.txt   # validation (al-Fatihah, ~300 bytes, fits in one forward pass)
+```
+
+No test suite. `pytest` is a dev dep but unused.
+
+## Architecture (`randcompress_v2.py`)
 
 ### Compression scheme
-- **Base xLSTM** (`xLSTMParams`): randomly initialized, fully frozen. Never updated.
-- **HiRA adapters** (`RandCompressParams`): the only trainable parameters. Applied as `W_eff = W₀ + W₀ ⊙ (B·A)`. B is zero-initialized (delta=0 at start), A is random. Adapters wrap: embedding, all mLSTM/sLSTM weight matrices, FFN up/down projections, output head.
-- **output_proj**: directly trainable (not HiRA-wrapped), maps `d_model → vocab_size`.
+
+- **Base xLSTM** (`xLSTMParams`): structured-randomly initialized, fully frozen. Seed + structured init rules fully determine it — no need to store weights.
+- **HiRA adapters** (`RandCompressParams`): only trainable parameters. Update rule: `W = W₀ + W₀ ⊙ (B·A)`. B zero-init (ΔW=0 at start), A orthonormal rows (SVD init). Adapters on: embedding, all mLSTM/sLSTM weight matrices, FFN up/down.
+- **output_proj**: directly trainable (no HiRA), maps `d_model → vocab_size`.
+
+**Why HiRA over LoRA**: `ΔW = W₀ ⊙ (B·A)` decomposes as `Σₖ diag(bₖ) W₀ diag(aₖ)`, which has `rank = rank(W₀)` even for rank-1 B·A. Same parameter count as LoRA but full-rank updates.
 
 ### xLSTM blocks
-Each block: `LayerNorm → [mLSTM or sLSTM] → residual → LayerNorm → gated FFN → residual`. Block type per layer set by `block_map` string (e.g. `"msms"`).
 
-**mLSTM**: matrix memory state `C ∈ [B, NH, DH, DH]`. During training uses parallel attention-like computation over the full chunk (no within-chunk recurrence). During eval steps recurrently. Train/eval compute different things within a chunk.
+Each block: `LayerNorm → [mLSTM or sLSTM] → residual → LayerNorm → gated FFN → residual`. Layer type set by `block_map` (e.g. `"msms"`).
 
-**sLSTM**: scalar state `(y, c, n, m) ∈ [B, H]` each. Always runs as `jax.lax.scan` in both training and eval — train and eval are identical computationally. Has recurrent connection `Ry` so previous output explicitly gates the next step.
+**mLSTM** — matrix memory `C ∈ [B, NH, DH, DH]`. Training uses parallel attention-like computation over the chunk. Eval steps recurrently. Has per-head gate biases `b_f [NH]` and `b_i [NH]` for multi-timescale control.
 
-### Training: Persistent TBPTT
-File is split into non-overlapping chunks of `chunk_size` tokens. Within each epoch, chunks are processed in order with recurrent state carried across chunk boundaries via `jax.lax.stop_gradient` (truncated BPTT). State is **reset to zeros at the start of each epoch**. This matches eval, which also uses zero initial state.
+**sLSTM** — scalar states `(y, c, n, m) ∈ [B, H]`. Always `jax.lax.scan` (training and eval identical). Has explicit recurrent connection `Ry`.
+
+### Structured frozen initialization (v2)
+
+The frozen basis is initialized to maximize diversity and signal richness:
+
+| component | init strategy | theory |
+|---|---|---|
+| `W_q, W_k, W_v` | orthonormal rows (QR), reshaped to `[NH, DH, inner]` | each head attends to an orthogonal subspace (observability) |
+| `b_f [NH]` (mLSTM forget bias) | `logit(exp(-1/τ))`, τ log-uniform in `[1, max_seq_len]` | multi-timescale memory, head 0 = fast, head NH-1 = full-window |
+| `b[H:2H]` (sLSTM forget bias) | same log-uniform spread over H units | multi-timescale for sLSTM |
+| `Ry` (sLSTM recurrent) | SVD → all singular values = 0.95 | near-critical (ESN principle): max memory capacity, guaranteed stability |
+| `conv_w` | DCT-II basis tiled across channels | structured FIR filter bank: DC, fundamental, 2nd, 3rd harmonic |
+| `W_up, W_down, ffn_*` | row-normalised or orthonormal rows | flat singular value spectrum, no dead input directions |
+
+Helper functions: `_ortho(key, n, m)`, `_fir_bank(n_channels, K)`, `_multiscale_forget_bias(n, seq_len)`.
+
+### HiRA initialization (v2)
+
+`init_hira_adapter`: A rows are right singular vectors of a random matrix (via SVD). This gives exact row orthonormality so each HiRA direction produces an independent gradient signal to B from step one. B remains zero.
+
+### Training: Persistent TBPTT with gradient accumulation
+
+File split into non-overlapping chunks of `chunk_size` tokens. State carried across chunks via `stop_gradient`. State reset to zeros at epoch start (matching eval).
+
+**Gradient accumulation** (`grad_accum_k=K`):
+- K chunks processed with params fixed (zero intra-block staleness)
+- Gradients summed and averaged, one param update per block
+- K=1 is the base case (standard per-chunk update)
+- Compared to standard TBPTT (K=1): intra-block staleness goes from 0→K-1 updates to 0; inter-block staleness is K updates (same as before)
 
 Key functions:
-- `forward_train_chunked` — forward through one chunk given an initial layer state
-- `grad_chunk_persistent` — computes gradients without applying them (used for grad accumulation)
-- `train_chunk_persistent` — computes gradients and applies update in one call
+- `forward_train_chunked` — one chunk forward from initial layer state
+- `grad_chunk_persistent` — gradients only, no update (used for accumulation)
+- `adamw_update` — hand-written AdamW with grad clipping before moment updates
 
-### Eval / decompression
-`_eval_generative`: seeds with first byte of file, zero states, steps token-by-token with `forward_step` (recurrent), greedily reconstructs. Metric is byte accuracy and CER vs original file.
+### Validation (per epoch)
 
-### Optimizer
-Hand-written AdamW in `adamw_update`. No optax. Gradient clipping applied before moment updates.
+After each epoch, on `surat_al-fatihah.txt`:
+1. **Teacher-forced BPC**: single `forward_train` call (file fits in one chunk)
+2. **Generative**: seed = first byte, zero states, greedy decode. Reports accuracy, bytes wrong, first wrong byte index, decoded text.
 
-## Key design constraints
+### Final evaluation (post-training)
 
-- **Eval always uses zero hidden state**: do not make the model depend on non-zero init states at training time in ways that won't exist at eval.
-- **Goal is overfitting**: weight decay = 0, no dropout, no regularization. Everything should push toward lower training loss.
-- **Fixed LR** (not cosine decay): equal learning pressure on all chunks across all epochs; Adam's second moment handles per-parameter scaling.
-- `PAD_TOKEN = 0` (null byte) is masked out of the loss — safe because dataset is Arabic UTF-8 which never produces 0x00.
+On full training dataset:
+1. **Teacher-forced BPC**: chunked stateful forward (same as training)
+2. **Generative**: seed = `tokens[0]`, generate `n_real - 1` bytes, compare to `tokens[1:]`. Reports bytes wrong, first wrong byte index, accuracy, CER.
+
+Logged to `eval_v2_final.log`.
+
+## Key design decisions
+
+- **Goal is overfitting**: weight_decay=0, no dropout. Everything pushes toward lower train loss.
+- **Eval always uses zero hidden state**: training carry-over states are never used at eval time; eval always starts fresh from token[0] with zero states.
+- **`PAD_TOKEN = 0`** masked from loss — safe because dataset is Arabic UTF-8 (never produces 0x00).
+- **Cosine LR with warmup**: `global_step` increments per chunk, so the LR schedule is identical at K=1 and K>1 (same total decay curve, just fewer actual updates).
+- **No optax**: AdamW hand-written for full control and no dependency.
+- **DTYPE = float32** throughout (bfloat16 disabled; swap in DTYPE line if needed).
+
+## Staleness analysis (TBPTT)
+
+The carry-over hidden state passed to chunk t+1 was computed with params from chunk t. Staleness = how many gradient updates old the state is.
+
+| strategy | intra-block staleness | inter-block staleness |
+|---|---|---|
+| standard TBPTT (K=1) | 0 (trivially) | 1 update per chunk |
+| grad accumulation (K>1) | **0** (params frozen within block) | K updates at block boundary |
+| K-chunk EM (double-pass) | 0→K-1 (grows) | ~0 (last step fresh) |
+
+xLSTM's forget gates attenuate stale state in ~50-100 tokens, so inter-block staleness is self-correcting. Intra-block staleness is the more persistent problem — grad accumulation eliminates it.

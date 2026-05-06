@@ -1,34 +1,32 @@
 """
-randcompress v2 — HiRA + structured frozen basis + gradient accumulation
+randcompress v2.1 — HiRA + structured frozen basis + gradient accumulation
+               + sequential curriculum learning
 
-Key changes from v1
+Key changes from v2
 -------------------
-Frozen xLSTM init (structured basis):
-  mLSTM  — orthogonal W_q/W_k/W_v (observability), FIR filter bank for conv,
-            per-head forget/input gate biases (b_f, b_i) with log-uniform
-            time constants spanning 1..seq_len (multi-timescale memory).
-  sLSTM  — near-critical Ry via SVD (spectral radius 0.95, ESN principle),
-            orthogonal input projections, multi-timescale forget bias in b[H:2H].
-  Both   — balanced W_up/W_down via row-normalisation (flat singular values).
+Curriculum learning (sequential memorization):
+  Memorization is sequential — the recurrent state builds context left-to-right,
+  so earlier bytes must be solid before later bytes can be learned.
 
-Trainable HiRA init:
-  A rows initialised as orthonormal right singular vectors (SVD) so every HiRA
-  direction provides an independent gradient signal to B from the first step.
-  B remains zero so ΔW = W₀ ⊙ (B·A) = 0 at initialisation.
+  Schedule: each epoch covers a growing prefix of the dataset.
+    window = min(curriculum_start_chunks + curriculum_step_chunks * epoch, n_chunks)
+  The active window is repeated `curriculum_repeat` times per epoch so early
+  bytes receive many gradient updates before new bytes are introduced.
+  State is NOT reset between repetitions within an epoch — each pass sees the
+  data with the state context built up by the previous pass (richer signal).
 
-HiRA update rule: ΔW = W₀ ⊙ (B · A)  →  W = W₀ + W₀ ⊙ (B · A)
-  Rank of ΔW equals rank(W₀) even for rank-1 B·A (Hadamard rank-lift).
+  Baked-in detection (curriculum_baked_threshold > 0):
+    Tracks per-chunk EMA loss. On repetition passes (pass_idx > 0), chunks whose
+    loss has fallen below the threshold are considered "baked" — we still run a
+    forward pass to advance state but skip backprop, saving compute without
+    losing sequential context.
 
-Training: Persistent TBPTT with K-chunk gradient accumulation.
-  K=1 → standard per-chunk update (base case).
-  K>1 → params frozen across K chunks, one update per block (zero intra-block
-         staleness vs. standard TBPTT's per-chunk staleness).
+  curriculum=False → standard TBPTT over all chunks (identical to v2).
 
-Validation: surat_al-fatihah.txt evaluated every epoch (teacher-forced BPC +
-  greedy generation from first byte: accuracy, bytes wrong, first wrong index).
-
-Final eval: teacher-forced BPC and greedy generation on full train set, logged
-  to eval_final.log separately.
+Inherited from v2
+-----------------
+  Structured frozen basis, HiRA with orthonormal A, grad accumulation,
+  per-epoch validation, final eval on full train set.
 """
 
 import jax
@@ -72,6 +70,12 @@ class Config(NamedTuple):
     weight_decay:  float = 0.0
     grad_clip_norm:float = 1.0
     grad_accum_k:  int   = 1       # chunks per update; 1 = standard TBPTT
+    # ---- curriculum ----
+    curriculum:                 bool  = False  # enable sequential curriculum
+    curriculum_start_chunks:    int   = 4      # initial window (chunks)
+    curriculum_step_chunks:     int   = 4      # chunks added per epoch
+    curriculum_repeat:          int   = 4      # full passes over window per epoch
+    curriculum_baked_threshold: float = 0.0   # skip backprop if chunk loss < this (0=off)
 
 
 # ============================================================================
@@ -870,6 +874,47 @@ def grad_chunk_persistent(base_xlstm, params, chunk_batch, layer_states, config)
     return loss, grads, new_states
 
 
+@jax.jit(static_argnames=["num_heads", "block_map"])
+def _advance_states(base_xlstm, params, chunk_batch, layer_states, num_heads, block_map):
+    """Forward-only pass to advance recurrent states. No loss, no grad.
+    Used for baked chunks that still need state continuity.
+    """
+    _, new_states = forward_train_chunked(
+        base_xlstm, params, chunk_batch[:,:-1], layer_states, num_heads, block_map)
+    return new_states
+
+
+# ============================================================================
+# Curriculum schedule
+# ============================================================================
+
+def make_epoch_schedule(epoch, num_chunks, config):
+    """Return list of (chunk_idx, pass_number) for this epoch.
+
+    curriculum=False: single sequential pass — [(0,0),(1,0),...,(N-1,0)].
+
+    curriculum=True:
+      window = min(start + step*epoch, num_chunks)
+      Repeat the window `curriculum_repeat` times.
+      pass_number tracks which repetition so the training loop can identify
+      repeated passes and skip baked chunks on them.
+
+    State flows continuously through the entire schedule (no intra-epoch reset).
+    """
+    if not config.curriculum:
+        return [(i, 0) for i in range(num_chunks)]
+
+    window = min(
+        config.curriculum_start_chunks + config.curriculum_step_chunks * epoch,
+        num_chunks,
+    )
+    schedule = []
+    for pass_idx in range(config.curriculum_repeat):
+        for ci in range(window):
+            schedule.append((ci, pass_idx))
+    return schedule
+
+
 # ============================================================================
 # Data
 # ============================================================================
@@ -946,11 +991,16 @@ def main():
     print(f"Train: {n_real} bytes   Val: {n_val} bytes   chunk_size={chunk_size}")
 
     config = Config(
-        vocab_size=256, d_model=256, num_heads=8, d_ff=512,
+        vocab_size=256, d_model=128, num_heads=8, d_ff=256,
         num_layers=4, max_seq_len=chunk_size, seed=0, conv_kernel=4,
-        block_map="msms", lora_r=8, batch_size=1,
-        learning_rate=1e-4, weight_decay=0.0, grad_clip_norm=10.0,
+        block_map="msms", lora_r=16, batch_size=1,
+        learning_rate=1e-3, weight_decay=0.0, grad_clip_norm=10.0,
         grad_accum_k=4,
+        curriculum=True,
+        curriculum_start_chunks=4,
+        curriculum_step_chunks=4,
+        curriculum_repeat=4,
+        curriculum_baked_threshold=0.3,
     )
 
     key = jr.key(config.seed)
@@ -982,78 +1032,128 @@ def main():
     raw        = tokens[:usable]
     num_chunks = (len(raw)-1)//chunk_size
     chunks     = [raw[i*chunk_size : i*chunk_size+chunk_size+1] for i in range(num_chunks)]
-    print(f"Chunks: {num_chunks}   steps/epoch={num_chunks}")
 
     # Validation tensors (al-Fatihah fits in one forward pass)
     val_inputs_jnp  = jnp.array(val_tokens[:-1][None,:], dtype=jnp.int32)
     val_targets_jnp = jnp.array(val_tokens[1:][None,:],  dtype=jnp.int32)
+    val_target_np   = np.array(val_tokens[1:], dtype=np.uint8)
+    n_val_pred      = n_val - 1
 
-    num_epochs  = 200
-    total_steps = num_epochs * num_chunks
-    global_step = 0
-    t_total     = 0.0
+    num_epochs  = 20
     K           = config.grad_accum_k
 
-    print(f"\nPersistent TBPTT  epochs={num_epochs}  grad_accum_k={K}  "
-          f"log -> {train_log_path}")
+    # Precompute total steps for cosine LR (accounts for varying epoch lengths)
+    total_steps = sum(
+        len(make_epoch_schedule(e, num_chunks, config))
+        for e in range(num_epochs)
+    )
+
+    # Per-chunk EMA loss for baked-in detection (inf = never seen)
+    chunk_losses = np.full(num_chunks, np.inf)
+
+    global_step = 0
+    t_total     = 0.0
+
+    curric_str = (f"curriculum  start={config.curriculum_start_chunks}  "
+                  f"step={config.curriculum_step_chunks}  "
+                  f"repeat={config.curriculum_repeat}  "
+                  f"baked_thr={config.curriculum_baked_threshold}"
+                  if config.curriculum else "curriculum=off")
+    print(f"\nPersistent TBPTT  epochs={num_epochs}  grad_accum_k={K}  {curric_str}")
+    print(f"Total chunks: {num_chunks}   Total steps (scheduled): {total_steps}")
     print("-" * 60)
 
     for epoch in range(num_epochs):
+        schedule = make_epoch_schedule(epoch, num_chunks, config)
+        window   = schedule[-1][0] + 1 if schedule else 0   # highest chunk in this epoch
+
         states     = init_step_states(config, batch_size=1)
         epoch_loss = 0.0
+        n_trained  = 0   # chunks that actually ran backprop this epoch
+        n_baked    = 0   # chunks skipped due to baked-in threshold
         recent     = []
 
-        pbar = tqdm(total=num_chunks, desc=f"E{epoch+1:04d}", unit="chunk",
+        pbar = tqdm(total=len(schedule), desc=f"E{epoch+1:04d}", unit="chunk",
                     dynamic_ncols=True, leave=True)
 
-        for block_start in range(0, num_chunks, K):
-            block_end = min(block_start + K, num_chunks)
-            k_actual  = block_end - block_start
-
+        for block_start in range(0, len(schedule), K):
+            block     = schedule[block_start : block_start + K]
             accum_grads = None
             block_loss  = 0.0
+            n_block_trained = 0
             t0 = time.perf_counter()
 
-            for ci in range(block_start, block_end):
-                # lr            = cosine_lr(global_step, total_steps, config.learning_rate)
-                lr            = config.learning_rate
+            for (ci, pass_idx) in block:
+                lr            = cosine_lr(global_step, total_steps, config.learning_rate)
                 chunk_batch   = jnp.array(chunks[ci][None,:], dtype=jnp.int32)
                 frozen_states = jax.lax.stop_gradient(states)
 
+                # Baked: chunk is memorised and this is a repetition pass — advance
+                # state without backprop so sequential context is preserved.
+                is_baked = (
+                    config.curriculum_baked_threshold > 0
+                    and np.isfinite(chunk_losses[ci])
+                    and chunk_losses[ci] < config.curriculum_baked_threshold
+                    and pass_idx > 0
+                )
+
+                if is_baked:
+                    states = _advance_states(
+                        base_xlstm, params, chunk_batch, frozen_states,
+                        config.num_heads, config.block_map)
+                    n_baked    += 1
+                    global_step += 1
+                    pbar.update(1)
+                    continue
+
                 loss, grads, states = grad_chunk_persistent(
                     base_xlstm, params, chunk_batch, frozen_states, config)
-                loss_f     = float(loss)
-                block_loss += loss_f
-                global_step += 1
+                loss_f = float(loss)
+
+                # EMA update for baked detection
+                chunk_losses[ci] = (0.9 * chunk_losses[ci] + 0.1 * loss_f
+                                    if np.isfinite(chunk_losses[ci]) else loss_f)
+
+                block_loss      += loss_f
+                n_block_trained += 1
+                n_trained       += 1
+                global_step     += 1
 
                 accum_grads = (grads if accum_grads is None
                                else jax.tree_util.tree_map(jnp.add, accum_grads, grads))
                 pbar.update(1)
 
-            if k_actual > 1:
-                accum_grads = jax.tree_util.tree_map(lambda g: g/k_actual, accum_grads)
+            # Only update if at least one chunk in this block had gradients
+            if accum_grads is not None:
+                if n_block_trained > 1:
+                    accum_grads = jax.tree_util.tree_map(
+                        lambda g: g / n_block_trained, accum_grads)
+                params, opt_state = adamw_update(
+                    opt_state, accum_grads, params,
+                    lr=lr, weight_decay=config.weight_decay,
+                    max_norm=config.grad_clip_norm)
 
-            params, opt_state = adamw_update(
-                opt_state, accum_grads, params,
-                lr=lr, weight_decay=config.weight_decay, max_norm=config.grad_clip_norm)
             t_total += (time.perf_counter() - t0) * 1000
 
-            avg_block_loss = block_loss / k_actual
-            epoch_loss    += block_loss
-            recent.append(avg_block_loss)
-            if len(recent) > 50: recent.pop(0)
-            bpc     = math.exp(avg_block_loss) / math.log(2)
-            avg_bpc = math.exp(sum(recent)/len(recent)) / math.log(2)
-            pbar.set_postfix(loss=f"{avg_block_loss:.4f}", bpc=f"{bpc:.3f}",
-                             avg_bpc=f"{avg_bpc:.3f}",
-                             ms=f"{t_total/max(global_step,1):.1f}")
+            if n_block_trained > 0:
+                avg_block_loss = block_loss / n_block_trained
+                epoch_loss    += block_loss
+                recent.append(avg_block_loss)
+                if len(recent) > 50: recent.pop(0)
+                bpc     = math.exp(avg_block_loss) / math.log(2)
+                avg_bpc = math.exp(sum(recent)/len(recent)) / math.log(2)
+                pbar.set_postfix(loss=f"{avg_block_loss:.4f}", bpc=f"{bpc:.3f}",
+                                 avg_bpc=f"{avg_bpc:.3f}",
+                                 baked=n_baked,
+                                 ms=f"{t_total/max(global_step,1):.1f}")
 
         pbar.close()
-        avg_loss = epoch_loss / num_chunks
+        avg_loss = epoch_loss / max(n_trained, 1)
         bpc      = math.exp(avg_loss) / math.log(2)
         avg_ms   = t_total / max(global_step, 1)
         print(f"  epoch {epoch+1:4d}  loss={avg_loss:.5f}  bpc={bpc:.4f}"
-              f"  lr={float(lr):.2e}  avg_ms/chunk={avg_ms:.1f}")
+              f"  lr={float(lr):.2e}  window={window}/{num_chunks}"
+              f"  trained={n_trained}  baked={n_baked}  avg_ms/chunk={avg_ms:.1f}")
 
         # ---- validation: surat al-Fatihah ----
         val_logits = forward_train(base_xlstm, params, val_inputs_jnp,
@@ -1061,15 +1161,12 @@ def main():
         val_loss   = float(cross_entropy_loss(val_logits, val_targets_jnp))
         val_bpc    = math.exp(val_loss) / math.log(2)
 
-        n_seed = 10
-        val_target_gen = np.array(val_tokens[n_seed:], dtype=np.uint8)
         val_gen, val_wrong, val_acc, _, val_first = _eval_generative(
             base_xlstm, params, config,
-            seed_bytes=[int(b) for b in val_tokens[:n_seed]],
-            target_np=val_target_gen)
+            seed_bytes=[int(val_tokens[0])], target_np=val_target_np)
         val_first_str = f"byte {val_first}" if val_first is not None else "none (perfect)"
         print(f"  [VAL] bpc={val_bpc:.4f}  acc={val_acc*100:.2f}%  "
-              f"wrong={val_wrong}/{len(val_target_gen)}  first_wrong={val_first_str}")
+              f"wrong={val_wrong}/{n_val_pred}  first_wrong={val_first_str}")
         print(f"  [GEN] {ByteTokenizer.decode(val_gen)}")
 
         if avg_loss < 0.01:
@@ -1097,14 +1194,13 @@ def main():
     train_bpc = math.exp(total_eval_loss/num_chunks) / math.log(2)
     print(f"Train BPC (teacher-forced): {train_bpc:.4f}")
 
-    n_seed = 10
-    train_target = np.array(tokens[n_seed:], dtype=np.uint8)
-    n_train_pred = len(train_target)
-    print(f"Generating {n_train_pred} bytes seeded with first {n_seed} train bytes "
-          f"(0x{int(tokens[0]):02x}...)...")
-    _, train_wrong, train_acc, train_cer, train_first = _eval_generative(
+    n_train_pred = n_real - 1
+    train_target = np.array(tokens[1:], dtype=np.uint8)
+    print(f"Generating {n_train_pred} bytes from first train byte "
+          f"(0x{int(tokens[0]):02x})...")
+    train_gen, train_wrong, train_acc, train_cer, train_first = _eval_generative(
         base_xlstm, params, config,
-        seed_bytes=[int(b) for b in tokens[:n_seed]], target_np=train_target)
+        seed_bytes=[int(tokens[0])], target_np=train_target)
     train_first_str = f"byte {train_first}" if train_first is not None else "none (perfect)"
 
     print(f"\n{'='*60}")
