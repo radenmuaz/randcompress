@@ -1039,8 +1039,8 @@ def main():
                 # fw_str = f"pred{fw}→byte{fw+1}" if fw is not None else "ok"
                 # print(f"  [solo it={it:5d}] loss={float(loss):.5f}  "
                 print()
-                pbar.set_description(f"loss={float(loss):.5f}  "
-                      f"acc={acc:.1%}  first_fail={fw_str} {elapsed:.1f}s")
+                bpc = math.exp(loss) / math.log(2)
+                pbar.set_description(f"acc={acc:.1%} first_fail={fw_str} bpc={bpc:.4f}")
                 if acc == 1.0:
                     solo_success = True
                     break
@@ -1092,15 +1092,15 @@ def main():
             base_xlstm, params, config, gen_tokens)
         gen_fw_str = f"byte {gen_fw}" if gen_fw is not None else "none (perfect)"
         gen_path = os.path.join(log_dir, f"gen_seg{seg_idx+1:03d}_solo.txt")
+        full_gen = np.concatenate([[gen_tokens[0]], gen_out])
         with open(gen_path, "w", encoding="utf-8", errors="replace") as gf:
             gf.write(f"phase:       seg{seg_idx+1} SOLO\n"
                      f"segs:        1..{len(completed)}\n"
                      f"gen_acc:     {gen_acc:.1%}\n"
                      f"wrong:       {gen_wrong}/{len(gen_tokens)-1}\n"
                      f"first_wrong: {gen_fw_str}\n"
-                     f"\n--- seed byte ---\n{ByteTokenizer.decode([gen_tokens[0]])}\n"
-                     f"\n--- target ---\n{ByteTokenizer.decode(gen_tokens[1:])}\n"
-                     f"\n--- generated ---\n{ByteTokenizer.decode(gen_out)}\n")
+                     f"\n--- target ---\n{ByteTokenizer.decode(gen_tokens)}\n"
+                     f"\n--- generated ---\n{ByteTokenizer.decode(full_gen)}\n")
         save_checkpoint(os.path.join(log_dir, "ckpt_last"), params, config, seg_idx, "solo")
 
         if seg_idx == 0:
@@ -1135,12 +1135,18 @@ def main():
                 accs = eval_segments_stateful(base_xlstm, params, config, completed)
                 last_comb_accs = accs
                 all_perfect = all(a == 1.0 for a, _ in accs)
+                min_acc = min(a for a, _ in accs)
+                first_fail = next((fw for a, fw in accs if a < 1.0 and fw is not None), None)
+                fw_str = f"{first_fail}" if first_fail is not None else "ok"
+                bpc = math.exp(loss) / math.log(2)
+                print()
+                pbar.set_description(f"acc={min_acc:.1%} first_fail={fw_str} bpc={bpc:.4f}")
                 if it == MAX_ITER_PER_PHASE:
                     elapsed = time.perf_counter() - t0
                     parts = []
                     for pi, (pa, pfw) in enumerate(accs):
-                        fw_str = f"b{pfw+1}" if pfw is not None else "ok"
-                        parts.append(f"s{pi+1}={pa:.0%}({fw_str})")
+                        fw_str2 = f"b{pfw+1}" if pfw is not None else "ok"
+                        parts.append(f"s{pi+1}={pa:.0%}({fw_str2})")
                     print(f"  [comb it={it:5d}] loss={float(loss):.5f}  "
                           f"{' '.join(parts)}  {elapsed:.1f}s")
                 if all_perfect:
@@ -1175,14 +1181,14 @@ def main():
             base_xlstm, params, config, gen_tokens)
         gen_fw_str = f"byte {gen_fw}" if gen_fw is not None else "none (perfect)"
         gen_path = os.path.join(log_dir, f"gen_segs001_to_{seg_name}_combined.txt")
+        full_gen = np.concatenate([[gen_tokens[0]], gen_out])
         with open(gen_path, "w", encoding="utf-8", errors="replace") as gf:
             gf.write(f"phase:       COMBINED segs 1..{n_done}\n"
                      f"gen_acc:     {gen_acc:.1%}\n"
                      f"wrong:       {gen_wrong}/{len(gen_tokens)-1}\n"
                      f"first_wrong: {gen_fw_str}\n"
-                     f"\n--- seed byte ---\n{ByteTokenizer.decode([gen_tokens[0]])}\n"
-                     f"\n--- target ---\n{ByteTokenizer.decode(gen_tokens[1:])}\n"
-                     f"\n--- generated ---\n{ByteTokenizer.decode(gen_out)}\n")
+                     f"\n--- target ---\n{ByteTokenizer.decode(gen_tokens)}\n"
+                     f"\n--- generated ---\n{ByteTokenizer.decode(full_gen)}\n")
         save_checkpoint(os.path.join(log_dir, "ckpt_last"), params, config, seg_idx, "combined")
         run_elapsed = time.perf_counter() - t_run_start
         outer_pbar.update(len(seg))
