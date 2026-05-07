@@ -1,25 +1,20 @@
 """
-randcompress v4.1 — TBPTT persistent state (train + eval)
+randcompress v4.2 — exact BPTT with gradient rematerialisation
 
-Experiment: does carrying hidden state across chunk boundaries during both
-training AND generation fix the reconstruction failure beyond chunk_size?
+Changes from v4.1
+-----------------
+Training : exact BPTT — no stop_gradient between chunks.  All sequential
+           chunks for the epoch are stacked into one array and processed via
+           jax.lax.scan with jax.checkpoint on the scan body.  Gradients
+           flow back through every chunk boundary to the very first token.
+           Memory cost is O(state_size * num_chunks + activations_one_chunk)
+           instead of O(activations * num_chunks) thanks to remat.
 
-Changes from v4
----------------
-Training : persistent TBPTT — state carries over between sequential chunks via
-           stop_gradient (same as v2).  No random shuffling; chunks are always
-           processed in order within each epoch.
-Generation: no chunk reset, no warmup.  Hidden state flows continuously from
-           chunk 0 through the full file, exactly mirroring training.
-
-Hypothesis: v2 failed because training used ground-truth carry-over state but
-eval always reset to zero (train/eval mismatch).  Here both paths use
-persistent state so they are aligned.
+Generation: same as v4.1 — persistent state, no reset.
 
 Dataset : surat_al-fatihah.txt   (562 bytes)
-chunk_size : 128  (<< dataset)
-n_seed     : 32   (hardcoded, not chunk_size//4)
-warmup     : 0    (none — direct state reuse)
+chunk_size : 128
+n_seed     : 32
 """
 
 import jax
@@ -62,8 +57,7 @@ class Config(NamedTuple):
     learning_rate: float = 1e-3
     weight_decay:  float = 0.0
     grad_clip_norm:float = 1.0
-    random_shuffle:bool  = True   # True → random segments; False → sequential
-    state_reset_prob:float= 0.5   # prob of resetting state to zero at each chunk boundary
+    random_shuffle:bool  = True
 
 
 # ============================================================================
@@ -492,14 +486,34 @@ def forward_train_chunked(base_xlstm, rc, inputs, layer_states, num_heads, block
     return jnp.dot(x, rc.output_proj), new_states
 
 @jax.jit(static_argnames=["config"])
-def grad_chunk_persistent(base_xlstm, params, chunk_batch, layer_states, config):
-    inputs, targets = chunk_batch[:,:-1], chunk_batch[:,1:]
+def exact_bptt_step(base_xlstm, params, all_chunks, config):
+    """Exact BPTT over all chunks via scan + remat.
+
+    all_chunks : [num_chunks, chunk_size+1] int32
+    Gradients flow through every chunk boundary.  jax.checkpoint on the scan
+    body recomputes per-chunk activations in the backward pass instead of
+    storing them, so peak memory is O(state * num_chunks + acts_one_chunk).
+    """
+    num_heads = config.num_heads
+    block_map = config.block_map
+
     def loss_fn(p):
-        logits, new_states = forward_train_chunked(
-            base_xlstm, p, inputs, layer_states, config.num_heads, config.block_map)
-        return cross_entropy_loss(logits, targets), new_states
-    (loss, new_states), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-    return loss, grads, new_states
+        init_states = init_step_states(config, batch_size=1)
+
+        @jax.checkpoint
+        def scan_body(states, chunk):
+            inputs  = chunk[None, :-1]
+            targets = chunk[None, 1:]
+            logits, new_states = forward_train_chunked(
+                base_xlstm, p, inputs, states, num_heads, block_map)
+            loss = cross_entropy_loss(logits, targets)
+            return new_states, loss
+
+        _, per_chunk_losses = jax.lax.scan(scan_body, init_states, all_chunks)
+        return per_chunk_losses.mean()
+
+    loss, grads = jax.value_and_grad(loss_fn)(params)
+    return loss, grads
 
 
 def init_step_states(config, batch_size):
@@ -915,30 +929,29 @@ def main():
     train_log_file = open(train_log_path, "w", buffering=1)
     sys.stdout     = _Tee(sys.__stdout__, train_log_file)
 
-    dataset_path = "datasets/surat_al-fatihah.txt"
-    val_path     = "datasets/surat_al-fatihah.txt"
+    dataset_path = "datasets/quran-uthmani.txt"
+    val_path = "datasets/juz1.txt"
     tokens     = load_dataset(dataset_path)
     val_tokens = load_dataset(val_path)
     n_real = len(tokens)
     n_val  = len(val_tokens)
     chunk_size = 128
-    n_seed     = 32
+    n_seed     = 64
     print(f"Train: {n_real} bytes   Val: {n_val} bytes   chunk_size={chunk_size}  n_seed={n_seed}")
 
     # config = Config(
     #     vocab_size=256, d_model=32, num_heads=4, d_ff=64,
     #     num_layers=4, max_seq_len=chunk_size, seed=0, conv_kernel=4,
-    #     block_map="smsm", lora_r=4, batch_size=1,
-    #     learning_rate=5e-3, weight_decay=0.0, grad_clip_norm=100.0,
-    #     random_shuffle=False, state_reset_prob=0.5,
+    #     block_map="smsm", lora_r=16, batch_size=1,
+    #     learning_rate=1e-3, weight_decay=0.0, grad_clip_norm=100.0,
+    #     random_shuffle=False,
     # )
-
     config = Config(
-        vocab_size=256, d_model=16, num_heads=4, d_ff=32,
+        vocab_size=256, d_model=128, num_heads=4, d_ff=256,
         num_layers=4, max_seq_len=chunk_size, seed=0, conv_kernel=4,
-        block_map="smsm", lora_r=2, batch_size=1,
-        learning_rate=5e-3, weight_decay=0.0, grad_clip_norm=100.0,
-        random_shuffle=False, state_reset_prob=0.5,
+        block_map="smsm", lora_r=32, batch_size=1,
+        learning_rate=5e-3, weight_decay=0.0, grad_clip_norm=50.0,
+        random_shuffle=False,
     )
 
     key = jr.key(config.seed)
@@ -967,12 +980,16 @@ def main():
     opt_state = adamw_init(params)
 
     # Pad dataset to next chunk boundary so every byte is trained on.
-    num_chunks    = math.ceil((n_real - 1) / chunk_size)
-    pad_len       = num_chunks * chunk_size + 1 - n_real
+    # PAD_TOKEN=0 is already masked from loss (safe for Arabic UTF-8).
+    num_chunks  = math.ceil((n_real - 1) / chunk_size)
+    pad_len     = num_chunks * chunk_size + 1 - n_real
     tokens_padded = np.concatenate([tokens, np.zeros(pad_len, dtype=np.uint8)])
-    eval_chunks   = [tokens_padded[i*chunk_size : i*chunk_size + chunk_size + 1]
-                     for i in range(num_chunks)]
-    print(f"n_real={n_real}  pad={pad_len}  num_chunks={num_chunks}  state_reset_prob={config.state_reset_prob}")
+    eval_chunks = [tokens_padded[i*chunk_size : i*chunk_size + chunk_size + 1]
+                   for i in range(num_chunks)]
+    # stacked array for exact BPTT scan: [num_chunks, chunk_size+1]
+    all_chunks_jnp = jnp.array(
+        np.stack(eval_chunks), dtype=jnp.int32)
+    print(f"n_real={n_real}  pad={pad_len}  num_chunks={num_chunks}  exact BPTT + remat")
 
     val_inputs_jnp  = jnp.array(val_tokens[:-1][None,:], dtype=jnp.int32)
     val_targets_jnp = jnp.array(val_tokens[1:][None,:],  dtype=jnp.int32)
@@ -982,59 +999,25 @@ def main():
     t_total     = 0.0
     lr          = config.learning_rate
 
-    print(f"\nTBPTT persistent-state training  epochs={num_epochs}  log -> {train_log_path}")
+    print(f"\nExact BPTT + remat  epochs={num_epochs}  log -> {train_log_path}")
     print("-" * 60)
 
-    n_padded  = len(tokens_padded)
-    max_start = n_padded - chunk_size - 1
-
     for epoch in range(num_epochs):
-        states     = init_step_states(config, batch_size=1)
-        pos        = 0   # sequential cursor
-        epoch_loss = 0.0
-        recent     = []
+        t0 = time.perf_counter()
+        loss, grads = exact_bptt_step(base_xlstm, params, all_chunks_jnp, config)
+        params, opt_state = adamw_update(
+            opt_state, grads, params,
+            lr=lr, weight_decay=config.weight_decay, max_norm=config.grad_clip_norm)
+        t_total += (time.perf_counter() - t0) * 1000
+        global_step += 1
 
-        pbar = tqdm(total=num_chunks, desc=f"E{epoch+1:04d}", unit="chunk",
-                    dynamic_ncols=True, leave=True)
+        loss_f = float(loss)
+        bpc    = math.exp(loss_f) / math.log(2)
+        avg_ms = t_total / global_step
+        print(f"  epoch {epoch+1:4d}  loss={loss_f:.5f}  bpc={bpc:.4f}"
+              f"  lr={lr:.2e}  ms/epoch={avg_ms:.1f}")
 
-        for ci in range(num_chunks):
-            if np.random.random() < config.state_reset_prob:
-                # reset: jump to a fresh random position
-                states = init_step_states(config, batch_size=1)
-                pos    = int(np.random.randint(0, max_start + 1))
-            seg           = tokens_padded[pos : pos + chunk_size + 1]
-            pos           = (pos + chunk_size) % (max_start + 1)
-            chunk_batch   = jnp.array(seg[None,:], dtype=jnp.int32)
-            frozen_states = jax.lax.stop_gradient(states)
-
-            t0 = time.perf_counter()
-            loss, grads, states = grad_chunk_persistent(
-                base_xlstm, params, chunk_batch, frozen_states, config)
-            params, opt_state = adamw_update(
-                opt_state, grads, params,
-                lr=lr, weight_decay=config.weight_decay, max_norm=config.grad_clip_norm)
-            t_total += (time.perf_counter() - t0) * 1000
-            global_step += 1
-
-            loss_f = float(loss)
-            epoch_loss += loss_f
-            recent.append(loss_f)
-            if len(recent) > 50: recent.pop(0)
-            bpc     = math.exp(loss_f) / math.log(2)
-            avg_bpc = math.exp(sum(recent)/len(recent)) / math.log(2)
-            pbar.update(1)
-            pbar.set_postfix(loss=f"{loss_f:.4f}", bpc=f"{bpc:.3f}",
-                             avg_bpc=f"{avg_bpc:.3f}",
-                             ms=f"{t_total/max(global_step,1):.1f}")
-
-        pbar.close()
-        avg_loss = epoch_loss / num_chunks
-        bpc      = math.exp(avg_loss) / math.log(2)
-        avg_ms   = t_total / max(global_step, 1)
-        print(f"  epoch {epoch+1:4d}  loss={avg_loss:.5f}  bpc={bpc:.4f}"
-              f"  lr={lr:.2e}  avg_ms/chunk={avg_ms:.1f}")
-
-        if epoch % 50 == 0:
+        if epoch % 500 == 0:
             # teacher-forced BPC on val (chunked, persistent state)
             val_states = init_step_states(config, batch_size=1)
             val_loss_sum = 0.0
@@ -1075,7 +1058,15 @@ def main():
                     f"\n--- generated ---\n{val_gen_text}\n"
                 )
 
-        if avg_loss < 0.01:
+            train_target = np.array(tokens[n_seed:], dtype=np.uint8)
+            n_train_pred = len(train_target)
+            save_checkpoint(os.path.join(log_dir, f"epoch_{epoch}"), params, config,
+                            n_seed=n_seed, n_output=n_train_pred,
+                            seed_bytes=[int(b) for b in tokens[:n_seed]],
+                            warmup_tokens=0)
+
+
+        if val_acc == 1.0:
             print(f"\n  Converged at epoch {epoch+1}")
             break
 
