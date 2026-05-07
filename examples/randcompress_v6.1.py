@@ -1,5 +1,5 @@
 """
-randcompress v6
+randcompress v6.1
 
 Algorithm
 ---------
@@ -41,15 +41,15 @@ class _Tee:
 
 class Config(NamedTuple):
     vocab_size:    int   = 256
-    d_model:       int   = 128
+    d_model:       int   = 16
     num_heads:     int   = 4
-    d_ff:          int   = 256
-    num_layers:    int   = 4       # always overridden to len(block_map)
-    segment_size:  int   = 1024   # bytes per segment = chunk_size for exact BPTT
+    d_ff:          int   = 32
+    num_layers:    int   = 2       # always overridden to len(block_map)
+    segment_size:  int   = 512    # bytes per segment = chunk_size for exact BPTT
     seed:          int   = 0
     conv_kernel:   int   = 4
-    block_map:     str   = "msms"
-    lora_r:        int   = 16
+    block_map:     str   = "ms"
+    lora_r:        int   = 4
     batch_size:    int   = 1
     learning_rate: float = 1e-2
     weight_decay:  float = 0.0
@@ -59,7 +59,7 @@ class Config(NamedTuple):
     pad_token:     int   = 0
     dtype:         str   = "float32"   # stored as string (JSON/pickle safe)
     max_iter_per_phase: int = 50000
-    check_every:   int   = 500
+    check_every:   int   = 1000
     dataset:       str   = "datasets/juz1.txt"
 
 
@@ -680,14 +680,16 @@ def init_xlstm_params(key, config) -> xLSTMParams:
 # ============================================================================
 
 def init_hira_adapter(key, d_out, d_in, r) -> HiRAAdapter:
-    # A: orthonormal rows via SVD. B: zero-init (ΔW=0 at start).
-    raw = np.array(jr.normal(key, (r, d_in)))
+    # A: orthonormal rows via SVD. B: small random so ∂L/∂A ≠ 0 from step 1.
+    ka, kb = jr.split(key)
+    raw = np.array(jr.normal(ka, (r, d_in)))
     if r <= d_in:
         _, _, Vt = np.linalg.svd(raw, full_matrices=False)
         A = _bf(Vt / math.sqrt(d_in))
     else:
         A = _bf(raw / math.sqrt(d_in))
-    return HiRAAdapter(A=A, B=jnp.zeros((d_out, r), DTYPE))
+    B = _bf(np.array(jr.normal(kb, (d_out, r))) * (0.01 / math.sqrt(r)))
+    return HiRAAdapter(A=A, B=B)
 
 def init_block_hira(key, config, btype) -> BlockHiRA:
     d, d_ff, r = config.d_model, config.d_ff, config.lora_r
@@ -888,35 +890,25 @@ def eval_segments_stateful(base_xlstm, params, config, seg_list):
 def eval_generative(base_xlstm, params, config, all_tokens):
     """
     Seed with all_tokens[0], generate len(all_tokens)-1 bytes autoregressively.
-    At each failure feeds the CORRECT byte as next input (state correction —
-    prevents cascade so residual stays O(n_errors), not O(N)).
-    Returns (generated_np, bytes_wrong, accuracy, first_wrong, residual).
-    residual: dict {position → correct_byte} for every argmax failure.
+    Returns (generated_np, bytes_wrong, accuracy, first_wrong_byte_idx_or_None).
     """
     target_np  = np.array(all_tokens[1:], dtype=np.uint8)
     n          = len(target_np)
     states     = init_step_states(config, batch_size=1)
     cur_token  = jnp.array([int(all_tokens[0])])
     gen_result = []
-    residual   = {}
-    for t in range(n):
+    for _ in range(n):
         logit, states = _fwd_step_jit(
             base_xlstm, params, cur_token, states, config.num_heads, config.block_map)
-        pred = int(jnp.argmax(logit, axis=-1)[0])
-        correct = int(target_np[t])
-        if pred != correct:
-            residual[t] = correct          # store failure
-            cur_token = jnp.array([correct])  # feed correct → no cascade
-        else:
-            cur_token = jnp.array([pred])
-        gen_result.append(pred)
+        cur_token = jnp.argmax(logit, axis=-1)
+        gen_result.append(int(cur_token[0]))
     generated   = np.array(gen_result, dtype=np.uint8)
     wrong_mask  = generated != target_np
     bytes_wrong = int(np.sum(wrong_mask))
     accuracy    = (n - bytes_wrong) / n
     wrong_idxs  = np.where(wrong_mask)[0]
     first_wrong = int(wrong_idxs[0]) if len(wrong_idxs) > 0 else None
-    return generated, bytes_wrong, accuracy, first_wrong, residual
+    return generated, bytes_wrong, accuracy, first_wrong
 
 
 # ============================================================================

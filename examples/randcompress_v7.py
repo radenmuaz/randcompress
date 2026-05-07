@@ -1,5 +1,5 @@
 """
-randcompress v6
+randcompress v7
 
 Algorithm
 ---------
@@ -61,6 +61,11 @@ class Config(NamedTuple):
     max_iter_per_phase: int = 50000
     check_every:   int   = 500
     dataset:       str   = "datasets/juz1.txt"
+    # Loss: margin=0.0 → pure cross-entropy (v6); ce_weight=0.0 → pure margin loss
+    margin:        float = 1.0
+    ce_weight:     float = 0.05
+    # Residual: 0.0 → no residual stored; 1.0 → store all corrections
+    residual_budget: float = 0.05  # max fraction of dataset bytes to use for residual
 
 
 
@@ -509,6 +514,9 @@ def exact_bptt_step(base_xlstm, params, all_chunks, config):
     num_heads = config.num_heads
     block_map = config.block_map
 
+    margin    = config.margin
+    ce_weight = config.ce_weight
+
     def loss_fn(p):
         init_states = init_step_states(config, batch_size=1)
 
@@ -518,7 +526,7 @@ def exact_bptt_step(base_xlstm, params, all_chunks, config):
             targets = chunk[None, 1:]
             logits, new_states = forward_train_chunked(
                 base_xlstm, p, inputs, states, num_heads, block_map)
-            loss = cross_entropy_loss(logits, targets)
+            loss = training_loss(logits, targets, margin, ce_weight)
             return new_states, loss
 
         _, per_chunk_losses = jax.lax.scan(scan_body, init_states, all_chunks)
@@ -790,6 +798,31 @@ def cross_entropy_loss(logits, targets):
     mask        = (targets != PAD_TOKEN).astype(jnp.float32)
     return (loss_per_tok*mask).sum() / (mask.sum()+1e-8)
 
+def argmax_margin_loss(logits, targets, margin=1.0):
+    """Multiclass hinge loss — directly penalises argmax failures.
+    loss_t = max(0, max_{j≠y} logit_j − logit_y + margin)
+    Zero once correct token leads by ≥ margin. No gradient when already right.
+    Cross-entropy needs BPC→0 for 100% argmax; this only needs margin>0 (higher BPC ok).
+    """
+    target_logits = jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
+    # mask target class with -inf so max below ignores it
+    neg_inf       = jax.nn.one_hot(targets, logits.shape[-1]) * 1e9
+    best_wrong    = (logits - neg_inf).max(axis=-1)
+    loss_per_tok  = jnp.maximum(0.0, best_wrong - target_logits + margin)
+    mask          = (targets != PAD_TOKEN).astype(jnp.float32)
+    return (loss_per_tok * mask).sum() / (mask.sum() + 1e-8)
+
+def training_loss(logits, targets, margin=1.0, ce_weight=0.05):
+    """Primary: argmax margin.  Small CE term keeps gradients smooth near zero loss.
+    margin=0.0  → pure cross-entropy (degenerates to v6 behaviour).
+    ce_weight=0.0 → pure margin loss, no CE regularizer.
+    """
+    if margin == 0.0:
+        return cross_entropy_loss(logits, targets)
+    ce = cross_entropy_loss(logits, targets)
+    mg = argmax_margin_loss(logits, targets, margin)
+    return mg + ce_weight * ce
+
 
 # ============================================================================
 # Data helpers
@@ -887,29 +920,43 @@ def eval_segments_stateful(base_xlstm, params, config, seg_list):
 
 def eval_generative(base_xlstm, params, config, all_tokens):
     """
-    Seed with all_tokens[0], generate len(all_tokens)-1 bytes autoregressively.
-    At each failure feeds the CORRECT byte as next input (state correction —
-    prevents cascade so residual stays O(n_errors), not O(N)).
-    Returns (generated_np, bytes_wrong, accuracy, first_wrong, residual).
-    residual: dict {position → correct_byte} for every argmax failure.
+    Autoregressive decode with optional residual collection.
+
+    residual_budget (from config):
+      0.0  → no residual stored; pure argmax, cascade allowed.
+      >0.0 → collect corrections up to budget bytes of residual storage.
+             At each failure: store correction AND feed correct token (state
+             correction prevents cascade while budget remains).
+             Once budget exhausted: stop correcting, let cascade run.
+
+    Returns (generated_np, bytes_wrong, accuracy, first_wrong, residual_dict).
+    residual_dict is empty when residual_budget=0.0.
     """
-    target_np  = np.array(all_tokens[1:], dtype=np.uint8)
-    n          = len(target_np)
-    states     = init_step_states(config, batch_size=1)
-    cur_token  = jnp.array([int(all_tokens[0])])
+    target_np   = np.array(all_tokens[1:], dtype=np.uint8)
+    n           = len(target_np)
+    budget_bytes = int(config.residual_budget * len(all_tokens))  # max residual storage
+    bytes_per_entry = 4  # 1 value + 3 position (delta-encoded estimate)
+    max_entries = budget_bytes // bytes_per_entry if budget_bytes > 0 else 0
+
+    states    = init_step_states(config, batch_size=1)
+    cur_token = jnp.array([int(all_tokens[0])])
     gen_result = []
     residual   = {}
+
     for t in range(n):
         logit, states = _fwd_step_jit(
             base_xlstm, params, cur_token, states, config.num_heads, config.block_map)
-        pred = int(jnp.argmax(logit, axis=-1)[0])
+        pred    = int(jnp.argmax(logit, axis=-1)[0])
         correct = int(target_np[t])
-        if pred != correct:
-            residual[t] = correct          # store failure
-            cur_token = jnp.array([correct])  # feed correct → no cascade
+
+        if pred != correct and len(residual) < max_entries:
+            residual[t]  = correct
+            cur_token    = jnp.array([correct])   # state correction
         else:
             cur_token = jnp.array([pred])
+
         gen_result.append(pred)
+
     generated   = np.array(gen_result, dtype=np.uint8)
     wrong_mask  = generated != target_np
     bytes_wrong = int(np.sum(wrong_mask))
@@ -931,6 +978,13 @@ def save_checkpoint(ckpt_dir, params, config, seg_idx, phase):
         json.dump(meta, f, indent=2)
     with open(os.path.join(ckpt_dir, "params.pkl"), "wb") as f:
         pickle.dump(jax.tree_util.tree_map(np.array, params), f)
+
+def _save_residual(ckpt_dir, residual: dict):
+    """Save residual corrections. Empty dict → file still written (0 entries = no corrections)."""
+    import pickle
+    os.makedirs(ckpt_dir, exist_ok=True)
+    with open(os.path.join(ckpt_dir, "residual.pkl"), "wb") as f:
+        pickle.dump(residual, f)
 
 
 # ============================================================================
@@ -1179,9 +1233,10 @@ def main():
 
         # Generative eval + checkpoint (silent on PASS)
         gen_tokens = np.concatenate(completed)
-        gen_out, gen_wrong, gen_acc, gen_fw = eval_generative(
+        gen_out, gen_wrong, gen_acc, gen_fw, residual = eval_generative(
             base_xlstm, params, config, gen_tokens)
-        gen_fw_str = f"byte {gen_fw}" if gen_fw is not None else "none (perfect)"
+        gen_fw_str   = f"byte {gen_fw}" if gen_fw is not None else "none (perfect)"
+        residual_kb  = len(residual) * 4 / 1024
         gen_path = os.path.join(log_dir, f"gen_seg{seg_idx+1:03d}_solo.txt")
         full_gen = np.concatenate([[gen_tokens[0]], gen_out])
         with open(gen_path, "w", encoding="utf-8", errors="replace") as gf:
@@ -1190,9 +1245,11 @@ def main():
                      f"gen_acc:     {gen_acc:.1%}\n"
                      f"wrong:       {gen_wrong}/{len(gen_tokens)-1}\n"
                      f"first_wrong: {gen_fw_str}\n"
+                     f"residual:    {len(residual)} entries  {residual_kb:.2f} KB\n"
                      f"\n--- target ---\n{ByteTokenizer.decode(gen_tokens)}\n"
                      f"\n--- generated ---\n{ByteTokenizer.decode(full_gen)}\n")
         save_checkpoint(os.path.join(log_dir, "ckpt_last"), params, config, seg_idx, "solo")
+        _save_residual(os.path.join(log_dir, "ckpt_last"), residual)
 
         if seg_idx == 0:
             run_elapsed = time.perf_counter() - t_run_start
@@ -1269,9 +1326,10 @@ def main():
 
         # Generative eval + checkpoint (silent on PASS)
         gen_tokens = np.concatenate(completed)
-        gen_out, gen_wrong, gen_acc, gen_fw = eval_generative(
+        gen_out, gen_wrong, gen_acc, gen_fw, residual = eval_generative(
             base_xlstm, params, config, gen_tokens)
-        gen_fw_str = f"byte {gen_fw}" if gen_fw is not None else "none (perfect)"
+        gen_fw_str  = f"byte {gen_fw}" if gen_fw is not None else "none (perfect)"
+        residual_kb = len(residual) * 4 / 1024
         gen_path = os.path.join(log_dir, f"gen_segs001_to_{seg_name}_combined.txt")
         full_gen = np.concatenate([[gen_tokens[0]], gen_out])
         with open(gen_path, "w", encoding="utf-8", errors="replace") as gf:
@@ -1279,9 +1337,11 @@ def main():
                      f"gen_acc:     {gen_acc:.1%}\n"
                      f"wrong:       {gen_wrong}/{len(gen_tokens)-1}\n"
                      f"first_wrong: {gen_fw_str}\n"
+                     f"residual:    {len(residual)} entries  {residual_kb:.2f} KB\n"
                      f"\n--- target ---\n{ByteTokenizer.decode(gen_tokens)}\n"
                      f"\n--- generated ---\n{ByteTokenizer.decode(full_gen)}\n")
         save_checkpoint(os.path.join(log_dir, "ckpt_last"), params, config, seg_idx, "combined")
+        _save_residual(os.path.join(log_dir, "ckpt_last"), residual)
         run_elapsed = time.perf_counter() - t_run_start
         outer_pbar.update(len(seg))
         outer_pbar.set_postfix(seg=f"{seg_idx+1}/{n_segs}",

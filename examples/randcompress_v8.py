@@ -1,5 +1,5 @@
 """
-randcompress v6
+randcompress v8
 
 Algorithm
 ---------
@@ -40,28 +40,159 @@ class _Tee:
 # ============================================================================
 
 class Config(NamedTuple):
-    vocab_size:    int   = 256
+    # ── tokenisation (new v8) ─────────────────────────────────────────────────
+    # input_bits  → input_vocab  = 2**input_bits  (embedding table)
+    # output_bits → output_vocab = 2**output_bits (per-head softmax)
+    # output_heads: predictions fired per input step
+    # vocab_size is DERIVED = 2**input_bits; stored for checkpoint compat
+    #
+    # preset table (--preset <name>):
+    #   byte         8  8  1   sequence 1×   standard v7
+    #   nibble        4  4  1   sequence 2×   16-class per step
+    #   binary        1  1  1   sequence 8×   2-class per step
+    #   byte2bits     8  1  8   sequence 1×   asymmetric: byte in, 8 binary heads out
+    #   byte2nibbles  8  4  2   sequence 1×   asymmetric: byte in, 2 nibble heads out
+    #   mtp_binary    1  1  8   sequence 8×   binary seq, predict next 8 bits at once
+    input_bits:    int   = 8
+    output_bits:   int   = 8
+    output_heads:  int   = 1
+    vocab_size:    int   = 256    # derived = 2**input_bits; set by _parse_config
+    # ── architecture ─────────────────────────────────────────────────────────
     d_model:       int   = 128
     num_heads:     int   = 4
     d_ff:          int   = 256
-    num_layers:    int   = 4       # always overridden to len(block_map)
-    segment_size:  int   = 1024   # bytes per segment = chunk_size for exact BPTT
+    num_layers:    int   = 4      # always overridden to len(block_map)
+    segment_size:  int   = 1024   # in BYTES (converted to tokens in train loop)
     seed:          int   = 0
     conv_kernel:   int   = 4
     block_map:     str   = "msms"
     lora_r:        int   = 16
     batch_size:    int   = 1
+    # ── optimiser ────────────────────────────────────────────────────────────
     learning_rate: float = 1e-2
     weight_decay:  float = 0.0
     grad_clip_norm:float = 1e6
     random_shuffle:bool  = False
     sinkgd_l:      int   = 1
-    pad_token:     int   = 0
-    dtype:         str   = "float32"   # stored as string (JSON/pickle safe)
+    # ── loss ─────────────────────────────────────────────────────────────────
+    margin:        float = 1.0    # 0.0 → pure CE
+    # ce_weight:     float = 0.05
+    ce_weight:     float = 0.0
+    # ── residual ─────────────────────────────────────────────────────────────
+    # residual_budget: float = 0.05  # fraction of dataset bytes; 0.0 → disabled
+    residual_budget: float = 0.0  # fraction of dataset bytes; 0.0 → disabled
+    # ── misc ─────────────────────────────────────────────────────────────────
+    pad_token:     int   = 0      # -1 → masking disabled (use for sub-byte modes)
+    dtype:         str   = "float32"
     max_iter_per_phase: int = 50000
     check_every:   int   = 500
-    dataset:       str   = "datasets/juz1.txt"
+    # dataset:       str   = "datasets/juz1.txt"
+    dataset:       str   = "datasets/quran-uthmani.txt"
 
+# preset table ──────────────────────────────────────────────────────────────
+_PRESETS = {
+    "byte":         dict(input_bits=8, output_bits=8, output_heads=1, vocab_size=256, pad_token=0),
+    "nibble":       dict(input_bits=4, output_bits=4, output_heads=1, vocab_size=16,  pad_token=-1),
+    "binary":       dict(input_bits=1, output_bits=1, output_heads=1, vocab_size=2,   pad_token=-1),
+    "byte2bits":    dict(input_bits=8, output_bits=1, output_heads=8, vocab_size=256, pad_token=0),
+    "byte2nibbles": dict(input_bits=8, output_bits=4, output_heads=2, vocab_size=256, pad_token=0),
+    "mtp_binary":   dict(input_bits=1, output_bits=1, output_heads=8, vocab_size=2,   pad_token=-1),
+}
+
+# ── tokenisation helpers ───────────────────────────────────────────────────
+
+def bytes_to_tokens(raw: np.ndarray, bits: int) -> np.ndarray:
+    """Split each byte into 8//bits sub-tokens. bits ∈ {8,4,1}."""
+    if bits == 8: return raw.astype(np.int32)
+    if bits == 4:
+        hi = ((raw >> 4) & 0xF).astype(np.int32)
+        lo = (raw & 0xF).astype(np.int32)
+        return np.stack([hi, lo], axis=-1).ravel()
+    # bits == 1
+    return np.unpackbits(raw).astype(np.int32)
+
+def tokens_to_bytes(toks: np.ndarray, bits: int) -> np.ndarray:
+    """Inverse of bytes_to_tokens."""
+    if bits == 8: return toks.astype(np.uint8)
+    if bits == 4:
+        hi = (toks[0::2].astype(np.uint8) & 0xF) << 4
+        lo = toks[1::2].astype(np.uint8) & 0xF
+        return hi | lo
+    return np.packbits(toks.astype(np.uint8))
+
+def compute_targets_np(tokens: np.ndarray, config) -> np.ndarray:
+    """
+    Build target array for training from the input-space token sequence.
+    Returns shape [N_steps, output_heads] int32.
+    For symmetric modes: standard next-token shift.
+    For asymmetric (input_bits=8, output_bits<8): decompose next byte per head.
+    For MTP (output_heads>1, symmetric): stack next H tokens per step.
+    """
+    output_mask = (1 << config.output_bits) - 1
+    N = len(tokens) - 1  # number of prediction steps (need at least 1 lookahead)
+
+    if config.input_bits == config.output_bits and config.output_heads == 1:
+        # standard next-token
+        return tokens[1:N+1].reshape(N, 1)
+
+    if config.input_bits == 8 and config.output_bits < 8:
+        # asymmetric: tokens are bytes; decompose each next byte into heads
+        next_bytes = tokens[1:N+1].astype(np.int32)
+        heads = np.stack(
+            [(next_bytes >> (h * config.output_bits)) & output_mask
+             for h in range(config.output_heads)],
+            axis=-1)
+        return heads  # [N, output_heads]
+
+    # MTP symmetric: predict next output_heads tokens
+    # clip N so indices don't exceed
+    N_mtp = len(tokens) - config.output_heads
+    heads = np.stack(
+        [tokens[1+h : 1+h+N_mtp] for h in range(config.output_heads)],
+        axis=-1)
+    return heads  # [N_mtp, output_heads]
+
+# ── config validation ──────────────────────────────────────────────────────
+
+_WARNINGS = []
+
+def validate_config(config, n_dataset_bytes: int):
+    """Print warnings for bad / expensive config combinations."""
+    warns = []
+    ib, ob, oh = config.input_bits, config.output_bits, config.output_heads
+
+    # derived
+    input_vocab  = 2 ** ib
+    output_vocab = 2 ** ob
+    tokens_per_byte = 8 // ib
+    bits_per_step   = ob * oh
+
+    if input_vocab != config.vocab_size:
+        warns.append(f"vocab_size={config.vocab_size} ≠ 2**input_bits={input_vocab}; will be forced to {input_vocab}")
+    if ib not in (1, 4, 8):
+        warns.append(f"input_bits={ib} not in {{1,4,8}} — unsupported")
+    if ob not in (1, 4, 8):
+        warns.append(f"output_bits={ob} not in {{1,4,8}} — unsupported")
+    if bits_per_step < ib:
+        warns.append(f"output_bits*output_heads={bits_per_step} < input_bits={ib}: "
+                     f"each step produces fewer bits than it consumes — can't reconstruct bytes")
+    if ib < 8 and config.pad_token == 0:
+        warns.append(f"input_bits={ib} (sub-byte) but pad_token=0: token 0 is valid — "
+                     f"masking will silently drop real data; set pad_token=-1")
+    if tokens_per_byte > 1:
+        seq_len = n_dataset_bytes * tokens_per_byte
+        if seq_len > 500_000:
+            warns.append(f"input_bits={ib} → sequence length {seq_len:,} tokens "
+                         f"({tokens_per_byte}× dataset) — training will be very slow")
+    param_bytes = (config.d_model * config.d_ff * 2 +
+                   config.d_model * input_vocab +
+                   config.d_model * output_vocab * oh) * 4 * config.num_layers
+    if param_bytes > n_dataset_bytes * 10:
+        warns.append(f"param estimate ~{param_bytes//1024}KB >> dataset {n_dataset_bytes//1024}KB "
+                     f"— heavily over-parameterised, compression impossible at this scale")
+    for w in warns:
+        print(f"  [CONFIG WARN] {w}")
+    return warns
 
 
 # ============================================================================
@@ -498,6 +629,11 @@ def forward_step(base_xlstm, rc, token, states, num_heads, block_map):
 _fwd_step_jit    = jax.jit(forward_step,         static_argnames=["num_heads","block_map"])
 _fwd_chunked_jit = jax.jit(forward_train_chunked, static_argnames=["num_heads","block_map"])
 
+def _reshape_logits(flat, output_heads, output_bits):
+    """flat: [..., output_heads*output_vocab] → [..., output_heads, output_vocab]"""
+    output_vocab = 2 ** output_bits
+    return flat.reshape(*flat.shape[:-1], output_heads, output_vocab)
+
 
 # ============================================================================
 # Exact BPTT step (scan + remat over all chunks)
@@ -509,16 +645,44 @@ def exact_bptt_step(base_xlstm, params, all_chunks, config):
     num_heads = config.num_heads
     block_map = config.block_map
 
+    margin    = config.margin
+    ce_weight = config.ce_weight
+
     def loss_fn(p):
         init_states = init_step_states(config, batch_size=1)
 
+        oh = config.output_heads
+        ob = config.output_bits
+        out_mask = (1 << ob) - 1
+
         @jax.checkpoint
         def scan_body(states, chunk):
-            inputs  = chunk[None, :-1]
-            targets = chunk[None, 1:]
-            logits, new_states = forward_train_chunked(
+            inputs      = chunk[None, :-1]          # [1, S] input tokens
+            logits_flat, new_states = forward_train_chunked(
                 base_xlstm, p, inputs, states, num_heads, block_map)
-            loss = cross_entropy_loss(logits, targets)
+            logits = _reshape_logits(logits_flat, oh, ob)  # [1, S, oh, ov]
+
+            # compute per-head targets from chunk
+            if config.input_bits == 8 and ob < 8:
+                # asymmetric: decompose next byte into heads
+                next_bytes = chunk[1:][None, :]          # [1, S]
+                tgt = jnp.stack(
+                    [(next_bytes >> (h * ob)) & out_mask for h in range(oh)],
+                    axis=-1)                              # [1, S, oh]
+            elif oh > 1:
+                # MTP: stack next oh tokens
+                S = chunk.shape[0] - 1
+                tgt = jnp.stack(
+                    [chunk[1+h:1+h+S][None, :] for h in range(oh)],
+                    axis=-1)                              # [1, S, oh]
+            else:
+                tgt = chunk[1:][None, :, None]           # [1, S, 1]
+
+            # loss over all heads
+            loss = sum(
+                training_loss(logits[..., h, :], tgt[..., h], margin, ce_weight)
+                for h in range(oh)
+            ) / oh
             return new_states, loss
 
         _, per_chunk_losses = jax.lax.scan(scan_body, init_states, all_chunks)
@@ -718,8 +882,9 @@ def init_block_hira(key, config, btype) -> BlockHiRA:
 
 def init_randcompress_params(key, config) -> RandCompressParams:
     ks = jr.split(key, 2 + config.num_layers)
+    out_dim = config.output_heads * (2 ** config.output_bits)  # total output width
     return RandCompressParams(
-        output_proj=_bf(np.array(jr.normal(ks[0],(config.d_model,config.vocab_size)))*0.01),
+        output_proj=_bf(np.array(jr.normal(ks[0], (config.d_model, out_dim))) * 0.01),
         emb_hira   =init_hira_adapter(ks[1], config.vocab_size, config.d_model, config.lora_r),
         blocks     =[init_block_hira(ks[2+i], config, config.block_map[i])
                      for i in range(config.num_layers)],
@@ -790,6 +955,31 @@ def cross_entropy_loss(logits, targets):
     mask        = (targets != PAD_TOKEN).astype(jnp.float32)
     return (loss_per_tok*mask).sum() / (mask.sum()+1e-8)
 
+def argmax_margin_loss(logits, targets, margin=1.0):
+    """Multiclass hinge loss — directly penalises argmax failures.
+    loss_t = max(0, max_{j≠y} logit_j − logit_y + margin)
+    Zero once correct token leads by ≥ margin. No gradient when already right.
+    Cross-entropy needs BPC→0 for 100% argmax; this only needs margin>0 (higher BPC ok).
+    """
+    target_logits = jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
+    # mask target class with -inf so max below ignores it
+    neg_inf       = jax.nn.one_hot(targets, logits.shape[-1]) * 1e9
+    best_wrong    = (logits - neg_inf).max(axis=-1)
+    loss_per_tok  = jnp.maximum(0.0, best_wrong - target_logits + margin)
+    mask          = (targets != PAD_TOKEN).astype(jnp.float32)
+    return (loss_per_tok * mask).sum() / (mask.sum() + 1e-8)
+
+def training_loss(logits, targets, margin=1.0, ce_weight=0.05):
+    """Primary: argmax margin.  Small CE term keeps gradients smooth near zero loss.
+    margin=0.0  → pure cross-entropy (degenerates to v6 behaviour).
+    ce_weight=0.0 → pure margin loss, no CE regularizer.
+    """
+    if margin == 0.0:
+        return cross_entropy_loss(logits, targets)
+    ce = cross_entropy_loss(logits, targets)
+    mg = argmax_margin_loss(logits, targets, margin)
+    return mg + ce_weight * ce
+
 
 # ============================================================================
 # Data helpers
@@ -809,21 +999,26 @@ def load_dataset(path):
     with open(path, 'r', encoding='utf-8') as f:
         return ByteTokenizer.encode(f.read())
 
-def split_segments(tokens, segment_size):
-    segs = []
-    n = len(tokens)
-    i = 0
+def split_segments(raw_bytes, segment_size):
+    """Split raw byte array into segments of segment_size bytes."""
+    segs, n, i = [], len(raw_bytes), 0
     while i < n:
-        segs.append(tokens[i : i + segment_size])
+        segs.append(raw_bytes[i : i + segment_size])
         i += segment_size
     return segs
 
-def make_chunks_array(tokens, chunk_size):
-    """Pack tokens into [num_chunks, chunk_size+1] int32 array, zero-padded."""
-    n = len(tokens)
+def make_chunks_array(raw_bytes, config):
+    """
+    Tokenise raw_bytes with config.input_bits, then pack into
+    [num_chunks, chunk_size+1] int32 array, zero-padded.
+    chunk_size = config.segment_size * (8 // config.input_bits).
+    """
+    toks       = bytes_to_tokens(np.asarray(raw_bytes, dtype=np.uint8), config.input_bits)
+    chunk_size = config.segment_size * (8 // config.input_bits)
+    n          = len(toks)
     num_chunks = max(1, math.ceil((n - 1) / chunk_size))
     pad_len    = num_chunks * chunk_size + 1 - n
-    padded     = np.concatenate([tokens, np.zeros(pad_len, dtype=np.uint8)])
+    padded     = np.concatenate([toks, np.zeros(pad_len, dtype=np.int32)])
     chunks     = [padded[i*chunk_size : i*chunk_size + chunk_size + 1]
                   for i in range(num_chunks)]
     return jnp.array(np.stack(chunks), dtype=jnp.int32)
@@ -836,46 +1031,64 @@ def make_chunks_array(tokens, chunk_size):
 def eval_segments_stateful(base_xlstm, params, config, seg_list):
     """
     Zero-state TF eval with state flowing across segments.
-    preds[k] within a segment predicts seg[k+1].
-    Returns list of (accuracy, fail_at_pred_idx) per segment.
-    fail_at_pred_idx is 0-based index into the segment's prediction positions;
-    the failed byte is at position (fail_at_pred_idx + 1) within the segment.
+    Works in INPUT-TOKEN space. Reports byte-level accuracy.
+    Returns list of (accuracy, fail_at_byte_idx) per segment.
     """
-    chunk_size = config.segment_size
-    states = init_step_states(config, batch_size=1)
-    results = []
+    tok_per_byte = 8 // config.input_bits
+    chunk_size   = config.segment_size * tok_per_byte  # chunk in token units
+    ob, oh       = config.output_bits, config.output_heads
+    out_mask     = (1 << ob) - 1
+    states       = init_step_states(config, batch_size=1)
+    results      = []
 
-    for seg in seg_list:
-        n = len(seg)
-        if n < 2:
+    for seg_bytes in seg_list:
+        seg   = bytes_to_tokens(np.array(seg_bytes, dtype=np.uint8), config.input_bits)
+        n_tok = len(seg)
+        n_b   = len(seg_bytes)
+        if n_b < 2:
             results.append((1.0, None))
             continue
 
-        num_chunks = max(1, math.ceil((n - 1) / chunk_size))
-        pad_len    = num_chunks * chunk_size + 1 - n
-        padded     = np.concatenate([seg, np.zeros(pad_len, dtype=np.uint8)])
+        num_chunks = max(1, math.ceil((n_tok - 1) / chunk_size))
+        pad_len    = num_chunks * chunk_size + 1 - n_tok
+        padded     = np.concatenate([seg, np.zeros(pad_len, dtype=np.int32)])
 
-        all_preds = []
-        all_tgts  = []
+        byte_correct = []
         for ci in range(num_chunks):
             s     = ci * chunk_size
             chunk = padded[s : s + chunk_size + 1]
             inp   = jnp.array(chunk[None, :-1], dtype=jnp.int32)
-            tgt   = jnp.array(chunk[None, 1:],  dtype=jnp.int32)
-            logits, states = _fwd_chunked_jit(
+            logits_flat, states = _fwd_chunked_jit(
                 base_xlstm, params, inp, states, config.num_heads, config.block_map)
-            all_preds.append(np.array(jnp.argmax(logits[0], axis=-1)))
-            all_tgts.append(np.array(tgt[0]))
+            logits = _reshape_logits(logits_flat, oh, ob)   # [1, S, oh, ov]
+            preds  = np.array(jnp.argmax(logits[0], axis=-1))  # [S, oh]
 
-        preds_np = np.concatenate(all_preds)[:n-1]
-        tgts_np  = np.concatenate(all_tgts)[:n-1]
-        mask     = tgts_np != PAD_TOKEN
-        correct  = (preds_np == tgts_np) & mask
-        n_valid  = int(mask.sum())
-        acc      = float(correct.sum()) / max(n_valid, 1)
-        wrong    = np.where(~correct & mask)[0]
-        # wrong[0] is prediction index k → byte (k+1) of segment is wrong
-        fail_at = int(wrong[0]) if len(wrong) > 0 else None
+            # reconstruct predicted bytes from heads
+            if config.input_bits == 8 and ob < 8:
+                # asymmetric: heads reconstruct next byte
+                pred_bytes = np.zeros(preds.shape[0], np.uint8)
+                for h in range(oh):
+                    pred_bytes |= (preds[:, h].astype(np.uint8) & out_mask) << (h * ob)
+                tgt_bytes = padded[s+1 : s+chunk_size+1].astype(np.uint8)
+            elif oh == 1:
+                # symmetric: tokens → bytes
+                pred_toks = preds[:, 0]
+                pred_bytes = tokens_to_bytes(pred_toks, config.input_bits)
+                tgt_bytes  = tokens_to_bytes(padded[s+1:s+chunk_size+1], config.input_bits)
+            else:
+                # MTP: each head is a token prediction; use head-0 for accuracy
+                pred_toks  = preds[:, 0]
+                pred_bytes = tokens_to_bytes(pred_toks, config.input_bits)
+                tgt_bytes  = tokens_to_bytes(padded[s+1:s+chunk_size+1], config.input_bits)
+
+            # trim to actual segment length
+            valid = min(len(pred_bytes), max(0, n_b - 1 - ci * (chunk_size // tok_per_byte)))
+            byte_correct.extend((pred_bytes[:valid] == tgt_bytes[:valid]).tolist())
+
+        byte_correct = byte_correct[:n_b - 1]
+        n_valid = len(byte_correct)
+        acc     = float(sum(byte_correct)) / max(n_valid, 1)
+        fail_at = next((i for i, ok in enumerate(byte_correct) if not ok), None)
         results.append((acc, fail_at))
 
     return results
@@ -887,31 +1100,77 @@ def eval_segments_stateful(base_xlstm, params, config, seg_list):
 
 def eval_generative(base_xlstm, params, config, all_tokens):
     """
-    Seed with all_tokens[0], generate len(all_tokens)-1 bytes autoregressively.
-    At each failure feeds the CORRECT byte as next input (state correction —
-    prevents cascade so residual stays O(n_errors), not O(N)).
-    Returns (generated_np, bytes_wrong, accuracy, first_wrong, residual).
-    residual: dict {position → correct_byte} for every argmax failure.
+    Autoregressive decode with optional residual collection.
+
+    residual_budget (from config):
+      0.0  → no residual stored; pure argmax, cascade allowed.
+      >0.0 → collect corrections up to budget bytes of residual storage.
+             At each failure: store correction AND feed correct token (state
+             correction prevents cascade while budget remains).
+             Once budget exhausted: stop correcting, let cascade run.
+
+    Returns (generated_np, bytes_wrong, accuracy, first_wrong, residual_dict).
+    residual_dict is empty when residual_budget=0.0.
     """
-    target_np  = np.array(all_tokens[1:], dtype=np.uint8)
-    n          = len(target_np)
-    states     = init_step_states(config, batch_size=1)
-    cur_token  = jnp.array([int(all_tokens[0])])
-    gen_result = []
+    all_bytes    = np.array(all_tokens, dtype=np.uint8)  # always byte-level
+    target_bytes = all_bytes[1:]
+    n            = len(target_bytes)
+    budget_bytes = int(config.residual_budget * n)
+    bytes_per_entry = 4
+    max_entries  = budget_bytes // bytes_per_entry if budget_bytes > 0 else 0
+
+    ob, oh   = config.output_bits, config.output_heads
+    out_mask = (1 << ob) - 1
+    tok_per_byte = 8 // config.input_bits
+
+    states    = init_step_states(config, batch_size=1)
+    gen_bytes  = []
     residual   = {}
-    for t in range(n):
-        logit, states = _fwd_step_jit(
+
+    # input token stream (sub-byte modes expand the sequence)
+    input_toks = bytes_to_tokens(all_bytes, config.input_bits)
+    cur_token  = jnp.array([int(input_toks[0])])
+    tok_idx    = 0   # position in input_tok stream
+
+    for byte_idx in range(n):
+        # for sub-byte inputs: we step tok_per_byte times per byte
+        # but for generative we only need the LAST step's logit to predict next byte
+        # (earlier steps in the byte predict intra-byte tokens, handle if needed)
+        logit_flat, states = _fwd_step_jit(
             base_xlstm, params, cur_token, states, config.num_heads, config.block_map)
-        pred = int(jnp.argmax(logit, axis=-1)[0])
-        correct = int(target_np[t])
-        if pred != correct:
-            residual[t] = correct          # store failure
-            cur_token = jnp.array([correct])  # feed correct → no cascade
+        logits = _reshape_logits(logit_flat, oh, ob)  # [1, oh, ov]
+
+        # reconstruct predicted byte from heads
+        if config.input_bits == 8 and ob < 8:
+            # asymmetric: each head predicts ob bits of next byte
+            pred_byte = 0
+            for h in range(oh):
+                pred_byte |= (int(jnp.argmax(logits[0, h])) & out_mask) << (h * ob)
+            pred_byte = pred_byte & 0xFF
+        elif oh == 1:
+            pred_tok  = int(jnp.argmax(logits[0, 0]))
+            pred_byte = int(tokens_to_bytes(np.array([pred_tok], np.int32), config.input_bits)[0])
         else:
-            cur_token = jnp.array([pred])
-        gen_result.append(pred)
-    generated   = np.array(gen_result, dtype=np.uint8)
-    wrong_mask  = generated != target_np
+            pred_tok  = int(jnp.argmax(logits[0, 0]))
+            pred_byte = int(tokens_to_bytes(np.array([pred_tok], np.int32), config.input_bits)[0])
+
+        correct_byte = int(target_bytes[byte_idx])
+
+        if pred_byte != correct_byte and len(residual) < max_entries:
+            residual[byte_idx] = correct_byte
+            # feed correct token for state correction
+            correct_tok = int(bytes_to_tokens(np.array([correct_byte], np.uint8), config.input_bits)[0])
+            cur_token   = jnp.array([correct_tok])
+        else:
+            correct_tok = int(bytes_to_tokens(np.array([correct_byte], np.uint8), config.input_bits)[0])
+            pred_tok_   = int(bytes_to_tokens(np.array([pred_byte  ], np.uint8), config.input_bits)[0])
+            cur_token   = jnp.array([pred_tok_])
+
+        gen_bytes.append(pred_byte)
+        tok_idx += tok_per_byte  # advance (simplified: last sub-token feeds next byte)
+
+    generated   = np.array(gen_bytes, dtype=np.uint8)
+    wrong_mask  = generated != target_bytes
     bytes_wrong = int(np.sum(wrong_mask))
     accuracy    = (n - bytes_wrong) / n
     wrong_idxs  = np.where(wrong_mask)[0]
@@ -931,6 +1190,13 @@ def save_checkpoint(ckpt_dir, params, config, seg_idx, phase):
         json.dump(meta, f, indent=2)
     with open(os.path.join(ckpt_dir, "params.pkl"), "wb") as f:
         pickle.dump(jax.tree_util.tree_map(np.array, params), f)
+
+def _save_residual(ckpt_dir, residual: dict):
+    """Save residual corrections. Empty dict → file still written (0 entries = no corrections)."""
+    import pickle
+    os.makedirs(ckpt_dir, exist_ok=True)
+    with open(os.path.join(ckpt_dir, "residual.pkl"), "wb") as f:
+        pickle.dump(residual, f)
 
 
 # ============================================================================
@@ -957,8 +1223,18 @@ def _parse_config():
     # 1. Start from class defaults
     cfg = Config()._asdict()
 
-    # 2. --config path.json overrides
     argv = sys.argv[1:]
+
+    # 2. --preset <name> applies preset fields (before other overrides)
+    if "--preset" in argv:
+        idx = argv.index("--preset")
+        name = argv[idx + 1]
+        if name not in _PRESETS:
+            print(f"  [CONFIG WARN] unknown preset '{name}'; known: {list(_PRESETS)}")
+        else:
+            cfg.update(_PRESETS[name])
+
+    # 3. --config path.json overrides
     if "--config" in argv:
         idx = argv.index("--config")
         with open(argv[idx + 1]) as f:
@@ -966,10 +1242,10 @@ def _parse_config():
                 if k in cfg:
                     cfg[k] = v
 
-    # 3. --key val overrides (highest priority)
+    # 4. --key val overrides (highest priority)
     i = 0
     while i < len(argv):
-        if argv[i].startswith("--") and argv[i] != "--config":
+        if argv[i].startswith("--") and argv[i] not in ("--config", "--preset"):
             field = argv[i][2:]
             if field in cfg and i + 1 < len(argv):
                 cfg[field] = _cast(field, argv[i + 1])
@@ -977,8 +1253,9 @@ def _parse_config():
                 continue
         i += 1
 
-    # block_map is authoritative for num_layers
+    # derived: block_map → num_layers; input_bits → vocab_size
     cfg['num_layers'] = len(cfg['block_map'])
+    cfg['vocab_size'] = 2 ** cfg['input_bits']
 
     config = Config(**cfg)
 
@@ -1017,8 +1294,20 @@ def main():
     else:
         print("Config: all defaults")
 
-    tokens = load_dataset(config.dataset)
-    n_total = len(tokens)
+    raw_bytes = load_dataset(config.dataset)
+    n_total   = len(raw_bytes)
+
+    print(f"\nConfig validation:")
+    warns = validate_config(config, n_total)
+    if not warns:
+        print("  OK")
+
+    # tokenise dataset (sub-byte modes expand sequence; byte mode is a no-op)
+    tokens  = bytes_to_tokens(raw_bytes, config.input_bits)
+    tok_per_byte = 8 // config.input_bits
+    print(f"Tokenisation: input_bits={config.input_bits} output_bits={config.output_bits} "
+          f"output_heads={config.output_heads}  "
+          f"seq={len(tokens)} tokens ({tok_per_byte}× bytes)")
     print(f"Dataset: {config.dataset}  ({n_total} bytes)")
 
     key = jr.key(config.seed)
@@ -1054,7 +1343,7 @@ def main():
     opt_state = sinkgd_init(params)
     lr        = config.learning_rate
 
-    segs   = split_segments(tokens, config.segment_size)
+    segs   = split_segments(raw_bytes, config.segment_size)  # byte-level segments
     n_segs = len(segs)
     print(f"Segments: {n_segs} × {config.segment_size} bytes  (last={len(segs[-1])} bytes)")
     print(f"config.max_iter_per_phase={config.max_iter_per_phase}  config.check_every={config.check_every}  lr={lr}")
@@ -1105,7 +1394,7 @@ def main():
         # SOLO phase                                                           #
         # ------------------------------------------------------------------ #
         print(f"[SOLO] seg{seg_idx+1}  budget={config.max_iter_per_phase} iters")
-        solo_chunks = make_chunks_array(seg, config.segment_size)
+        solo_chunks = make_chunks_array(seg, config)
         t0          = time.perf_counter()
         solo_iters  = 0
         solo_success = False
@@ -1179,9 +1468,10 @@ def main():
 
         # Generative eval + checkpoint (silent on PASS)
         gen_tokens = np.concatenate(completed)
-        gen_out, gen_wrong, gen_acc, gen_fw = eval_generative(
+        gen_out, gen_wrong, gen_acc, gen_fw, residual = eval_generative(
             base_xlstm, params, config, gen_tokens)
-        gen_fw_str = f"byte {gen_fw}" if gen_fw is not None else "none (perfect)"
+        gen_fw_str   = f"byte {gen_fw}" if gen_fw is not None else "none (perfect)"
+        residual_kb  = len(residual) * 4 / 1024
         gen_path = os.path.join(log_dir, f"gen_seg{seg_idx+1:03d}_solo.txt")
         full_gen = np.concatenate([[gen_tokens[0]], gen_out])
         with open(gen_path, "w", encoding="utf-8", errors="replace") as gf:
@@ -1190,9 +1480,11 @@ def main():
                      f"gen_acc:     {gen_acc:.1%}\n"
                      f"wrong:       {gen_wrong}/{len(gen_tokens)-1}\n"
                      f"first_wrong: {gen_fw_str}\n"
+                     f"residual:    {len(residual)} entries  {residual_kb:.2f} KB\n"
                      f"\n--- target ---\n{ByteTokenizer.decode(gen_tokens)}\n"
                      f"\n--- generated ---\n{ByteTokenizer.decode(full_gen)}\n")
         save_checkpoint(os.path.join(log_dir, "ckpt_last"), params, config, seg_idx, "solo")
+        _save_residual(os.path.join(log_dir, "ckpt_last"), residual)
 
         if seg_idx == 0:
             run_elapsed = time.perf_counter() - t_run_start
@@ -1207,7 +1499,7 @@ def main():
         n_done = len(completed)
         print(f"[COMBINED] segs 1..{n_done}  budget={config.max_iter_per_phase} iters")
         combined_tokens = np.concatenate(completed)
-        combined_chunks = make_chunks_array(combined_tokens, config.segment_size)
+        combined_chunks = make_chunks_array(combined_tokens, config)
         t0              = time.perf_counter()
         comb_iters      = 0
         comb_success    = False
@@ -1269,9 +1561,10 @@ def main():
 
         # Generative eval + checkpoint (silent on PASS)
         gen_tokens = np.concatenate(completed)
-        gen_out, gen_wrong, gen_acc, gen_fw = eval_generative(
+        gen_out, gen_wrong, gen_acc, gen_fw, residual = eval_generative(
             base_xlstm, params, config, gen_tokens)
-        gen_fw_str = f"byte {gen_fw}" if gen_fw is not None else "none (perfect)"
+        gen_fw_str  = f"byte {gen_fw}" if gen_fw is not None else "none (perfect)"
+        residual_kb = len(residual) * 4 / 1024
         gen_path = os.path.join(log_dir, f"gen_segs001_to_{seg_name}_combined.txt")
         full_gen = np.concatenate([[gen_tokens[0]], gen_out])
         with open(gen_path, "w", encoding="utf-8", errors="replace") as gf:
@@ -1279,9 +1572,11 @@ def main():
                      f"gen_acc:     {gen_acc:.1%}\n"
                      f"wrong:       {gen_wrong}/{len(gen_tokens)-1}\n"
                      f"first_wrong: {gen_fw_str}\n"
+                     f"residual:    {len(residual)} entries  {residual_kb:.2f} KB\n"
                      f"\n--- target ---\n{ByteTokenizer.decode(gen_tokens)}\n"
                      f"\n--- generated ---\n{ByteTokenizer.decode(full_gen)}\n")
         save_checkpoint(os.path.join(log_dir, "ckpt_last"), params, config, seg_idx, "combined")
+        _save_residual(os.path.join(log_dir, "ckpt_last"), residual)
         run_elapsed = time.perf_counter() - t_run_start
         outer_pbar.update(len(seg))
         outer_pbar.set_postfix(seg=f"{seg_idx+1}/{n_segs}",
