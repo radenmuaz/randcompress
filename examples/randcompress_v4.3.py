@@ -516,6 +516,23 @@ def exact_bptt_step(base_xlstm, params, all_chunks, config):
     return loss, grads
 
 
+@jax.jit(static_argnames=["config"])
+def val_loss_scan(base_xlstm, params, all_val_chunks, config):
+    """Teacher-forced BPC over all val chunks via scan (no gradients)."""
+    init_states = init_step_states(config, batch_size=1)
+
+    def scan_body(states, chunk):
+        inputs  = chunk[None, :-1]
+        targets = chunk[None, 1:]
+        logits, new_states = forward_train_chunked(
+            base_xlstm, params, inputs, states, config.num_heads, config.block_map)
+        loss = cross_entropy_loss(logits, targets)
+        return new_states, loss
+
+    _, per_chunk_losses = jax.lax.scan(scan_body, init_states, all_val_chunks)
+    return per_chunk_losses.mean()
+
+
 def init_step_states(config, batch_size):
     B, K   = batch_size, config.conv_kernel
     NH, DH = config.num_heads, config.d_model // config.num_heads
@@ -930,20 +947,29 @@ def main():
     sys.stdout     = _Tee(sys.__stdout__, train_log_file)
 
     dataset_path = "datasets/juz1.txt"
-    val_path     = "datasets/surat_al-fatihah.txt"
+    val_path     = dataset_path
+    # val_path     = "datasets/surat_al-fatihah.txt"
     tokens     = load_dataset(dataset_path)
     val_tokens = load_dataset(val_path)
     n_real = len(tokens)
     n_val  = len(val_tokens)
     chunk_size = 128
-    n_seed     = 32
+    n_seed     = 64
     print(f"Train: {n_real} bytes   Val: {n_val} bytes   chunk_size={chunk_size}  n_seed={n_seed}")
 
+    # config = Config(
+    #     vocab_size=256, d_model=32, num_heads=4, d_ff=64,
+    #     num_layers=4, max_seq_len=chunk_size, seed=0, conv_kernel=4,
+    #     block_map="smsm", lora_r=16, batch_size=1,
+    #     learning_rate=1e-3, weight_decay=0.0, grad_clip_norm=100.0,
+    #     random_shuffle=False,
+    # )
     config = Config(
-        vocab_size=256, d_model=32, num_heads=4, d_ff=64,
+        vocab_size=256, d_model=16, num_heads=4, d_ff=64,
         num_layers=4, max_seq_len=chunk_size, seed=0, conv_kernel=4,
-        block_map="smsm", lora_r=4, batch_size=1,
-        learning_rate=5e-3, weight_decay=0.0, grad_clip_norm=100.0,
+        block_map="smsm", lora_r=2, batch_size=1,
+        learning_rate=5e-3,
+        weight_decay=0.0, grad_clip_norm=100.0,
         random_shuffle=False,
     )
 
@@ -984,46 +1010,43 @@ def main():
         np.stack(eval_chunks), dtype=jnp.int32)
     print(f"n_real={n_real}  pad={pad_len}  num_chunks={num_chunks}  exact BPTT + remat")
 
-    val_inputs_jnp  = jnp.array(val_tokens[:-1][None,:], dtype=jnp.int32)
-    val_targets_jnp = jnp.array(val_tokens[1:][None,:],  dtype=jnp.int32)
+    val_chunks_n = max(1, (n_val - 1) // chunk_size)
+    val_eval_chunks = [val_tokens[i*chunk_size : i*chunk_size + chunk_size + 1]
+                       for i in range(val_chunks_n)]
+    all_val_chunks_jnp = jnp.array(np.stack(val_eval_chunks), dtype=jnp.int32)
 
     num_epochs  = 10000
     global_step = 0
     t_total     = 0.0
     lr          = config.learning_rate
 
+
     print(f"\nExact BPTT + remat  epochs={num_epochs}  log -> {train_log_path}")
     print("-" * 60)
 
-    for epoch in range(num_epochs):
+    pbar = tqdm(range(num_epochs), desc="train", unit="epoch")
+    for epoch in pbar:
+        # lr = cosine_lr(global_step, num_epochs, config.learning_rate)
+
         t0 = time.perf_counter()
         loss, grads = exact_bptt_step(base_xlstm, params, all_chunks_jnp, config)
         params, opt_state = adamw_update(
             opt_state, grads, params,
             lr=lr, weight_decay=config.weight_decay, max_norm=config.grad_clip_norm)
-        t_total += (time.perf_counter() - t0) * 1000
+        elapsed_ms  = (time.perf_counter() - t0) * 1000
+        t_total    += elapsed_ms
         global_step += 1
 
         loss_f = float(loss)
         bpc    = math.exp(loss_f) / math.log(2)
         avg_ms = t_total / global_step
-        print(f"  epoch {epoch+1:4d}  loss={loss_f:.5f}  bpc={bpc:.4f}"
-              f"  lr={lr:.2e}  ms/epoch={avg_ms:.1f}")
+        pbar.set_postfix(loss=f"{loss_f:.5f}", bpc=f"{bpc:.4f}",
+                         lr=f"{lr:.2e}", ms=f"{avg_ms:.1f}")
 
-        if epoch % 100 == 0:
-            # teacher-forced BPC on val (chunked, persistent state)
-            val_states = init_step_states(config, batch_size=1)
-            val_loss_sum = 0.0
-            val_chunks_n = max(1, (n_val - 1) // chunk_size)
-            for vci in range(val_chunks_n):
-                vseg = val_tokens[vci*chunk_size : vci*chunk_size + chunk_size + 1]
-                vinp = jnp.array(vseg[:-1][None,:], dtype=jnp.int32)
-                vtgt = jnp.array(vseg[1:][None,:],  dtype=jnp.int32)
-                frozen_vs = jax.lax.stop_gradient(val_states)
-                vlogits, val_states = forward_train_chunked(
-                    base_xlstm, params, vinp, frozen_vs, config.num_heads, config.block_map)
-                val_loss_sum += float(cross_entropy_loss(vlogits, vtgt))
-            val_bpc = math.exp(val_loss_sum / val_chunks_n) / math.log(2)
+        if epoch % 1000 == 0:
+            # teacher-forced BPC on val (scan, JIT compiled)
+            val_mean_loss = val_loss_scan(base_xlstm, params, all_val_chunks_jnp, config)
+            val_bpc = math.exp(float(val_mean_loss)) / math.log(2)
 
             val_target_gen = np.array(val_tokens[n_seed:], dtype=np.uint8)
             val_gen, val_wrong, val_acc, _, val_first = _eval_generative(
@@ -1036,8 +1059,8 @@ def main():
             val_seed_text   = ByteTokenizer.decode(val_tokens[:n_seed])
             val_gen_text    = ByteTokenizer.decode(val_gen)
             val_target_text = ByteTokenizer.decode(val_target_gen)
-            print(f"  seed: {val_seed_text!r}")
-            print(f"  gen:  {val_gen_text}")
+            # print(f"  seed: {val_seed_text!r}")
+            # print(f"  gen:  {val_gen_text}")
             val_gen_path = f"{log_dir}/val_gen_epoch{epoch+1:04d}.txt"
             with open(val_gen_path, "w", encoding="utf-8", errors="replace") as f:
                 f.write(
@@ -1050,10 +1073,17 @@ def main():
                     f"\n--- target ---\n{val_target_text}\n"
                     f"\n--- generated ---\n{val_gen_text}\n"
                 )
+            train_target = np.array(tokens[n_seed:], dtype=np.uint8)
+            n_train_pred = len(train_target)
+            save_checkpoint(os.path.join(log_dir, "last_epoch"), params, config,
+                            n_seed=n_seed, n_output=n_train_pred,
+                            seed_bytes=[int(b) for b in tokens[:n_seed]],
+                            warmup_tokens=0)
+            print()
 
-        # if loss_f < 0.01:
-        #     print(f"\n  Converged at epoch {epoch+1}")
-        #     break
+        if val_acc == 1.0:
+            print(f"\n  Converged at epoch {epoch+1}")
+            break
 
     # ---- final evaluation ----
     print("\n" + "="*60)
