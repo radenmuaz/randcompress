@@ -1,5 +1,5 @@
 """
-randcompress v8
+randcompress v8.1
 
 Algorithm
 ---------
@@ -56,12 +56,7 @@ class Config(NamedTuple):
     input_bits:    int   = 8
     output_bits:   int   = 8
     output_heads:  int   = 1
-    vocab_size:    int   = 256    
-    # derived = 2**input_bits; set by _parse_config
-    # input_bits:    int   = 1
-    # output_bits:   int   = 1
-    # output_heads:  int   = 1
-    # vocab_size:    int   = 2   
+    vocab_size:    int   = 256    # derived = 2**input_bits; set by _parse_config
     # ── architecture ─────────────────────────────────────────────────────────
     d_model:       int   = 128
     num_heads:     int   = 4
@@ -70,7 +65,7 @@ class Config(NamedTuple):
     segment_size:  int   = 1024   # in BYTES (converted to tokens in train loop)
     seed:          int   = 0
     conv_kernel:   int   = 4
-    block_map:     str   = "mmms"
+    block_map:     str   = "msms"
     lora_r:        int   = 16
     batch_size:    int   = 1
     # ── optimiser ────────────────────────────────────────────────────────────
@@ -81,8 +76,12 @@ class Config(NamedTuple):
     sinkgd_l:      int   = 1
     # ── loss ─────────────────────────────────────────────────────────────────
     margin:        float = 1.0    # 0.0 → pure CE
-    ce_weight:     float = 0.05
-    # ce_weight:     float = 0.0
+    ce_weight:     float = 0.1
+    # ── PI integral action (v8.1) ─────────────────────────────────────────────
+    lambda_i:      float = 0.5    # integral gain; 0.0 → disables PI (uniform weights)
+    w_max:         float = 10.0   # max per-position weight (clips integral explosion)
+    # ── Lyapunov stability regularizer (v8.1) ────────────────────────────────
+    alpha_l:       float = 0.01   # Lyapunov weight; 0.0 → disables stability term
     # ── residual ─────────────────────────────────────────────────────────────
     residual_budget: float = 0.01  # fraction of dataset bytes; 0.0 → disabled
     # residual_budget: float = 0.0  # fraction of dataset bytes; 0.0 → disabled
@@ -90,7 +89,7 @@ class Config(NamedTuple):
     pad_token:     int   = 0      # -1 → masking disabled (use for sub-byte modes)
     dtype:         str   = "float32"
     max_iter_per_phase: int = 50000
-    check_every:   int   = 100
+    check_every:   int   = 500
     # dataset:       str   = "datasets/juz1.txt"
     dataset:       str   = "datasets/quran-uthmani.txt"
 
@@ -645,36 +644,39 @@ def _reshape_logits(flat, output_heads, output_bits):
 # ============================================================================
 
 @jax.jit(static_argnames=["config"])
-def exact_bptt_step(base_xlstm, params, all_inputs, all_targets, config):
+def exact_bptt_step(base_xlstm, params, all_inputs, all_targets, chunk_weights, config):
     """
-    all_inputs:  [num_chunks, chunk_size] int32  — input token ids
-    all_targets: [num_chunks, chunk_size, output_heads] int32  — precomputed targets
-    Gradients flow through all chunk boundaries via jax.lax.scan.
+    all_inputs:    [num_chunks, chunk_size] int32
+    all_targets:   [num_chunks, chunk_size, output_heads] int32  precomputed
+    chunk_weights: [num_chunks, chunk_size] float32  PI integral weights
     """
     num_heads = config.num_heads
     block_map = config.block_map
     margin    = config.margin
     ce_weight = config.ce_weight
+    alpha_l   = config.alpha_l
     oh        = config.output_heads
     ob        = config.output_bits
 
     def loss_fn(p):
         init_states = init_step_states(config, batch_size=1)
+        xlstm_eff   = apply_xlstm_hira(base_xlstm, p)
+        embedding   = xlstm_eff.embedding
 
         @jax.checkpoint
         def scan_body(states, xs):
-            inputs, tgt = xs                        # [S], [S, oh]
+            inputs, tgt, weights = xs              # [S], [S, oh], [S]
             logits_flat, new_states = forward_train_chunked(
                 base_xlstm, p, inputs[None, :], states, num_heads, block_map)
             logits = _reshape_logits(logits_flat, oh, ob)  # [1, S, oh, ov]
-            tgt_b  = tgt[None, :]                   # [1, S, oh]
-            loss = sum(
-                training_loss(logits[..., h, :], tgt_b[..., h], margin, ce_weight)
-                for h in range(oh)
-            ) / oh
-            return new_states, loss
+            tgt_b  = tgt[None, :]                          # [1, S, oh]
 
-        _, per_chunk_losses = jax.lax.scan(scan_body, init_states, (all_inputs, all_targets))
+            L_primary = weighted_training_loss(logits, tgt_b, weights, margin, ce_weight)
+            L_stable  = lyapunov_loss_cheap(logits, tgt_b, embedding, config)
+            return new_states, L_primary + L_stable
+
+        _, per_chunk_losses = jax.lax.scan(
+            scan_body, init_states, (all_inputs, all_targets, chunk_weights))
         return per_chunk_losses.mean()
 
     loss, grads = jax.value_and_grad(loss_fn)(params)
@@ -969,6 +971,77 @@ def training_loss(logits, targets, margin=1.0, ce_weight=0.05):
     mg = argmax_margin_loss(logits, targets, margin)
     return mg + ce_weight * ce
 
+def weighted_training_loss(logits, targets, weights, margin=1.0, ce_weight=0.05):
+    """Per-token loss weighted by PI integral importance.
+    weights: [S] float32, per input-step importance (≥1.0).
+    lambda_i=0.0 → all weights==1.0 → degenerates to training_loss.
+    """
+    ob = logits.shape[-1]
+    oh = logits.shape[-2] if logits.ndim == 4 else 1
+    loss_per_head = []
+    for h in range(oh):
+        lg = logits[..., h, :] if oh > 1 else logits
+        tg = targets[..., h]   if oh > 1 else targets
+        # per-token margin loss (not averaged yet)
+        if margin == 0.0:
+            log_probs   = jax.nn.log_softmax(lg, axis=-1)
+            per_tok_ce  = -jnp.take_along_axis(log_probs, tg[..., None], axis=-1)[..., 0]
+            per_tok     = per_tok_ce
+        else:
+            tgt_logit   = jnp.take_along_axis(lg, tg[..., None], axis=-1)[..., 0]
+            neg_inf_mask= jax.nn.one_hot(tg, lg.shape[-1]) * 1e9
+            best_wrong  = (lg - neg_inf_mask).max(axis=-1)
+            per_tok_mg  = jnp.maximum(0.0, best_wrong - tgt_logit + margin)
+            log_probs   = jax.nn.log_softmax(lg, axis=-1)
+            per_tok_ce  = -jnp.take_along_axis(log_probs, tg[..., None], axis=-1)[..., 0]
+            per_tok     = per_tok_mg + ce_weight * per_tok_ce
+        mask = (tg != PAD_TOKEN).astype(jnp.float32)
+        # apply PI weights (broadcast over batch dim if needed)
+        w = weights[None, :] if per_tok.ndim == 2 else weights
+        loss_per_head.append((per_tok * mask * w).sum() / (mask * w).sum().clip(1e-8))
+    return sum(loss_per_head) / oh
+
+def lyapunov_loss_cheap(logits, targets, embedding, config):
+    """Embedding-distance proxy for hidden-state divergence.
+    Penalises positions where argmax ≠ target by the embedding gap
+    ||embed(pred) - embed(target)||².
+    Cheap: no second forward pass. Captures first-order cascade risk.
+    alpha_l=0.0 → disabled.
+    """
+    if config.alpha_l == 0.0:
+        return jnp.array(0.0)
+    oh, ob = config.output_heads, config.output_bits
+    out_mask = (1 << ob) - 1
+    total = jnp.array(0.0)
+    for h in range(oh):
+        lg = logits[..., h, :] if oh > 1 else logits   # [B, S, V]
+        tg = targets[..., h]   if oh > 1 else targets   # [B, S]
+        preds = jax.lax.stop_gradient(jnp.argmax(lg, axis=-1))
+        wrong = (preds != tg).astype(jnp.float32)
+        # for byte-level: map pred/tgt tokens → embedding indices
+        emb_gap = jnp.sum((embedding[preds] - embedding[tg])**2, axis=-1)
+        total  += jnp.mean(emb_gap * wrong)
+    return config.alpha_l * total / oh
+
+# ── PI integral state (lives outside JIT) ─────────────────────────────────
+
+def make_integral_weights(n_bytes: int) -> np.ndarray:
+    return np.ones(n_bytes, dtype=np.float32)
+
+def update_integral(weights, seg_accs, seg_byte_offsets, seg_lengths, config):
+    """
+    After each eval: add lambda_i to weights from first-fail byte onwards in
+    each segment. Clips to w_max. lambda_i=0 → no-op.
+    """
+    if config.lambda_i == 0.0:
+        return weights
+    for (acc, fail_at), offset, seg_len in zip(seg_accs, seg_byte_offsets, seg_lengths):
+        if fail_at is not None:
+            lo = offset + fail_at
+            hi = offset + seg_len
+            weights[lo:hi] = np.minimum(weights[lo:hi] + config.lambda_i, config.w_max)
+    return weights
+
 
 # ============================================================================
 # Data helpers
@@ -1015,11 +1088,9 @@ def make_chunks_array(raw_bytes, config):
 
 def make_chunks_and_targets(raw_bytes, config):
     """
-    Tokenise raw_bytes with config.input_bits, precompute targets for all heads.
-
     Returns:
-      all_inputs:  [num_chunks, chunk_size] int32  — input token ids
-      all_targets: [num_chunks, chunk_size, output_heads] int32  — target token ids per head
+      all_inputs:  [num_chunks, chunk_size] int32
+      all_targets: [num_chunks, chunk_size, output_heads] int32
     """
     toks       = bytes_to_tokens(np.asarray(raw_bytes, dtype=np.uint8), config.input_bits)
     chunk_size = config.segment_size * (8 // config.input_bits)
@@ -1029,29 +1100,25 @@ def make_chunks_and_targets(raw_bytes, config):
     ob         = config.output_bits
     out_mask   = (1 << ob) - 1
 
-    # Pad enough for inputs + MTP lookahead (oh extra tokens after last input)
-    pad_len = num_chunks * chunk_size + oh - n
-    pad_len = max(pad_len, 0)
+    pad_len = max(0, num_chunks * chunk_size + oh - n)
     padded  = np.concatenate([toks, np.zeros(pad_len + oh, dtype=np.int32)])
 
-    all_inputs  = np.stack([padded[i*chunk_size : i*chunk_size + chunk_size]
-                             for i in range(num_chunks)]).astype(np.int32)
+    all_inputs = np.stack([padded[i*chunk_size : i*chunk_size + chunk_size]
+                           for i in range(num_chunks)]).astype(np.int32)
 
     tgt_chunks = []
     for i in range(num_chunks):
         chunk_tgts = np.zeros((chunk_size, oh), dtype=np.int32)
         if config.input_bits == 8 and ob < 8:
-            # asymmetric: decompose each next-byte into output_heads bit-fields
             next_bytes = padded[i*chunk_size + 1 : i*chunk_size + chunk_size + 1]
             for h in range(oh):
                 chunk_tgts[:, h] = (next_bytes >> (h * ob)) & out_mask
         else:
-            # symmetric (standard next-token or MTP): head h predicts token at offset 1+h
             for h in range(oh):
                 chunk_tgts[:, h] = padded[i*chunk_size + 1 + h : i*chunk_size + chunk_size + 1 + h]
         tgt_chunks.append(chunk_tgts)
 
-    all_targets = np.stack(tgt_chunks)  # [num_chunks, chunk_size, oh]
+    all_targets = np.stack(tgt_chunks)
     return jnp.array(all_inputs, dtype=jnp.int32), jnp.array(all_targets, dtype=jnp.int32)
 
 
@@ -1164,14 +1231,14 @@ def eval_generative(base_xlstm, params, config, all_tokens):
         # Sub-byte modes (nibble, binary): step at token granularity, reconstruct bytes.
         # No residual correction — operate purely autoregressively.
         pred_subtoks = []
-        n_pred = n * tok_per_byte          # tokens to predict (skip seed)
+        n_pred = n * tok_per_byte
         for t in range(n_pred):
             logit_flat, states = _fwd_step_jit(
                 base_xlstm, params, cur_token, states, config.num_heads, config.block_map)
             logits = _reshape_logits(logit_flat, oh, ob)   # [1, 1, ov]
-            pred_tok   = int(jnp.argmax(logits[0, 0]))
+            pred_tok  = int(jnp.argmax(logits[0, 0]))
             pred_subtoks.append(pred_tok)
-            cur_token  = jnp.array([pred_tok])
+            cur_token = jnp.array([pred_tok])
         gen_bytes = list(tokens_to_bytes(np.array(pred_subtoks, np.int32), config.input_bits))
     else:
         # Byte-level or asymmetric (byte2bits, byte2nibbles): one step per output byte.
@@ -1397,6 +1464,11 @@ def main():
     # Per-phase summary table rows
     phase_summary = []
 
+    # ── PI integral weights (v8.1) ─────────────────────────────────────────
+    integral_weights = make_integral_weights(n_total)  # [N_bytes] float32, starts 1.0
+    # precompute byte offsets for each segment
+    seg_byte_offsets = [i * config.segment_size for i in range(len(segs))]
+
     completed = []  # segments that passed solo+combined
     t_run_start = time.perf_counter()
     outer_pbar  = tqdm(total=n_total, desc="compress", unit="B", unit_scale=True,
@@ -1428,6 +1500,18 @@ def main():
         # ------------------------------------------------------------------ #
         print(f"[SOLO] seg{seg_idx+1}  budget={config.max_iter_per_phase} iters")
         solo_inputs, solo_targets = make_chunks_and_targets(seg, config)
+        tok_per_byte  = 8 // config.input_bits
+        chunk_size_tok = config.segment_size * tok_per_byte
+        n_solo_chunks  = solo_inputs.shape[0]
+
+        def _solo_weights():
+            w = integral_weights[byte_lo:byte_hi]
+            w_tok = np.repeat(w, tok_per_byte) if tok_per_byte > 1 else w.copy()
+            pad   = n_solo_chunks * chunk_size_tok - len(w_tok)
+            return jnp.array(
+                np.concatenate([w_tok, np.ones(pad, np.float32)])
+                .reshape(n_solo_chunks, chunk_size_tok))
+
         t0          = time.perf_counter()
         solo_iters  = 0
         solo_success = False
@@ -1435,7 +1519,8 @@ def main():
 
         pbar = tqdm(range(1, config.max_iter_per_phase + 1), desc=f"solo s{seg_idx+1}", unit="it", file=sys.stderr)
         for it in pbar:
-            loss, grads = exact_bptt_step(base_xlstm, params, solo_inputs, solo_targets, config)
+            loss, grads = exact_bptt_step(
+                base_xlstm, params, solo_inputs, solo_targets, _solo_weights(), config)
             params, opt_state = sinkgd_update(
                 opt_state, grads, params, lr=lr,
                 weight_decay=config.weight_decay, max_norm=config.grad_clip_norm,
@@ -1447,13 +1532,15 @@ def main():
                 accs = eval_segments_stateful(base_xlstm, params, config, [seg])
                 last_accs = accs
                 acc, fw = accs[0]
-                elapsed = time.perf_counter() - t0
+                # ── PI: update integral weights from failure position ──────
+                update_integral(integral_weights, accs,
+                                [byte_lo], [len(seg)], config)
                 fw_str = f"{fw}" if fw is not None else "ok"
-                # fw_str = f"pred{fw}→byte{fw+1}" if fw is not None else "ok"
-                # print(f"  [solo it={it:5d}] loss={float(loss):.5f}  "
                 print()
-                bpc = math.exp(loss) / math.log(2)
-                pbar.set_description(f"acc={acc:.2%} fail_at={fw_str} bpc={bpc:.4f}")
+                bpc = math.exp(float(loss)) / math.log(2)
+                w_mean = float(integral_weights[byte_lo:byte_hi].mean())
+                pbar.set_description(
+                    f"acc={acc:.1%} fail={fw_str} bpc={bpc:.4f} w={w_mean:.2f}")
                 if acc == 1.0:
                     solo_success = True
                     break
@@ -1469,14 +1556,14 @@ def main():
             run_elapsed = time.perf_counter() - t_run_start
             print(f"\n[FAIL] seg{seg_idx+1} SOLO — could not reach 100% in "
                   f"{config.max_iter_per_phase} iters  "
-                  f"(final acc={final_acc:.2%}  fail_at={fw_str})")
+                  f"(final acc={final_acc:.1%}  fail_at={fw_str})")
             if completed:
                 forget_accs = eval_segments_stateful(base_xlstm, params, config, completed + [seg])
                 print(f"[forgetting at fail]")
                 for pi, (pa, pfw) in enumerate(forget_accs):
                     label = f"NEW seg{seg_idx+1}" if pi == len(completed) else f"seg{pi+1:03d}"
                     fw_str2 = f"pred{pfw}→byte{pfw+1}" if pfw is not None else "ok"
-                    print(f"  {label}: acc={pa:.2%}  fail_at={fw_str2}")
+                    print(f"  {label}: acc={pa:.1%}  fail_at={fw_str2}")
             _print_time(seg_elapsed, run_elapsed)
             phase_summary.append(
                 (seg_idx+1, "SOLO", solo_iters, elapsed_solo, False, final_acc))
@@ -1533,6 +1620,23 @@ def main():
         print(f"[COMBINED] segs 1..{n_done}  budget={config.max_iter_per_phase} iters")
         combined_tokens = np.concatenate(completed)
         combined_inputs, combined_targets = make_chunks_and_targets(combined_tokens, config)
+        n_comb_chunks   = combined_inputs.shape[0]
+        comb_size_tok   = config.segment_size * (8 // config.input_bits)
+        comb_byte_len   = sum(len(s) for s in completed)
+        comb_byte_off   = seg_byte_offsets[:n_done]
+
+        def _comb_weights():
+            # stitch integral_weights across all completed segments
+            w_all = np.concatenate([
+                integral_weights[seg_byte_offsets[i]:seg_byte_offsets[i]+len(completed[i])]
+                for i in range(n_done)])
+            tok_per = 8 // config.input_bits
+            w_tok = np.repeat(w_all, tok_per) if tok_per > 1 else w_all.copy()
+            pad   = n_comb_chunks * comb_size_tok - len(w_tok)
+            return jnp.array(
+                np.concatenate([w_tok, np.ones(pad, np.float32)])
+                .reshape(n_comb_chunks, comb_size_tok))
+
         t0              = time.perf_counter()
         comb_iters      = 0
         comb_success    = False
@@ -1540,7 +1644,8 @@ def main():
 
         pbar = tqdm(range(1, config.max_iter_per_phase + 1), desc=f"comb 1..{n_done}", unit="it", file=sys.stderr)
         for it in pbar:
-            loss, grads = exact_bptt_step(base_xlstm, params, combined_inputs, combined_targets, config)
+            loss, grads = exact_bptt_step(
+                base_xlstm, params, combined_inputs, combined_targets, _comb_weights(), config)
             params, opt_state = sinkgd_update(
                 opt_state, grads, params, lr=lr,
                 weight_decay=config.weight_decay, max_norm=config.grad_clip_norm,
@@ -1551,13 +1656,16 @@ def main():
             if it % config.check_every == 0 or it == config.max_iter_per_phase:
                 accs = eval_segments_stateful(base_xlstm, params, config, completed)
                 last_comb_accs = accs
+                # ── PI: update integral weights for all completed segs ─────
+                update_integral(integral_weights, accs,
+                                comb_byte_off, [len(s) for s in completed], config)
                 all_perfect = all(a == 1.0 for a, _ in accs)
                 min_acc = min(a for a, _ in accs)
                 fail_at = next((fw for a, fw in accs if a < 1.0 and fw is not None), None)
                 fw_str = f"{fail_at}" if fail_at is not None else "ok"
                 bpc = math.exp(loss) / math.log(2)
                 print()
-                pbar.set_description(f"acc={min_acc:.2%} fail_at={fw_str} bpc={bpc:.4f}")
+                pbar.set_description(f"acc={min_acc:.1%} fail_at={fw_str} bpc={bpc:.4f}")
                 if it == config.max_iter_per_phase:
                     elapsed = time.perf_counter() - t0
                     parts = []
@@ -1581,7 +1689,7 @@ def main():
             if last_comb_accs:
                 for pi, (pa, pfw) in enumerate(last_comb_accs):
                     fw_str = f"pred{pfw}→byte{pfw+1}" if pfw is not None else "ok"
-                    print(f"  seg{pi+1:03d}: acc={pa:.2%}  fail_at={fw_str}")
+                    print(f"  seg{pi+1:03d}: acc={pa:.1%}  fail_at={fw_str}")
             _print_time(seg_elapsed, run_elapsed)
             phase_summary.append(
                 (seg_idx+1, "COMBINED", comb_iters, elapsed_comb, False,
@@ -1602,7 +1710,7 @@ def main():
         full_gen = np.concatenate([[gen_tokens[0]], gen_out])
         with open(gen_path, "w", encoding="utf-8", errors="replace") as gf:
             gf.write(f"phase:       COMBINED segs 1..{n_done}\n"
-                     f"gen_acc:     {gen_acc:.2%}\n"
+                     f"gen_acc:     {gen_acc:.1%}\n"
                      f"wrong:       {gen_wrong}/{len(gen_tokens)-1}\n"
                      f"first_wrong: {gen_fw_str}\n"
                      f"residual:    {len(residual)} entries  {residual_kb:.2f} KB\n"
