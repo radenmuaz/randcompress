@@ -1,15 +1,20 @@
 """
-randcompress v8.1
+randcompress v4.5 — v4.4 + speculative decoding for MTP byte presets
 
-Algorithm
----------
-Split dataset into fixed-size segments. For each new segment k:
-  SOLO     phase — train on segment k alone until 100% TF-accuracy (or FAIL).
-  COMBINED phase — train on segments 0..k together until 100% on all (or FAIL).
+Same training as v4.4 (TBPTT with random state drop).
 
-Per-segment TF-accuracy and first-fail-byte are reported before/after each phase
-to track forgetting. Checkpoint saved after every successful phase.
-config.max_iter_per_phase is the fixed budget; exceeding it declares FAIL and stops.
+Decoding:
+  byte / non-MTP → sequential (same as v4.4).
+  mtp_byte4 / mtp_byte8 → speculative macro-steps:
+    Each macro-step is ONE JIT call that:
+      1. Feeds cur_token → draft logits from all oh heads → draft[0..oh-1]
+      2. Feeds draft[0..oh-2] as a chunk → verification head-0 logits
+    Both forward passes are fused inside a single jit so apply_xlstm_hira
+    is computed once and weights are reused.
+    After the call, find the longest prefix where verify_pred[k] == draft[k+1].
+    All oh draft bytes are emitted regardless of acceptance; the acceptance
+    mask drives cur_token (state boundary) and tqdm display only.
+    Speedup: oh bytes for 2 JIT calls vs oh bytes for oh JIT calls.
 """
 
 import jax
@@ -56,7 +61,12 @@ class Config(NamedTuple):
     input_bits:    int   = 8
     output_bits:   int   = 8
     output_heads:  int   = 1
-    vocab_size:    int   = 256    # derived = 2**input_bits; set by _parse_config
+    vocab_size:    int   = 256    
+    # derived = 2**input_bits; set by _parse_config
+    # input_bits:    int   = 1
+    # output_bits:   int   = 1
+    # output_heads:  int   = 1
+    # vocab_size:    int   = 2   
     # ── architecture ─────────────────────────────────────────────────────────
     d_model:       int   = 128
     num_heads:     int   = 4
@@ -65,31 +75,27 @@ class Config(NamedTuple):
     segment_size:  int   = 1024   # in BYTES (converted to tokens in train loop)
     seed:          int   = 0
     conv_kernel:   int   = 4
-    block_map:     str   = "msms"
+    block_map:     str   = "mmms"
     lora_r:        int   = 16
     batch_size:    int   = 1
     # ── optimiser ────────────────────────────────────────────────────────────
     learning_rate: float = 1e-2
     weight_decay:  float = 0.0
     grad_clip_norm:float = 1e6
-    random_shuffle:bool  = False
     sinkgd_l:      int   = 1
     # ── loss ─────────────────────────────────────────────────────────────────
-    margin:        float = 1.0    # 0.0 → pure CE
-    ce_weight:     float = 0.1
-    # ── PI integral action (v8.1) ─────────────────────────────────────────────
-    lambda_i:      float = 0.5    # integral gain; 0.0 → disables PI (uniform weights)
-    w_max:         float = 10.0   # max per-position weight (clips integral explosion)
-    # ── Lyapunov stability regularizer (v8.1) ────────────────────────────────
-    alpha_l:       float = 0.01   # Lyapunov weight; 0.0 → disables stability term
-    # ── residual ─────────────────────────────────────────────────────────────
-    residual_budget: float = 0.01  # fraction of dataset bytes; 0.0 → disabled
-    # residual_budget: float = 0.0  # fraction of dataset bytes; 0.0 → disabled
+    margin:        float = 0.1    # 0.0 → pure CE
+    ce_weight:     float = 1.0
+    # ── TBPTT state drop (v4.1) ──────────────────────────────────────────────
+    state_reset_prob: float = 0.5  # prob of resetting hidden state each chunk step
+    # ── residual / stop ──────────────────────────────────────────────────────
+    residual_budget: float = 0.1  # fraction of dataset bytes; stop when errors fit
+    target_bpc:    float = 0.0    # also stop when BPC < this; 0.0 = disabled
     # ── misc ─────────────────────────────────────────────────────────────────
     pad_token:     int   = 0      # -1 → masking disabled (use for sub-byte modes)
     dtype:         str   = "float32"
-    max_iter_per_phase: int = 50000
-    check_every:   int   = 500
+    max_iters:     int   = 100000
+    check_every:   int   = 10000
     # dataset:       str   = "datasets/juz1.txt"
     dataset:       str   = "datasets/quran-uthmani.txt"
 
@@ -641,48 +647,93 @@ def _reshape_logits(flat, output_heads, output_bits):
     return flat.reshape(*flat.shape[:-1], output_heads, output_vocab)
 
 
+@functools.partial(jax.jit, static_argnames=["num_heads", "block_map", "oh", "ob"])
+def _spec_macro_step_jit(base_xlstm, params, cur_token, states, num_heads, block_map, oh, ob):
+    """
+    Fused speculative macro-step for MTP byte decoding.
+    apply_xlstm_hira is called once; both passes share the materialized weights.
+
+    Pass 1 (step): feed cur_token → draft [oh] byte predictions.
+    Pass 2 (chunk): feed draft[0..oh-2] → head-0 verification preds [oh-1].
+
+    Returns:
+      drafts:       [oh]    int32 — predicted bytes for positions t+1..t+oh
+      verify_preds: [oh-1]  int32 — head-0 preds after feeding each draft byte
+      states2:      hidden state after pass 1 + pass 2 (fed oh-1 draft tokens)
+    """
+    xlstm = apply_xlstm_hira(base_xlstm, params)
+
+    # ── Pass 1: step with cur_token ─────────────────────────────────────────
+    x = xlstm.embedding[cur_token]                                    # [1, d]
+    states1 = []
+    for block, btype, state in zip(xlstm.blocks, block_map, states):
+        x_n = layer_norm(x, block.norm1_w, block.norm1_b)
+        if btype == 'm':
+            cell_out, ns = mlstm_layer_step(block.mlstm, x_n, state, num_heads)
+        else:
+            cell_out, ns = slstm_layer_step(block.slstm, x_n, state, num_heads)
+        states1.append(ns)
+        x = x + cell_out
+        x_n = layer_norm(x, block.norm2_w, block.norm2_b)
+        x = x + gated_ffn(block.ffn_up, block.ffn_down, x_n)
+    x = layer_norm(x, xlstm.norm_w, xlstm.norm_b)
+    draft_flat = jnp.dot(x, params.output_proj)                       # [1, oh*ov]
+    draft_logits = _reshape_logits(draft_flat, oh, ob)                # [1, oh, ov]
+    drafts = jnp.argmax(draft_logits[0], axis=-1)                     # [oh]
+
+    # ── Pass 2: chunked verify on draft[0..oh-2] ────────────────────────────
+    chunk = drafts[None, :-1]                                          # [1, oh-1]
+    x2 = xlstm.embedding[chunk]                                       # [1, oh-1, d]
+    states2 = []
+    for block, btype, state in zip(xlstm.blocks, block_map, states1):
+        x_n = layer_norm(x2, block.norm1_w, block.norm1_b)
+        if btype == 'm':
+            cell_out, ns = mlstm_layer_parallel_with_init(block.mlstm, x_n, num_heads, state)
+        else:
+            cell_out, ns = slstm_layer_with_init(block.slstm, x_n, num_heads, state)
+        states2.append(ns)
+        x2 = x2 + cell_out
+        x_n = layer_norm(x2, block.norm2_w, block.norm2_b)
+        x2 = x2 + gated_ffn(block.ffn_up, block.ffn_down, x_n)
+    x2 = layer_norm(x2, xlstm.norm_w, xlstm.norm_b)
+    verify_flat = jnp.dot(x2, params.output_proj)                     # [1, oh-1, oh*ov]
+    verify_logits = _reshape_logits(verify_flat, oh, ob)              # [1, oh-1, oh, ov]
+    verify_preds = jnp.argmax(verify_logits[0, :, 0, :], axis=-1)     # [oh-1] head-0
+
+    return drafts, verify_preds, states2
+
+
 # ============================================================================
-# Exact BPTT step (scan + remat over all chunks)
+# Single TBPTT step with carry-in state (v4.1-style)
 # ============================================================================
 
-@jax.jit(static_argnames=["config"])
-def exact_bptt_step(base_xlstm, params, all_inputs, all_targets, chunk_weights, config):
+@functools.partial(jax.jit, static_argnames=["config"])
+def grad_chunk_persistent(base_xlstm, params, inputs, targets, layer_states, config):
     """
-    all_inputs:    [num_chunks, chunk_size] int32
-    all_targets:   [num_chunks, chunk_size, output_heads] int32  precomputed
-    chunk_weights: [num_chunks, chunk_size] float32  PI integral weights
+    inputs:      [1, S] int32
+    targets:     [1, S, output_heads] int32
+    layer_states: carry-in hidden state (stop_gradient applied by caller)
+    Returns (loss, grads, new_states). new_states flows to the next step.
     """
+    oh        = config.output_heads
+    ob        = config.output_bits
     num_heads = config.num_heads
     block_map = config.block_map
     margin    = config.margin
     ce_weight = config.ce_weight
-    alpha_l   = config.alpha_l
-    oh        = config.output_heads
-    ob        = config.output_bits
 
     def loss_fn(p):
-        init_states = init_step_states(config, batch_size=1)
-        xlstm_eff   = apply_xlstm_hira(base_xlstm, p)
-        embedding   = xlstm_eff.embedding
+        logits_flat, new_states = forward_train_chunked(
+            base_xlstm, p, inputs, layer_states, num_heads, block_map)
+        logits = _reshape_logits(logits_flat, oh, ob)   # [1, S, oh, ov]
+        loss = sum(
+            training_loss(logits[..., h, :], targets[..., h], margin, ce_weight)
+            for h in range(oh)
+        ) / oh
+        return loss, new_states
 
-        @jax.checkpoint
-        def scan_body(states, xs):
-            inputs, tgt, weights = xs              # [S], [S, oh], [S]
-            logits_flat, new_states = forward_train_chunked(
-                base_xlstm, p, inputs[None, :], states, num_heads, block_map)
-            logits = _reshape_logits(logits_flat, oh, ob)  # [1, S, oh, ov]
-            tgt_b  = tgt[None, :]                          # [1, S, oh]
-
-            L_primary = weighted_training_loss(logits, tgt_b, weights, margin, ce_weight)
-            L_stable  = lyapunov_loss_cheap(logits, tgt_b, embedding, config)
-            return new_states, L_primary + L_stable
-
-        _, per_chunk_losses = jax.lax.scan(
-            scan_body, init_states, (all_inputs, all_targets, chunk_weights))
-        return per_chunk_losses.mean()
-
-    loss, grads = jax.value_and_grad(loss_fn)(params)
-    return loss, grads
+    (loss, new_states), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    return loss, grads, new_states
 
 
 # ============================================================================
@@ -973,77 +1024,6 @@ def training_loss(logits, targets, margin=1.0, ce_weight=0.05):
     mg = argmax_margin_loss(logits, targets, margin)
     return mg + ce_weight * ce
 
-def weighted_training_loss(logits, targets, weights, margin=1.0, ce_weight=0.05):
-    """Per-token loss weighted by PI integral importance.
-    weights: [S] float32, per input-step importance (≥1.0).
-    lambda_i=0.0 → all weights==1.0 → degenerates to training_loss.
-    """
-    ob = logits.shape[-1]
-    oh = logits.shape[-2] if logits.ndim == 4 else 1
-    loss_per_head = []
-    for h in range(oh):
-        lg = logits[..., h, :] if oh > 1 else logits
-        tg = targets[..., h]   if oh > 1 else targets
-        # per-token margin loss (not averaged yet)
-        if margin == 0.0:
-            log_probs   = jax.nn.log_softmax(lg, axis=-1)
-            per_tok_ce  = -jnp.take_along_axis(log_probs, tg[..., None], axis=-1)[..., 0]
-            per_tok     = per_tok_ce
-        else:
-            tgt_logit   = jnp.take_along_axis(lg, tg[..., None], axis=-1)[..., 0]
-            neg_inf_mask= jax.nn.one_hot(tg, lg.shape[-1]) * 1e9
-            best_wrong  = (lg - neg_inf_mask).max(axis=-1)
-            per_tok_mg  = jnp.maximum(0.0, best_wrong - tgt_logit + margin)
-            log_probs   = jax.nn.log_softmax(lg, axis=-1)
-            per_tok_ce  = -jnp.take_along_axis(log_probs, tg[..., None], axis=-1)[..., 0]
-            per_tok     = per_tok_mg + ce_weight * per_tok_ce
-        mask = (tg != PAD_TOKEN).astype(jnp.float32)
-        # apply PI weights (broadcast over batch dim if needed)
-        w = weights[None, :] if per_tok.ndim == 2 else weights
-        loss_per_head.append((per_tok * mask * w).sum() / (mask * w).sum().clip(1e-8))
-    return sum(loss_per_head) / oh
-
-def lyapunov_loss_cheap(logits, targets, embedding, config):
-    """Embedding-distance proxy for hidden-state divergence.
-    Penalises positions where argmax ≠ target by the embedding gap
-    ||embed(pred) - embed(target)||².
-    Cheap: no second forward pass. Captures first-order cascade risk.
-    alpha_l=0.0 → disabled.
-    """
-    if config.alpha_l == 0.0:
-        return jnp.array(0.0)
-    oh, ob = config.output_heads, config.output_bits
-    out_mask = (1 << ob) - 1
-    total = jnp.array(0.0)
-    for h in range(oh):
-        lg = logits[..., h, :] if oh > 1 else logits   # [B, S, V]
-        tg = targets[..., h]   if oh > 1 else targets   # [B, S]
-        preds = jax.lax.stop_gradient(jnp.argmax(lg, axis=-1))
-        wrong = (preds != tg).astype(jnp.float32)
-        # for byte-level: map pred/tgt tokens → embedding indices
-        emb_gap = jnp.sum((embedding[preds] - embedding[tg])**2, axis=-1)
-        total  += jnp.mean(emb_gap * wrong)
-    return config.alpha_l * total / oh
-
-# ── PI integral state (lives outside JIT) ─────────────────────────────────
-
-def make_integral_weights(n_bytes: int) -> np.ndarray:
-    return np.ones(n_bytes, dtype=np.float32)
-
-def update_integral(weights, seg_accs, seg_byte_offsets, seg_lengths, config):
-    """
-    After each eval: add lambda_i to weights from first-fail byte onwards in
-    each segment. Clips to w_max. lambda_i=0 → no-op.
-    """
-    if config.lambda_i == 0.0:
-        return weights
-    for (acc, fail_at), offset, seg_len in zip(seg_accs, seg_byte_offsets, seg_lengths):
-        if fail_at is not None:
-            lo = offset + fail_at
-            hi = offset + seg_len
-            weights[lo:hi] = np.minimum(weights[lo:hi] + config.lambda_i, config.w_max)
-    return weights
-
 
 # ============================================================================
 # Data helpers
@@ -1090,9 +1070,11 @@ def make_chunks_array(raw_bytes, config):
 
 def make_chunks_and_targets(raw_bytes, config):
     """
+    Tokenise raw_bytes with config.input_bits, precompute targets for all heads.
+
     Returns:
-      all_inputs:  [num_chunks, chunk_size] int32
-      all_targets: [num_chunks, chunk_size, output_heads] int32
+      all_inputs:  [num_chunks, chunk_size] int32  — input token ids
+      all_targets: [num_chunks, chunk_size, output_heads] int32  — target token ids per head
     """
     toks       = bytes_to_tokens(np.asarray(raw_bytes, dtype=np.uint8), config.input_bits)
     chunk_size = config.segment_size * (8 // config.input_bits)
@@ -1102,25 +1084,29 @@ def make_chunks_and_targets(raw_bytes, config):
     ob         = config.output_bits
     out_mask   = (1 << ob) - 1
 
-    pad_len = max(0, num_chunks * chunk_size + oh - n)
+    # Pad enough for inputs + MTP lookahead (oh extra tokens after last input)
+    pad_len = num_chunks * chunk_size + oh - n
+    pad_len = max(pad_len, 0)
     padded  = np.concatenate([toks, np.zeros(pad_len + oh, dtype=np.int32)])
 
-    all_inputs = np.stack([padded[i*chunk_size : i*chunk_size + chunk_size]
-                           for i in range(num_chunks)]).astype(np.int32)
+    all_inputs  = np.stack([padded[i*chunk_size : i*chunk_size + chunk_size]
+                             for i in range(num_chunks)]).astype(np.int32)
 
     tgt_chunks = []
     for i in range(num_chunks):
         chunk_tgts = np.zeros((chunk_size, oh), dtype=np.int32)
         if config.input_bits == 8 and ob < 8:
+            # asymmetric: decompose each next-byte into output_heads bit-fields
             next_bytes = padded[i*chunk_size + 1 : i*chunk_size + chunk_size + 1]
             for h in range(oh):
                 chunk_tgts[:, h] = (next_bytes >> (h * ob)) & out_mask
         else:
+            # symmetric (standard next-token or MTP): head h predicts token at offset 1+h
             for h in range(oh):
                 chunk_tgts[:, h] = padded[i*chunk_size + 1 + h : i*chunk_size + chunk_size + 1 + h]
         tgt_chunks.append(chunk_tgts)
 
-    all_targets = np.stack(tgt_chunks)
+    all_targets = np.stack(tgt_chunks)  # [num_chunks, chunk_size, oh]
     return jnp.array(all_inputs, dtype=jnp.int32), jnp.array(all_targets, dtype=jnp.int32)
 
 
@@ -1233,17 +1219,73 @@ def eval_generative(base_xlstm, params, config, all_tokens):
         # Sub-byte modes (nibble, binary): step at token granularity, reconstruct bytes.
         # No residual correction — operate purely autoregressively.
         pred_subtoks = []
-        n_pred = n * tok_per_byte
+        n_pred = n * tok_per_byte          # tokens to predict (skip seed)
         for t in tqdm(range(n_pred), desc="gen", unit="tok", leave=False, file=sys.stderr):
             logit_flat, states = _fwd_step_jit(
                 base_xlstm, params, cur_token, states, config.num_heads, config.block_map)
             logits = _reshape_logits(logit_flat, oh, ob)   # [1, 1, ov]
-            pred_tok  = int(jnp.argmax(logits[0, 0]))
+            pred_tok   = int(jnp.argmax(logits[0, 0]))
             pred_subtoks.append(pred_tok)
-            cur_token = jnp.array([pred_tok])
+            cur_token  = jnp.array([pred_tok])
         gen_bytes = list(tokens_to_bytes(np.array(pred_subtoks, np.int32), config.input_bits))
+    elif oh > 1 and config.input_bits == 8 and ob == 8:
+        # MTP byte mode: speculative macro-steps (oh bytes per 1 JIT call).
+        # Each macro-step fuses draft+verify; apply_xlstm_hira computed once.
+        gen_bytes = []
+        byte_idx  = 0
+        _pbar = tqdm(total=n, desc="gen(spec)", unit="B", unit_scale=True,
+                     leave=False, file=sys.stderr)
+        while byte_idx < n:
+            n_remaining = n - byte_idx
+            if n_remaining >= oh:
+                # Full macro-step: produce oh bytes.
+                drafts_j, verify_j, states = _spec_macro_step_jit(
+                    base_xlstm, params, cur_token, states,
+                    config.num_heads, config.block_map, oh, ob)
+                drafts_np = np.array(drafts_j)      # [oh]
+                verify_np = np.array(verify_j)      # [oh-1]
+
+                # Acceptance prefix (cumprod of matches)
+                matches = (drafts_np[1:] == verify_np)
+                accept_mask = np.concatenate([[True], np.cumprod(matches, dtype=bool)])
+                n_accept = int(np.sum(accept_mask))
+
+                for k in range(oh):
+                    pred_byte  = int(drafts_np[k])
+                    tgt_byte   = int(target_bytes[byte_idx + k])
+                    if pred_byte != tgt_byte and len(residual) < max_entries:
+                        residual[byte_idx + k] = tgt_byte
+                    gen_bytes.append(pred_byte)
+
+                # State correction at macro-step boundary (last accepted byte)
+                last_pred = int(drafts_np[n_accept - 1])
+                last_tgt  = int(target_bytes[byte_idx + n_accept - 1])
+                if last_pred != last_tgt and len(residual) <= max_entries:
+                    cur_token = jnp.array([last_tgt])
+                else:
+                    cur_token = jnp.array([last_pred])
+
+                byte_idx += oh
+                _pbar.update(oh)
+                _pbar.set_postfix(wrong=len(residual), acc=f"{n_accept}/{oh}")
+            else:
+                # Tail: fewer than oh bytes remain → sequential fallback.
+                for k in range(n_remaining):
+                    logit_flat, states = _fwd_step_jit(
+                        base_xlstm, params, cur_token, states,
+                        config.num_heads, config.block_map)
+                    logits    = _reshape_logits(logit_flat, oh, ob)
+                    pred_byte = int(jnp.argmax(logits[0, 0]))
+                    tgt_byte  = int(target_bytes[byte_idx + k])
+                    if pred_byte != tgt_byte and len(residual) < max_entries:
+                        residual[byte_idx + k] = tgt_byte
+                    gen_bytes.append(pred_byte)
+                    cur_token = jnp.array([pred_byte])
+                    _pbar.update(1)
+                byte_idx += n_remaining
+        _pbar.close()
     else:
-        # Byte-level or asymmetric (byte2bits, byte2nibbles): one step per output byte.
+        # Byte-level or asymmetric (byte2bits, byte2nibbles): sequential, one step per byte.
         gen_bytes = []
         _pbar = tqdm(range(n), desc="gen", unit="B", unit_scale=True,
                      leave=False, file=sys.stderr)
@@ -1428,8 +1470,11 @@ def main():
     trainable = sum(np.prod(p.shape) for p in jax.tree_util.tree_leaves(params))
     total          = frozen + trainable
     dtype_bytes    = np.dtype(DTYPE).itemsize
-    param_bytes    = trainable * dtype_bytes
-    compress_ratio = n_total / param_bytes
+    param_bytes      = trainable * dtype_bytes
+    residual_bytes   = int(config.residual_budget * n_total)   # worst-case residual overhead
+    total_coded_bytes = param_bytes + residual_bytes
+    compress_ratio   = n_total / param_bytes
+    compress_ratio_r = n_total / total_coded_bytes             # including residual budget
     print(f"{'metric':<28}  {'value':>12}")
     print(f"{'-'*28}  {'-'*12}")
     print(f"{'frozen params':<28}  {frozen/1e6:>11.3f}M")
@@ -1440,308 +1485,119 @@ def main():
     print(f"{'dtype':<28}  {jnp.dtype(DTYPE).name:>12}")
     print(f"{'dtype bytes':<28}  {dtype_bytes:>12}")
     print(f"{'trainable param bytes':<28}  {param_bytes/1e6:>11.3f}M")
+    print(f"{'residual budget bytes':<28}  {residual_bytes/1e6:>11.3f}M  ({config.residual_budget*100:.1f}% of data)")
+    print(f"{'total coded bytes':<28}  {total_coded_bytes/1e6:>11.3f}M  (params + residual)")
     print(f"{'dataset bytes':<28}  {n_total/1e6:>11.3f}M")
     print(f"{'---':<28}  {'---':>12}")
     print(f"{'params / dataset byte':<28}  {trainable/n_total:>12.2f}")
-    print(f"{'compression ratio':<28}  {compress_ratio:>11.2f}x")
-    print(f"{'compressed?':<28}  {'yes' if compress_ratio > 1 else 'no (over-param)':>12}")
+    print(f"{'compression ratio (params)':<28}  {compress_ratio:>11.2f}x")
+    print(f"{'compression ratio (+ residual)':<28}  {compress_ratio_r:>11.2f}x")
+    print(f"{'compressed?':<28}  {'yes' if compress_ratio_r > 1 else 'no (over-param)':>12}")
 
     opt_state = sinkgd_init(params)
     lr        = config.learning_rate
 
-    segs   = split_segments(raw_bytes, config.segment_size)  # byte-level segments
-    n_segs = len(segs)
-    print(f"Segments: {n_segs} × {config.segment_size} bytes  (last={len(segs[-1])} bytes)")
-    print(f"config.max_iter_per_phase={config.max_iter_per_phase}  config.check_every={config.check_every}  lr={lr}")
+    # ── precompute all chunks and targets ────────────────────────────────────
+    tok_per_byte   = 8 // config.input_bits
+    chunk_size_tok = config.segment_size * tok_per_byte
+    all_inputs, all_targets = make_chunks_and_targets(raw_bytes, config)
+    num_chunks = all_inputs.shape[0]
 
-    # Crossover: first segment where cumulative data bytes > param_bytes
-    # (i.e. the first time storing these weights is actually smaller than the data seen so far)
-    crossover_byte = param_bytes
-    crossover_seg  = math.ceil(param_bytes / config.segment_size)  # 1-based segment index
-    crossover_frac = param_bytes / n_total * 100
-    if crossover_seg <= n_segs:
-        print(f"Compression crossover at seg {crossover_seg}/{n_segs}  "
-              f"(byte {crossover_byte:.0f} / {n_total}  =  {crossover_frac:.1f}% of dataset)")
-    else:
-        print(f"Compression crossover: never within dataset  "
-              f"(param_bytes={param_bytes:.0f} > dataset={n_total} bytes)")
+    # residual budget in entries (4 bytes each: uint32 position + uint8 value padded)
+    bytes_per_entry = 4
+    budget_bytes    = int(config.residual_budget * (n_total - 1))
+    max_entries     = budget_bytes // bytes_per_entry
+
+    print(f"Chunks: {num_chunks} × {chunk_size_tok} tokens  "
+          f"(segment_size={config.segment_size} bytes, tok_per_byte={tok_per_byte})")
+    print(f"Residual budget: {budget_bytes} bytes  ({max_entries} correction entries)")
+    print(f"max_iters={config.max_iters}  check_every={config.check_every}  "
+          f"state_reset_prob={config.state_reset_prob}  lr={lr}")
     print()
 
-    # Per-phase summary table rows
-    phase_summary = []
+    # ── flat TBPTT training loop ─────────────────────────────────────────────
+    states    = init_step_states(config, batch_size=1)
+    chunk_idx = 0
+    stop_reason = None
+    np.random.seed(config.seed + 1)
+    t_start = time.perf_counter()
 
-    # ── PI integral weights (v8.1) ─────────────────────────────────────────
-    integral_weights = make_integral_weights(n_total)  # [N_bytes] float32, starts 1.0
-    # precompute byte offsets for each segment
-    seg_byte_offsets = [i * config.segment_size for i in range(len(segs))]
+    pbar = tqdm(range(1, config.max_iters + 1), desc="train", unit="it",
+                file=sys.stderr, dynamic_ncols=True)
+    for it in pbar:
+        # v4.1-style random state drop: reset to zero and jump to random chunk
+        if config.state_reset_prob > 0 and np.random.random() < config.state_reset_prob:
+            states    = init_step_states(config, batch_size=1)
+            chunk_idx = int(np.random.randint(0, num_chunks))
 
-    completed = []  # segments that passed solo+combined
-    t_run_start = time.perf_counter()
-    outer_pbar  = tqdm(total=n_total, desc="compress", unit="B", unit_scale=True,
-                       unit_divisor=1024, file=sys.stderr, dynamic_ncols=True)
+        inp = all_inputs [chunk_idx][None, :]   # [1, S]
+        tgt = all_targets[chunk_idx][None, :]   # [1, S, oh]
+        chunk_idx = (chunk_idx + 1) % num_chunks
 
-    def _print_time(seg_elapsed, run_elapsed):
-        done = sum(len(s) for s in completed)
-        print(f"[time] seg={seg_elapsed:.1f}s  total={run_elapsed:.1f}s  "
-              f"bytes={done} ({done/1e6:.3f}M  {done/n_total*100:.1f}% of {n_total})")
+        frozen = jax.lax.stop_gradient(states)
+        loss, grads, states = grad_chunk_persistent(
+            base_xlstm, params, inp, tgt, frozen, config)
+        params, opt_state = sinkgd_update(
+            opt_state, grads, params, lr=lr,
+            weight_decay=config.weight_decay, max_norm=config.grad_clip_norm,
+            L=config.sinkgd_l)
 
-    for seg_idx in range(n_segs):
-        seg         = segs[seg_idx]
-        seg_name    = f"seg{seg_idx+1:03d}"
-        byte_lo     = seg_idx * config.segment_size
-        byte_hi     = byte_lo + len(seg)
-        t_seg_start = time.perf_counter()
+        bpc = math.exp(float(loss)) / math.log(2)
+        pbar.set_postfix(loss=f"{float(loss):.5f}", bpc=f"{bpc:.4f}")
 
-        # print(f"\n{'='*70}")
-        print(f"SEGMENT {seg_idx+1}/{n_segs}  bytes [{byte_lo}, {byte_hi})  len={len(seg)}")
-        if seg_idx + 1 == crossover_seg:
-            print(f"  *** COMPRESSION CROSSOVER: data trained ({byte_hi}B) now exceeds "
-                  f"param storage ({param_bytes:.0f}B) — actually compressing from here ***")
-        # print(f"{'='*70}")
+        if it % config.check_every == 0 or it == config.max_iters:
+            _, gen_wrong, gen_acc, gen_fw, residual = eval_generative(
+                base_xlstm, params, config, raw_bytes)
+            elapsed = time.perf_counter() - t_start
+            fw_str = f"byte {gen_fw}" if gen_fw is not None else "none"
+            print(f"\n[it={it:6d}] bpc={bpc:.4f}  gen_wrong={gen_wrong}/{n_total-1}"
+                  f"  budget={max_entries}  first_wrong={fw_str}  {elapsed:.0f}s")
 
-        # pre-solo forgetting printed only on FAIL (budget exhausted)
+            budget_done = gen_wrong <= max_entries
+            bpc_done    = config.target_bpc > 0 and bpc < config.target_bpc
 
-        # ------------------------------------------------------------------ #
-        # SOLO phase                                                           #
-        # ------------------------------------------------------------------ #
-        print(f"[SOLO] seg{seg_idx+1}  budget={config.max_iter_per_phase} iters")
-        solo_inputs, solo_targets = make_chunks_and_targets(seg, config)
-        tok_per_byte  = 8 // config.input_bits
-        chunk_size_tok = config.segment_size * tok_per_byte
-        n_solo_chunks  = solo_inputs.shape[0]
+            if budget_done:
+                stop_reason = f"residual_budget ({gen_wrong} corrections <= {max_entries})"
+            elif bpc_done:
+                stop_reason = f"target_bpc ({bpc:.4f} < {config.target_bpc})"
 
-        def _solo_weights():
-            w = integral_weights[byte_lo:byte_hi]
-            w_tok = np.repeat(w, tok_per_byte) if tok_per_byte > 1 else w.copy()
-            pad   = n_solo_chunks * chunk_size_tok - len(w_tok)
-            return jnp.array(
-                np.concatenate([w_tok, np.ones(pad, np.float32)])
-                .reshape(n_solo_chunks, chunk_size_tok))
-
-        t0          = time.perf_counter()
-        solo_iters  = 0
-        solo_success = False
-        last_accs   = None
-
-        pbar = tqdm(range(1, config.max_iter_per_phase + 1), desc=f"solo s{seg_idx+1}", unit="it", file=sys.stderr)
-        for it in pbar:
-            loss, grads = exact_bptt_step(
-                base_xlstm, params, solo_inputs, solo_targets, _solo_weights(), config)
-            params, opt_state = sinkgd_update(
-                opt_state, grads, params, lr=lr,
-                weight_decay=config.weight_decay, max_norm=config.grad_clip_norm,
-                L=config.sinkgd_l)
-            solo_iters = it
-            pbar.set_postfix(loss=f"{float(loss):.5f}")
-
-            if it % config.check_every == 0 or it == config.max_iter_per_phase:
-                accs = eval_segments_stateful(base_xlstm, params, config, [seg])
-                last_accs = accs
-                acc, fw = accs[0]
-                # ── PI: update integral weights from failure position ──────
-                update_integral(integral_weights, accs,
-                                [byte_lo], [len(seg)], config)
-                fw_str = f"{fw}" if fw is not None else "ok"
-                print()
-                bpc = math.exp(float(loss)) / math.log(2)
-                w_mean = float(integral_weights[byte_lo:byte_hi].mean())
-                pbar.set_description(
-                    f"acc={acc:.1%} fail={fw_str} bpc={bpc:.4f} w={w_mean:.2f}")
-                if acc == 1.0:
-                    solo_success = True
-                    break
+            if stop_reason:
+                print(f"[STOP] {stop_reason}")
+                pbar.close()
+                break
+    else:
         pbar.close()
 
-        elapsed_solo = time.perf_counter() - t0
+    if stop_reason is None:
+        stop_reason = f"max_iters ({config.max_iters})"
+        print(f"\n[STOP] {stop_reason}")
 
-        if not solo_success:
-            final_acc = last_accs[0][0] if last_accs else 0.0
-            final_fw  = last_accs[0][1] if last_accs else None
-            fw_str = f"pred{final_fw}→byte{final_fw+1}" if final_fw is not None else "ok"
-            seg_elapsed = time.perf_counter() - t_seg_start
-            run_elapsed = time.perf_counter() - t_run_start
-            print(f"\n[FAIL] seg{seg_idx+1} SOLO — could not reach 100% in "
-                  f"{config.max_iter_per_phase} iters  "
-                  f"(final acc={final_acc:.1%}  fail_at={fw_str})")
-            if completed:
-                forget_accs = eval_segments_stateful(base_xlstm, params, config, completed + [seg])
-                print(f"[forgetting at fail]")
-                for pi, (pa, pfw) in enumerate(forget_accs):
-                    label = f"NEW seg{seg_idx+1}" if pi == len(completed) else f"seg{pi+1:03d}"
-                    fw_str2 = f"pred{pfw}→byte{pfw+1}" if pfw is not None else "ok"
-                    print(f"  {label}: acc={pa:.1%}  fail_at={fw_str2}")
-            _print_time(seg_elapsed, run_elapsed)
-            phase_summary.append(
-                (seg_idx+1, "SOLO", solo_iters, elapsed_solo, False, final_acc))
-            break
+    # ── final generative eval + checkpoint ──────────────────────────────────
+    print("\nFinal generative eval...")
+    gen_out, gen_wrong, gen_acc, gen_fw, residual = eval_generative(
+        base_xlstm, params, config, raw_bytes)
+    gen_fw_str  = f"byte {gen_fw}" if gen_fw is not None else "none (perfect)"
+    residual_kb = len(residual) * bytes_per_entry / 1024
+    print(f"  gen_wrong={gen_wrong}  gen_acc={gen_acc:.4%}  first_wrong={gen_fw_str}")
+    print(f"  corrections={len(residual)} entries  {residual_kb:.2f} KB  "
+          f"budget={max_entries} entries ({budget_bytes} bytes)")
+    print(f"  reconstructable={'YES' if gen_wrong <= max_entries else 'NO'}")
 
-        print(f"[PASS] seg{seg_idx+1} SOLO — 100% in {solo_iters} iters  {elapsed_solo:.1f}s")
-        phase_summary.append((seg_idx+1, "SOLO", solo_iters, elapsed_solo, True, 1.0))
+    gen_path = os.path.join(log_dir, "gen_final.txt")
+    full_gen  = np.concatenate([[raw_bytes[0]], gen_out])
+    with open(gen_path, "w", encoding="utf-8", errors="replace") as gf:
+        gf.write(f"stop_reason:  {stop_reason}\n"
+                 f"gen_wrong:    {gen_wrong}\n"
+                 f"gen_acc:      {gen_acc:.4%}\n"
+                 f"first_wrong:  {gen_fw_str}\n"
+                 f"corrections:  {len(residual)} entries  {residual_kb:.2f} KB\n"
+                 f"budget:       {max_entries} entries  {budget_bytes} bytes\n"
+                 f"\n--- target ---\n{ByteTokenizer.decode(raw_bytes)}\n"
+                 f"\n--- generated ---\n{ByteTokenizer.decode(full_gen)}\n")
 
-        # ------------------------------------------------------------------ #
-        # Forgetting snapshot AFTER solo phase (effect on past segments)      #
-        # ------------------------------------------------------------------ #
-        if completed and solo_iters == config.max_iter_per_phase:
-            post_solo_accs = eval_segments_stateful(
-                base_xlstm, params, config, completed + [seg])
-            print(f"[post-solo forgetting]")
-            for pi, (pa, pfw) in enumerate(post_solo_accs):
-                label = f"seg{pi+1:03d}"
-                fw_str = f"pred{pfw}→byte{pfw+1}" if pfw is not None else "ok"
-                print(f"  {label}: acc={pa:.1%}  fail_at={fw_str}")
-
-        completed.append(seg)
-
-        # Generative eval + checkpoint (silent on PASS)
-        gen_tokens = np.concatenate(completed)
-        gen_out, gen_wrong, gen_acc, gen_fw, residual = eval_generative(
-            base_xlstm, params, config, gen_tokens)
-        gen_fw_str   = f"byte {gen_fw}" if gen_fw is not None else "none (perfect)"
-        residual_kb  = len(residual) * 4 / 1024
-        gen_path = os.path.join(log_dir, f"gen_seg{seg_idx+1:03d}_solo.txt")
-        full_gen = np.concatenate([[gen_tokens[0]], gen_out])
-        with open(gen_path, "w", encoding="utf-8", errors="replace") as gf:
-            gf.write(f"phase:       seg{seg_idx+1} SOLO\n"
-                     f"segs:        1..{len(completed)}\n"
-                     f"gen_acc:     {gen_acc:.1%}\n"
-                     f"wrong:       {gen_wrong}/{len(gen_tokens)-1}\n"
-                     f"first_wrong: {gen_fw_str}\n"
-                     f"residual:    {len(residual)} entries  {residual_kb:.2f} KB\n"
-                     f"\n--- target ---\n{ByteTokenizer.decode(gen_tokens)}\n"
-                     f"\n--- generated ---\n{ByteTokenizer.decode(full_gen)}\n")
-        save_checkpoint(os.path.join(log_dir, "ckpt_last"), params, config, seg_idx, "solo")
-        _save_residual(os.path.join(log_dir, "ckpt_last"), residual)
-
-        if seg_idx == 0:
-            run_elapsed = time.perf_counter() - t_run_start
-            outer_pbar.update(len(seg))
-            outer_pbar.set_postfix(seg=f"{seg_idx+1}/{n_segs}",
-                                   gen=f"{gen_acc:.0%}", t=f"{run_elapsed:.0f}s")
-            continue
-
-        # ------------------------------------------------------------------ #
-        # COMBINED phase: train on ALL completed segments together            #
-        # ------------------------------------------------------------------ #
-        n_done = len(completed)
-        print(f"[COMBINED] segs 1..{n_done}  budget={config.max_iter_per_phase} iters")
-        combined_tokens = np.concatenate(completed)
-        combined_inputs, combined_targets = make_chunks_and_targets(combined_tokens, config)
-        n_comb_chunks   = combined_inputs.shape[0]
-        comb_size_tok   = config.segment_size * (8 // config.input_bits)
-        comb_byte_len   = sum(len(s) for s in completed)
-        comb_byte_off   = seg_byte_offsets[:n_done]
-
-        def _comb_weights():
-            # stitch integral_weights across all completed segments
-            w_all = np.concatenate([
-                integral_weights[seg_byte_offsets[i]:seg_byte_offsets[i]+len(completed[i])]
-                for i in range(n_done)])
-            tok_per = 8 // config.input_bits
-            w_tok = np.repeat(w_all, tok_per) if tok_per > 1 else w_all.copy()
-            pad   = n_comb_chunks * comb_size_tok - len(w_tok)
-            return jnp.array(
-                np.concatenate([w_tok, np.ones(pad, np.float32)])
-                .reshape(n_comb_chunks, comb_size_tok))
-
-        t0              = time.perf_counter()
-        comb_iters      = 0
-        comb_success    = False
-        last_comb_accs  = None
-
-        pbar = tqdm(range(1, config.max_iter_per_phase + 1), desc=f"comb 1..{n_done}", unit="it", file=sys.stderr)
-        for it in pbar:
-            loss, grads = exact_bptt_step(
-                base_xlstm, params, combined_inputs, combined_targets, _comb_weights(), config)
-            params, opt_state = sinkgd_update(
-                opt_state, grads, params, lr=lr,
-                weight_decay=config.weight_decay, max_norm=config.grad_clip_norm,
-                L=config.sinkgd_l)
-            comb_iters = it
-            pbar.set_postfix(loss=f"{float(loss):.5f}")
-
-            if it % config.check_every == 0 or it == config.max_iter_per_phase:
-                accs = eval_segments_stateful(base_xlstm, params, config, completed)
-                last_comb_accs = accs
-                # ── PI: update integral weights for all completed segs ─────
-                update_integral(integral_weights, accs,
-                                comb_byte_off, [len(s) for s in completed], config)
-                all_perfect = all(a == 1.0 for a, _ in accs)
-                min_acc = min(a for a, _ in accs)
-                fail_at = next((fw for a, fw in accs if a < 1.0 and fw is not None), None)
-                fw_str = f"{fail_at}" if fail_at is not None else "ok"
-                bpc = math.exp(loss) / math.log(2)
-                print()
-                pbar.set_description(f"acc={min_acc:.1%} fail_at={fw_str} bpc={bpc:.4f}")
-                if it == config.max_iter_per_phase:
-                    elapsed = time.perf_counter() - t0
-                    parts = []
-                    for pi, (pa, pfw) in enumerate(accs):
-                        fw_str2 = f"b{pfw+1}" if pfw is not None else "ok"
-                        parts.append(f"s{pi+1}={pa:.0%}({fw_str2})")
-                    print(f"  [comb it={it:5d}] loss={float(loss):.5f}  "
-                          f"{' '.join(parts)}  {elapsed:.1f}s")
-                if all_perfect:
-                    comb_success = True
-                    break
-        pbar.close()
-
-        elapsed_comb = time.perf_counter() - t0
-
-        if not comb_success:
-            seg_elapsed = time.perf_counter() - t_seg_start
-            run_elapsed = time.perf_counter() - t_run_start
-            print(f"\n[FAIL] COMBINED segs 1..{n_done} — could not reach 100% in "
-                  f"{config.max_iter_per_phase} iters")
-            if last_comb_accs:
-                for pi, (pa, pfw) in enumerate(last_comb_accs):
-                    fw_str = f"pred{pfw}→byte{pfw+1}" if pfw is not None else "ok"
-                    print(f"  seg{pi+1:03d}: acc={pa:.1%}  fail_at={fw_str}")
-            _print_time(seg_elapsed, run_elapsed)
-            phase_summary.append(
-                (seg_idx+1, "COMBINED", comb_iters, elapsed_comb, False,
-                 min(a for a, _ in last_comb_accs) if last_comb_accs else 0.0))
-            break
-
-        mean_acc = sum(a for a, _ in last_comb_accs) / len(last_comb_accs)
-        phase_summary.append(
-            (seg_idx+1, "COMBINED", comb_iters, elapsed_comb, True, mean_acc))
-
-        # Generative eval + checkpoint (silent on PASS)
-        gen_tokens = np.concatenate(completed)
-        gen_out, gen_wrong, gen_acc, gen_fw, residual = eval_generative(
-            base_xlstm, params, config, gen_tokens)
-        gen_fw_str  = f"byte {gen_fw}" if gen_fw is not None else "none (perfect)"
-        residual_kb = len(residual) * 4 / 1024
-        gen_path = os.path.join(log_dir, f"gen_segs001_to_{seg_name}_combined.txt")
-        full_gen = np.concatenate([[gen_tokens[0]], gen_out])
-        with open(gen_path, "w", encoding="utf-8", errors="replace") as gf:
-            gf.write(f"phase:       COMBINED segs 1..{n_done}\n"
-                     f"gen_acc:     {gen_acc:.1%}\n"
-                     f"wrong:       {gen_wrong}/{len(gen_tokens)-1}\n"
-                     f"first_wrong: {gen_fw_str}\n"
-                     f"residual:    {len(residual)} entries  {residual_kb:.2f} KB\n"
-                     f"\n--- target ---\n{ByteTokenizer.decode(gen_tokens)}\n"
-                     f"\n--- generated ---\n{ByteTokenizer.decode(full_gen)}\n")
-        save_checkpoint(os.path.join(log_dir, "ckpt_last"), params, config, seg_idx, "combined")
-        _save_residual(os.path.join(log_dir, "ckpt_last"), residual)
-        run_elapsed = time.perf_counter() - t_run_start
-        outer_pbar.update(len(seg))
-        outer_pbar.set_postfix(seg=f"{seg_idx+1}/{n_segs}",
-                               gen=f"{gen_acc:.0%}", t=f"{run_elapsed:.0f}s")
-
-    outer_pbar.close()
-
-    # ------------------------------------------------------------------ #
-    # Summary table                                                        #
-    # ------------------------------------------------------------------ #
-    print(f"\n\n{'='*70}")
-    print(f"PHASE SUMMARY")
-    print(f"{'='*70}")
-    print(f"{'seg':>5}  {'phase':<10}  {'iters':>6}  {'time(s)':>8}  {'pass':>5}  {'acc':>7}")
-    print(f"{'-'*5}  {'-'*10}  {'-'*6}  {'-'*8}  {'-'*5}  {'-'*7}")
-    for seg_i, phase, iters, elapsed, passed, acc in phase_summary:
-        print(f"{seg_i:>5}  {phase:<10}  {iters:>6}  {elapsed:>8.1f}  "
-              f"{'PASS' if passed else 'FAIL':>5}  {acc:>7.1%}")
+    ckpt_dir = os.path.join(log_dir, "ckpt_last")
+    save_checkpoint(ckpt_dir, params, config, 0, "final")
+    _save_residual(ckpt_dir, residual)
 
     print(f"\nLog: {log_path}")
     log_file.close()

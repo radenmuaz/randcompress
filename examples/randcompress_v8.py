@@ -80,8 +80,8 @@ class Config(NamedTuple):
     random_shuffle:bool  = False
     sinkgd_l:      int   = 1
     # ── loss ─────────────────────────────────────────────────────────────────
-    margin:        float = 1.0    # 0.0 → pure CE
-    ce_weight:     float = 0.05
+    margin:        float = 10.0   # 0.0 → pure CE
+    ce_weight:     float = 1.0
     # ce_weight:     float = 0.0
     # ── residual ─────────────────────────────────────────────────────────────
     residual_budget: float = 0.01  # fraction of dataset bytes; 0.0 → disabled
@@ -97,6 +97,8 @@ class Config(NamedTuple):
 # preset table ──────────────────────────────────────────────────────────────
 _PRESETS = {
     "byte":         dict(input_bits=8, output_bits=8, output_heads=1, vocab_size=256, pad_token=0),
+    "mtp_byte4":    dict(input_bits=8, output_bits=8, output_heads=4, vocab_size=256, pad_token=0),
+    "mtp_byte8":    dict(input_bits=8, output_bits=8, output_heads=8, vocab_size=256, pad_token=0),
     "nibble":       dict(input_bits=4, output_bits=4, output_heads=1, vocab_size=16,  pad_token=-1),
     "binary":       dict(input_bits=1, output_bits=1, output_heads=1, vocab_size=2,   pad_token=-1),
     "byte2bits":    dict(input_bits=8, output_bits=1, output_heads=8, vocab_size=256, pad_token=-1),
@@ -1165,7 +1167,7 @@ def eval_generative(base_xlstm, params, config, all_tokens):
         # No residual correction — operate purely autoregressively.
         pred_subtoks = []
         n_pred = n * tok_per_byte          # tokens to predict (skip seed)
-        for t in range(n_pred):
+        for t in tqdm(range(n_pred), desc="gen", unit="tok", leave=False, file=sys.stderr):
             logit_flat, states = _fwd_step_jit(
                 base_xlstm, params, cur_token, states, config.num_heads, config.block_map)
             logits = _reshape_logits(logit_flat, oh, ob)   # [1, 1, ov]
@@ -1176,7 +1178,9 @@ def eval_generative(base_xlstm, params, config, all_tokens):
     else:
         # Byte-level or asymmetric (byte2bits, byte2nibbles): one step per output byte.
         gen_bytes = []
-        for byte_idx in range(n):
+        _pbar = tqdm(range(n), desc="gen", unit="B", unit_scale=True,
+                     leave=False, file=sys.stderr)
+        for byte_idx in _pbar:
             logit_flat, states = _fwd_step_jit(
                 base_xlstm, params, cur_token, states, config.num_heads, config.block_map)
             logits = _reshape_logits(logit_flat, oh, ob)   # [1, oh, ov]
@@ -1201,6 +1205,8 @@ def eval_generative(base_xlstm, params, config, all_tokens):
                 cur_token = jnp.array([pred_tok_])
 
             gen_bytes.append(pred_byte)
+            _pbar.set_postfix(wrong=len(residual))
+        _pbar.close()
 
     generated   = np.array(gen_bytes, dtype=np.uint8)
     wrong_mask  = generated != target_bytes
