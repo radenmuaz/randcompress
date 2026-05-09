@@ -1,37 +1,13 @@
 """
-randcompress v10.1 — Fully linear cells + growing-window curriculum (no SOLO phase)
+randcompress v10.2 — Fully linear cells + growing-window curriculum + exact BPTT
 
-Changes from v9:
-
-mLSTM (block type 'm') — linear, no gates:
-  - Remove all nonlinear gates (W_i, W_f, b_f, b_i, W_up, z-branch, act_ln).
-  - Replace forget/input gates with frozen per-head scalar decay alpha [NH],
-    log-uniform τ in [1, seq_len], alpha_h = exp(-1/τ_h). Implicit forgetting
-    via spectral radius, no sigmoid/exp at runtime.
-  - Cell: C_t = alpha[:,None,None]*C_{t-1} + phi_k⊗v  (pure linear accumulation)
-  - Output: h = phi_q @ C, then additive skip + multihead LayerNorm + W_down.
-  - q, k, v projected directly from layer-normed block input x (no W_up/silu).
-  - State: C only [B,NH,D_sym,DH]. No n, no m, no stabilizer.
-  - Training via jax.lax.scan (same path as eval). No parallel kernel needed.
-
-sRNN (block type 's') — whitened vanilla RNN:
-  - Replaces sLSTM entirely (sLSTMParams, sLSTMHiRA removed).
-  - h_t = LayerNorm(W_hh h_{t-1} + W_hx x_t + b)
-  - W_hh: near-critical SVD init, spectral radius=0.95 (implicit forgetting).
-  - W_hx: orthonormal init (white input → white pre-activation).
-  - LayerNorm inside cell enforces E[h_t]=0, Var[h_t_i]=1 at every step.
-    This makes H_B = I_r for both W_hx and W_hh HiRA adapters → SinkGD exact.
-  - State: h only [B, d_model]. No gates, no c, no n, no m.
-  - Only nonlinearity: LayerNorm (normalization, not a learnable gate).
-
-Both cells: no silu, no tanh, no sigmoid, no exp at runtime.
-HiRA B column-centering retained from v9.
-
-Curriculum (v10.1): growing-window, no SOLO phase.
-  Each step adds the next segment to the accumulated training set, then trains
-  for max_iter_per_phase TBPTT iterations on the full accumulated sequence.
-  State resets at each epoch (chunk_idx wraps). No accuracy gating — just keep
-  accumulating. eval_segments_stateful runs every check_every iters for logging.
+Changes from v10.1:
+  - Replace grad_chunk_persistent (truncated BPTT with manual grad accumulation)
+    with exact_bptt_step: jax.lax.scan over all chunks in one jax.value_and_grad
+    call, with @jax.checkpoint on the scan body (remat) to keep memory bounded.
+  - Gradients now flow through all chunk boundaries — true BPTT, not truncated.
+  - Training loop becomes a single call per iteration; no Python-level chunk loop.
+  - ce_loss returned as scan aux so BPC display is still based on pure CE.
 """
 
 import jax
@@ -68,31 +44,31 @@ class Config(NamedTuple):
     output_heads:  int   = 1
     vocab_size:    int   = 256
     # ── architecture ─────────────────────────────────────────────────────────
-    d_model:       int   = 256
+    d_model:       int   = 128
     num_heads:     int   = 8
-    num_layers:    int   = 4      # always overridden to len(block_map)
     segment_size:  int   = 1024
     power_p:       int   = 2      # mLSTM attention kernel degree; 1 = v4.4.1 baseline
     # power_p:       int   = 2      # mLSTM attention kernel degree; 1 = v4.4.1 baseline
     seed:          int   = 0
-    stride_map:    str   = "1111"  # one digit per layer; stride-N fires every N tokens
-    block_map:     str   = "mmmm"
-    # block_map:     str   = "ssssssss"
-    # stride_map:    str   = "1248"  # one digit per layer; stride-N fires every N tokens
-    # block_map:     str   = "smmm"
-    lora_r:        int   = 32
+    # stride_map:    str   = "1111"  # one digit per layer; stride-N fires every N tokens
+    # block_map:     str   = "mmmm"
+    num_layers:    int   = 8      # always overridden to len(block_map)
+    block_map:     str   = "ms"*4
+    stride_map:    str   = "11224488"  # one digit per layer; stride-N fires every N tokens
+    block_map:     str   = "smmm"
+    lora_r:        int   = 16
     batch_size:    int   = 1
     # ── optimiser ────────────────────────────────────────────────────────────
     learning_rate: float = 1e-2    # SinkGD: step = √(mn)·lr; output_proj is 64×256 → √=128, so lr≈1/128
     # learning_rate: float = 1.0    # SinkGD: step = √(mn)·lr; output_proj is 64×256 → √=128, so lr≈1/128
     weight_decay:  float = 0.0
-    grad_clip_norm:float = 10
-    sinkgd_l:      int   = 5
+    grad_clip_norm:float = 1e6
+    sinkgd_l:      int   = 2
     # ── loss ─────────────────────────────────────────────────────────────────
-    # margin:        float = 1.0
-    # ce_weight:     float = 0.0
     margin:        float = 1.0
-    ce_weight:     float = 0.1
+    ce_weight:     float = 0.0
+    # margin:        float = 1.0
+    # ce_weight:     float = 0.1
     # ── TBPTT state drop ─────────────────────────────────────────────────────
     state_reset_prob: float = 1.
     # ── residual / stop ──────────────────────────────────────────────────────
@@ -104,7 +80,7 @@ class Config(NamedTuple):
     pad_token:     int   = 0
     dtype:         str   = "float32"
     max_iters:     int   = 100000   # kept for compat; curriculum uses max_iter_per_phase
-    max_iter_per_phase: int = 10000 # SOLO / COMBINED budget per segment
+    max_iter_per_phase: int = 100000 # SOLO / COMBINED budget per segment
     check_every:   int   = 100
     # dataset:       str   = "datasets/surat_al-fatihah.txt"
     dataset:       str   = "datasets/juz1.txt"
@@ -537,35 +513,52 @@ def _reshape_logits(flat, output_heads, output_bits):
 
 
 # ============================================================================
-# Single TBPTT step with carry-in state
+# Exact BPTT: scan over all chunks, gradients flow through all boundaries.
+# @jax.checkpoint on scan_body rematerialises activations during backward pass
+# so peak memory is O(chunk) rather than O(n_chunks * chunk).
 # ============================================================================
 
 @functools.partial(jax.jit, static_argnames=["config"])
-def grad_chunk_persistent(base_xlstm, params, inputs, targets, layer_states, config):
-    oh        = config.output_heads
-    ob        = config.output_bits
-    num_heads = config.num_heads
-    block_map = config.block_map
+def exact_bptt_step(base_xlstm, params, all_inputs, all_targets, config):
+    """
+    all_inputs:  [num_chunks, chunk_size]      int32
+    all_targets: [num_chunks, chunk_size, oh]  int32
+    Returns (loss, ce_loss, grads) — all scalars averaged over chunks.
+    """
+    oh         = config.output_heads
+    ob         = config.output_bits
+    num_heads  = config.num_heads
+    block_map  = config.block_map
     stride_map = _parse_stride_map(config.stride_map, config.num_layers)
-    margin    = config.margin
-    ce_weight = config.ce_weight
+    margin     = config.margin
+    ce_weight  = config.ce_weight
 
     def loss_fn(p):
-        logits_flat, new_states = forward_train_chunked(
-            base_xlstm, p, inputs, layer_states, num_heads, block_map, stride_map)
-        logits = _reshape_logits(logits_flat, oh, ob)
-        loss = sum(
-            training_loss(logits[..., h, :], targets[..., h], margin, ce_weight)
-            for h in range(oh)
-        ) / oh
-        ce_loss = sum(
-            cross_entropy_loss(logits[..., h, :], targets[..., h])
-            for h in range(oh)
-        ) / oh
-        return loss, (new_states, ce_loss)
+        init_states = init_step_states(config, batch_size=1)
 
-    (loss, (new_states, ce_loss)), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
-    return loss, ce_loss, grads, new_states
+        @jax.checkpoint
+        def scan_body(states, xs):
+            inputs, tgt = xs                        # [chunk_size], [chunk_size, oh]
+            logits_flat, new_states = forward_train_chunked(
+                base_xlstm, p, inputs[None, :], states, num_heads, block_map, stride_map)
+            logits = _reshape_logits(logits_flat, oh, ob)   # [1, S, oh, ov]
+            tgt_b  = tgt[None, :]                           # [1, S, oh]
+            chunk_loss = sum(
+                training_loss(logits[..., h, :], tgt_b[..., h], margin, ce_weight)
+                for h in range(oh)
+            ) / oh
+            chunk_ce = sum(
+                cross_entropy_loss(logits[..., h, :], tgt_b[..., h])
+                for h in range(oh)
+            ) / oh
+            return new_states, (chunk_loss, chunk_ce)
+
+        _, (per_chunk_loss, per_chunk_ce) = jax.lax.scan(
+            scan_body, init_states, (all_inputs, all_targets))
+        return per_chunk_loss.mean(), per_chunk_ce.mean()
+
+    (loss, ce_loss), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
+    return loss, ce_loss, grads
 
 
 # ============================================================================
@@ -1196,7 +1189,6 @@ def main():
         combined = np.concatenate(accumulated)
         comb_inp, comb_tgt = make_chunks_and_targets(combined, config)
         n_chunks  = comb_inp.shape[0]
-        states    = init_step_states(config, batch_size=1)
 
         byte_lo = seg_idx * config.segment_size
         print(f"\nSEGMENT {seg_idx+1}/{n_segs}  accumulated={len(combined)} bytes  chunks={n_chunks}")
@@ -1204,33 +1196,16 @@ def main():
         pbar = tqdm(range(1, config.max_iter_per_phase + 1),
                     desc=f"seg{seg_idx+1}", unit="it", file=sys.stderr, dynamic_ncols=True)
         for it in pbar:
-            # one full pass over all chunks, accumulating gradients
-            states = init_step_states(config, batch_size=1)
-            accum_grads = None
-            total_loss = 0.0
-            total_ce   = 0.0
-            for ci in range(n_chunks):
-                inp = comb_inp[ci][None, :]
-                tgt = comb_tgt[ci][None, :]
-                frozen_sg = jax.lax.stop_gradient(states)
-                loss, ce_loss, grads, states = grad_chunk_persistent(
-                    base_xlstm, params, inp, tgt, frozen_sg, config)
-                total_loss += float(loss)
-                total_ce   += float(ce_loss)
-                accum_grads = grads if accum_grads is None else jax.tree_util.tree_map(
-                    lambda a, b: a + b, accum_grads, grads)
-            accum_grads = jax.tree_util.tree_map(lambda g: g / n_chunks, accum_grads)
-            loss    = total_loss / n_chunks
-            ce_loss = total_ce   / n_chunks
-
+            loss, ce_loss, grads = exact_bptt_step(
+                base_xlstm, params, comb_inp, comb_tgt, config)
             params, opt_state = sinkgd_update(
-                opt_state, accum_grads, params, lr=lr,
+                opt_state, grads, params, lr=lr,
                 weight_decay=config.weight_decay, max_norm=config.grad_clip_norm,
                 L=config.sinkgd_l)
             global_iters += 1
 
-            bpc = ce_loss / math.log(2)
-            pbar.set_postfix(loss=f"{loss:.4f}", bpc=f"{bpc:.3f}")
+            bpc = float(ce_loss) / math.log(2)
+            pbar.set_postfix(loss=f"{float(loss):.4f}", bpc=f"{bpc:.3f}")
 
             if it % config.check_every == 0 or it == config.max_iter_per_phase:
                 accs    = eval_segments_stateful(base_xlstm, params, config, accumulated)
