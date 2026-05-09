@@ -54,7 +54,8 @@ class Config(NamedTuple):
     # block_map:     str   = "mmmm"
     num_layers:    int   = 8      # always overridden to len(block_map)
     block_map:     str   = "ms"*4
-    stride_map:    str   = "11224488"  # one digit per layer; stride-N fires every N tokens
+    stride_map:    str   = "1,2,4,8,16,32,64"  # one digit per layer; stride-N fires every N tokens
+    # stride_map:    str   = "11224488"  # one digit per layer; stride-N fires every N tokens
     block_map:     str   = "smmm"
     lora_r:        int   = 16
     batch_size:    int   = 1
@@ -98,8 +99,13 @@ _PRESETS = {
 }
 
 def _parse_stride_map(s: str, n_layers: int) -> tuple:
-    """Parse stride_map string to tuple of ints, padding with 1s if short."""
-    strides = [int(c) for c in s]
+    """Parse stride_map string to tuple of ints, padding with 1s if short.
+    Accepts comma-separated values (e.g. '1,16,32,1') or single-digit chars ('1248').
+    """
+    if ',' in s:
+        strides = [int(x.strip()) for x in s.split(',')]
+    else:
+        strides = [int(c) for c in s]
     if len(strides) < n_layers:
         strides += [1] * (n_layers - len(strides))
     return tuple(strides[:n_layers])
@@ -1075,11 +1081,9 @@ def _parse_config():
     cfg['num_layers'] = len(cfg['block_map'])
     cfg['vocab_size'] = 2 ** cfg['input_bits']
 
-    # auto-extend stride_map to match block_map length
-    stride_map = cfg['stride_map']
-    if len(stride_map) < cfg['num_layers']:
-        stride_map = stride_map + "1" * (cfg['num_layers'] - len(stride_map))
-    cfg['stride_map'] = stride_map[:cfg['num_layers']]
+    # auto-extend stride_map to match block_map length (supports comma-separated values)
+    parsed = list(_parse_stride_map(cfg['stride_map'], cfg['num_layers']))
+    cfg['stride_map'] = ','.join(str(s) for s in parsed)
 
     config = Config(**cfg)
     lib_defaults = Config()._asdict()
