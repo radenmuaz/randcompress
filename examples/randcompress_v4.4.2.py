@@ -1,19 +1,15 @@
 """
-randcompress v4.4.1 — Hierarchical RNN: fixed-stride layer schedule, no FFN, no conv
+randcompress v4.4.2 — Power Attention mLSTM
 
-Changes from v4.4:
-  - Conv removed from both mLSTM and sLSTM (trimmed to essentials for deep nets).
-    x_conv_a = silu(x_m) instead of silu(causal_conv1d(x_m, conv_w)).
-    State no longer carries conv_buf.
-  - FFN removed from all blocks. xLSTMBlockParams has just norm_w/norm_b + lstm.
-    Deep block_map compensates.
-  - stride_map (e.g. "11112248"): layer i fires every stride[i] tokens.
-    Slow layers subsample input, run LSTM on sub-sequence, then repeat output
-    to fill the full sequence. Achieves BPE-like context efficiency at the byte level.
-  - Step state: (lstm_state, last_out) per layer. last_out is held on non-firing
-    steps via jax.lax.cond (stride=1 layers skip the cond for speed).
-  - forward_step takes 't' (int32 JAX scalar) for per-layer fire decisions.
-  - BlockHiRA has no ffn adapters. RandCompressParams unchanged otherwise.
+Changes from v4.4.1:
+  - mLSTM upgraded to Power Attention (arXiv:2507.04239), power_p=2 by default.
+    Parallel mode: attention weights raised to p-th power: qk → qk**p.
+    Step/recurrent mode: q and k expanded through symmetric power map φ_p before
+    accumulation. State C: [B,NH,DH,DH] → [B,NH,D_sym,DH] where
+    D_sym = C(DH+p-1,p) = DH*(DH+1)//2 for p=2.
+    mlstm_layer_parallel_with_init updated consistently for init-state handling.
+  - Config: new power_p=2 field. Set power_p=1 to recover v4.4.1 behavior.
+  - POWER_P module global set from config.power_p in main().
 """
 
 import jax
@@ -30,6 +26,7 @@ from tqdm import tqdm
 
 PAD_TOKEN = 0
 DTYPE     = jnp.float32
+POWER_P   = 2
 
 class _Tee:
     def __init__(self, *files): self.files = files
@@ -53,8 +50,11 @@ class Config(NamedTuple):
     num_heads:     int   = 8
     num_layers:    int   = 4      # always overridden to len(block_map)
     segment_size:  int   = 1024
+    power_p:       int   = 2      # mLSTM attention kernel degree; 1 = v4.4.1 baseline
     seed:          int   = 0
-    block_map:     str   = "smms"
+    block_map:     str   = "mmmm"
+    stride_map:    str   = "1111"  # one digit per layer; stride-N fires every N tokens
+    # block_map:     str   = "mmms"
     stride_map:    str   = "1248"  # one digit per layer; stride-N fires every N tokens
     # stride_map:    str   = "1248"  # one digit per layer; stride-N fires every N tokens
     lora_r:        int   = 4
@@ -189,7 +189,30 @@ def multihead_layer_norm(x, w, b, num_heads, eps=1e-6):
 
 
 # ============================================================================
-# mLSTM cell (unchanged)
+# Power attention helpers
+# ============================================================================
+
+def _dsym(DH, p):
+    """Output dimension of the symmetric degree-p feature map of R^DH."""
+    if p == 1: return DH
+    return math.comb(DH + p - 1, p)
+
+def spow(x, p):
+    """Symmetric degree-p polynomial feature map.
+
+    p=1: identity.  p=2: all products x_i*x_j (i<=j), off-diagonal * sqrt(2).
+    [..., D] → [..., D_sym] where D_sym = C(D+p-1, p).
+    """
+    if p == 1:
+        return x
+    D = x.shape[-1]
+    i_idx, j_idx = np.tril_indices(D)
+    scale = np.where(i_idx == j_idx, 1.0, np.sqrt(2.0)).astype(np.float32)
+    return x[..., i_idx] * x[..., j_idx] * scale
+
+
+# ============================================================================
+# mLSTM cell
 # ============================================================================
 
 def mlstm_cell_parallel(q, k, v, i_preact, f_preact):
@@ -208,6 +231,7 @@ def mlstm_cell_parallel(q, k, v, i_preact, f_preact):
     D      = jnp.exp(log_D - max_log_D)
     k_s    = k / jnp.sqrt(jnp.array(DH, k.dtype))
     qk     = jnp.einsum('bnsd,bntd->bnst', q, k_s)
+    qk     = qk ** POWER_P                           # power attention kernel
     C      = qk * D
     norm   = jnp.maximum(jnp.abs(C.sum(axis=-1, keepdims=True)), jnp.exp(-max_log_D))
     h      = jnp.einsum('bnst,bntd->bnsd', C/norm, v)
@@ -220,11 +244,13 @@ def mlstm_cell_step(q, k, v, i_preact, f_preact, C_prev, n_prev, m_prev):
     f_t    = jnp.exp(log_f + m_prev - m_t)
     i_t    = jnp.exp(i_preact - m_t)
     k_s    = k / jnp.sqrt(jnp.array(DH, k.dtype))
-    kv     = jnp.einsum('bnd,bne->bnde', k_s, v)
+    phi_k  = spow(k_s, POWER_P)                     # [B, NH, D_sym]
+    phi_q  = spow(q,   POWER_P)                     # [B, NH, D_sym]
+    kv     = jnp.einsum('bnd,bne->bnde', phi_k, v)  # [B, NH, D_sym, DH]
     C_t    = f_t[:,:,None,None]*C_prev + i_t[:,:,None,None]*kv
-    n_t    = f_t[:,:,None]*n_prev + i_t[:,:,None]*k_s
-    h_num  = jnp.einsum('bnd,bnde->bne', q, C_t)
-    denom  = jnp.maximum(jnp.abs((q*n_t).sum(axis=-1)), jnp.exp(-m_t))
+    n_t    = f_t[:,:,None]*n_prev + i_t[:,:,None]*phi_k
+    h_num  = jnp.einsum('bnd,bnde->bne', phi_q, C_t)
+    denom  = jnp.maximum(jnp.abs((phi_q*n_t).sum(axis=-1)), jnp.exp(-m_t))
     return h_num/(denom[:,:,None]+1e-8), C_t, n_t, m_t
 
 
@@ -419,7 +445,8 @@ def mlstm_layer_parallel_with_init(p, x, num_heads, state):
     x_m, z  = xz[...,:inner], xz[...,inner:]
     xa      = jax.nn.silu(x_m)
     q,k,v,i_p,f_p = _mlstm_preacts(p, xa, x_m)
-    NH, DH = C0.shape[1], C0.shape[2]
+    NH  = q.shape[1]
+    DH  = q.shape[-1]              # get DH from q, not C0 (C0.shape[2] = D_sym now)
     log_f  = jax.nn.log_sigmoid(f_p)
     lf_cs  = jnp.concatenate([jnp.zeros((B,NH,1,1),log_f.dtype),
                                jnp.cumsum(log_f, axis=2)], axis=2)
@@ -432,17 +459,19 @@ def mlstm_layer_parallel_with_init(p, x, num_heads, state):
     D_seq  = jnp.exp(log_D_seq - max_log_D)
     d_init = jnp.exp(log_w_init - max_log_D[:,:,:,0])
     k_s    = k / jnp.sqrt(jnp.array(DH, k.dtype))
-    qk     = jnp.einsum('bnsd,bntd->bnst', q, k_s)
+    phi_k  = spow(k_s, POWER_P)   # [B, NH, S, D_sym]
+    phi_q  = spow(q,   POWER_P)   # [B, NH, S, D_sym]
+    qk     = jnp.einsum('bnsd,bntd->bnst', q, k_s) ** POWER_P
     h_num  = (jnp.einsum('bnst,bntd->bnsd', qk*D_seq, v)
-              + jnp.einsum('bnsd,bnde->bnse', q, C0)*d_init[:,:,:,None])
-    n_full = (jnp.einsum('bnst,bntd->bnsd', D_seq, k_s)
+              + jnp.einsum('bnsd,bnde->bnse', phi_q, C0)*d_init[:,:,:,None])
+    n_full = (jnp.einsum('bnst,bntd->bnsd', D_seq, phi_k)
               + n0[:,:,None,:]*d_init[:,:,:,None])
-    qn     = (q*n_full).sum(axis=-1)
+    qn     = (phi_q*n_full).sum(axis=-1)
     denom  = jnp.maximum(jnp.abs(qn), jnp.exp(-max_log_D[:,:,:,0]))
     h      = h_num / (denom[:,:,:,None]+1e-8)
     w_T  = D_seq[:,:,-1,:]
     d_T  = d_init[:,:,-1]
-    C_T  = jnp.einsum('bns,bnsd,bnse->bnde', w_T, k_s, v) + d_T[:,:,None,None]*C0
+    C_T  = jnp.einsum('bns,bnsd,bnse->bnde', w_T, phi_k, v) + d_T[:,:,None,None]*C0
     n_T  = n_full[:,:,-1,:]
     m_T  = max_log_D[:,:,-1,0]
     h_flat = h.transpose(0,2,1,3).reshape(B,S,inner)
@@ -645,10 +674,11 @@ def init_step_states(config, batch_size):
     for btype in config.block_map:
         if btype == 'm':
             inner = config.d_model
+            D_sym = _dsym(DH, config.power_p)
             lstm_state = (
-                jnp.zeros((B, NH, DH, DH), bf),  # C
-                jnp.zeros((B, NH, DH),     bf),  # n
-                jnp.zeros((B, NH),         bf),  # m
+                jnp.zeros((B, NH, D_sym, DH), bf),  # C  [D_sym × DH]
+                jnp.zeros((B, NH, D_sym),     bf),  # n  [D_sym]
+                jnp.zeros((B, NH),            bf),  # m
             )
         else:
             H = config.d_model
@@ -1117,9 +1147,10 @@ def main():
     sys.stdout = _Tee(sys.__stdout__, log_file)
 
     config, config_diff = _parse_config()
-    global PAD_TOKEN, DTYPE
+    global PAD_TOKEN, DTYPE, POWER_P
     PAD_TOKEN = config.pad_token
     DTYPE     = jnp.dtype(config.dtype)
+    POWER_P   = config.power_p
 
     with open(os.path.join(log_dir, "config.json"), "w") as f:
         _json.dump(config._asdict(), f, indent=2)

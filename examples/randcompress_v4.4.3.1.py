@@ -1,19 +1,12 @@
 """
-randcompress v4.4.1 — Hierarchical RNN: fixed-stride layer schedule, no FFN, no conv
+randcompress v4.4.3.1 — mLSTM + msLSTM + Curriculum Learning
 
-Changes from v4.4:
-  - Conv removed from both mLSTM and sLSTM (trimmed to essentials for deep nets).
-    x_conv_a = silu(x_m) instead of silu(causal_conv1d(x_m, conv_w)).
-    State no longer carries conv_buf.
-  - FFN removed from all blocks. xLSTMBlockParams has just norm_w/norm_b + lstm.
-    Deep block_map compensates.
-  - stride_map (e.g. "11112248"): layer i fires every stride[i] tokens.
-    Slow layers subsample input, run LSTM on sub-sequence, then repeat output
-    to fill the full sequence. Achieves BPE-like context efficiency at the byte level.
-  - Step state: (lstm_state, last_out) per layer. last_out is held on non-firing
-    steps via jax.lax.cond (stride=1 layers skip the cond for speed).
-  - forward_step takes 't' (int32 JAX scalar) for per-layer fire decisions.
-  - BlockHiRA has no ffn adapters. RandCompressParams unchanged otherwise.
+Changes from v4.4.3:
+  - Curriculum learning (from v8): dataset split into segments, trained in order.
+    SOLO phase per segment (TBPTT on that segment alone until 100% TF-accuracy).
+    COMBINED phase (TBPTT on all completed segments until all 100% or budget).
+    TBPTT + stop_gradient within each phase unchanged.
+    New config field: max_iter_per_phase (replaces max_iters).
 """
 
 import jax
@@ -30,6 +23,7 @@ from tqdm import tqdm
 
 PAD_TOKEN = 0
 DTYPE     = jnp.float32
+POWER_P   = 2
 
 class _Tee:
     def __init__(self, *files): self.files = files
@@ -53,6 +47,7 @@ class Config(NamedTuple):
     num_heads:     int   = 8
     num_layers:    int   = 4      # always overridden to len(block_map)
     segment_size:  int   = 1024
+    power_p:       int   = 2      # mLSTM attention kernel degree; 1 = v4.4.1 baseline
     seed:          int   = 0
     block_map:     str   = "smms"
     stride_map:    str   = "1248"  # one digit per layer; stride-N fires every N tokens
@@ -77,7 +72,8 @@ class Config(NamedTuple):
     # ── misc ─────────────────────────────────────────────────────────────────
     pad_token:     int   = 0
     dtype:         str   = "float32"
-    max_iters:     int   = 100000
+    max_iters:     int   = 100000   # kept for compat; curriculum uses max_iter_per_phase
+    max_iter_per_phase: int = 10000 # SOLO / COMBINED budget per segment
     check_every:   int   = 1000
     # dataset:       str   = "datasets/surat_al-fatihah.txt"
     dataset:       str   = "datasets/juz1.txt"
@@ -189,7 +185,30 @@ def multihead_layer_norm(x, w, b, num_heads, eps=1e-6):
 
 
 # ============================================================================
-# mLSTM cell (unchanged)
+# Power attention helpers
+# ============================================================================
+
+def _dsym(DH, p):
+    """Output dimension of the symmetric degree-p feature map of R^DH."""
+    if p == 1: return DH
+    return math.comb(DH + p - 1, p)
+
+def spow(x, p):
+    """Symmetric degree-p polynomial feature map.
+
+    p=1: identity.  p=2: all products x_i*x_j (i<=j), off-diagonal * sqrt(2).
+    [..., D] → [..., D_sym] where D_sym = C(D+p-1, p).
+    """
+    if p == 1:
+        return x
+    D = x.shape[-1]
+    i_idx, j_idx = np.tril_indices(D)
+    scale = np.where(i_idx == j_idx, 1.0, np.sqrt(2.0)).astype(np.float32)
+    return x[..., i_idx] * x[..., j_idx] * scale
+
+
+# ============================================================================
+# mLSTM cell
 # ============================================================================
 
 def mlstm_cell_parallel(q, k, v, i_preact, f_preact):
@@ -208,6 +227,7 @@ def mlstm_cell_parallel(q, k, v, i_preact, f_preact):
     D      = jnp.exp(log_D - max_log_D)
     k_s    = k / jnp.sqrt(jnp.array(DH, k.dtype))
     qk     = jnp.einsum('bnsd,bntd->bnst', q, k_s)
+    qk     = qk ** POWER_P                           # power attention kernel
     C      = qk * D
     norm   = jnp.maximum(jnp.abs(C.sum(axis=-1, keepdims=True)), jnp.exp(-max_log_D))
     h      = jnp.einsum('bnst,bntd->bnsd', C/norm, v)
@@ -220,11 +240,13 @@ def mlstm_cell_step(q, k, v, i_preact, f_preact, C_prev, n_prev, m_prev):
     f_t    = jnp.exp(log_f + m_prev - m_t)
     i_t    = jnp.exp(i_preact - m_t)
     k_s    = k / jnp.sqrt(jnp.array(DH, k.dtype))
-    kv     = jnp.einsum('bnd,bne->bnde', k_s, v)
+    phi_k  = spow(k_s, POWER_P)                     # [B, NH, D_sym]
+    phi_q  = spow(q,   POWER_P)                     # [B, NH, D_sym]
+    kv     = jnp.einsum('bnd,bne->bnde', phi_k, v)  # [B, NH, D_sym, DH]
     C_t    = f_t[:,:,None,None]*C_prev + i_t[:,:,None,None]*kv
-    n_t    = f_t[:,:,None]*n_prev + i_t[:,:,None]*k_s
-    h_num  = jnp.einsum('bnd,bnde->bne', q, C_t)
-    denom  = jnp.maximum(jnp.abs((q*n_t).sum(axis=-1)), jnp.exp(-m_t))
+    n_t    = f_t[:,:,None]*n_prev + i_t[:,:,None]*phi_k
+    h_num  = jnp.einsum('bnd,bnde->bne', phi_q, C_t)
+    denom  = jnp.maximum(jnp.abs((phi_q*n_t).sum(axis=-1)), jnp.exp(-m_t))
     return h_num/(denom[:,:,None]+1e-8), C_t, n_t, m_t
 
 
@@ -273,11 +295,28 @@ class sLSTMParams(NamedTuple):
     gn_w:  jnp.ndarray
     gn_b:  jnp.ndarray
 
+class msLSTMParams(NamedTuple):
+    """Matrix sLSTM: mLSTM matrix memory + sLSTM recurrent output connection."""
+    W_up:  jnp.ndarray   # [2*inner, d_model]
+    W_q:   jnp.ndarray   # [NH, DH, inner]
+    W_k:   jnp.ndarray   # [NH, DH, inner]
+    W_v:   jnp.ndarray   # [NH, DH, inner]
+    W_i:   jnp.ndarray   # [NH, inner]
+    W_f:   jnp.ndarray   # [NH, inner]
+    b_f:   jnp.ndarray   # [NH]
+    b_i:   jnp.ndarray   # [NH]
+    Ry:    jnp.ndarray   # [2*NH, inner]  y_prev → (ry_i, ry_f) per head
+    skip:  jnp.ndarray   # [inner]
+    ln_w:  jnp.ndarray   # [inner]
+    ln_b:  jnp.ndarray   # [inner]
+    W_down:jnp.ndarray   # [d_model, inner]
+
 class xLSTMBlockParams(NamedTuple):
     norm_w:  jnp.ndarray
     norm_b:  jnp.ndarray
-    mlstm: Optional[mLSTMParams] = None
-    slstm: Optional[sLSTMParams] = None
+    mlstm:  Optional[mLSTMParams]  = None
+    slstm:  Optional[sLSTMParams]  = None
+    mslstm: Optional[msLSTMParams] = None
 
 class xLSTMParams(NamedTuple):
     embedding: jnp.ndarray
@@ -309,9 +348,20 @@ class sLSTMHiRA(NamedTuple):
     W_z: HiRAAdapter
     W_o: HiRAAdapter
 
+class msLSTMHiRA(NamedTuple):
+    W_up:  HiRAAdapter
+    W_q:   HiRAAdapter
+    W_k:   HiRAAdapter
+    W_v:   HiRAAdapter
+    W_i:   HiRAAdapter
+    W_f:   HiRAAdapter
+    Ry:    HiRAAdapter
+    W_down:HiRAAdapter
+
 class BlockHiRA(NamedTuple):
-    mlstm: Optional[mLSTMHiRA] = None
-    slstm: Optional[sLSTMHiRA] = None
+    mlstm:  Optional[mLSTMHiRA]  = None
+    slstm:  Optional[sLSTMHiRA]  = None
+    mslstm: Optional[msLSTMHiRA] = None
 
 class RandCompressParams(NamedTuple):
     output_proj: jnp.ndarray
@@ -348,11 +398,28 @@ def apply_slstm_hira(p: sLSTMParams, l: sLSTMHiRA) -> sLSTMParams:
         Ry=p.Ry, b=p.b, gn_w=p.gn_w, gn_b=p.gn_b,
     )
 
+def apply_mslstm_hira(p: msLSTMParams, l: msLSTMHiRA) -> msLSTMParams:
+    NH, DH, inner = p.W_q.shape
+    dm = NH * DH
+    def qkv(w, a):
+        return apply_hira(w.reshape(dm, inner), a).reshape(NH, DH, inner)
+    return msLSTMParams(
+        W_up  =apply_hira(p.W_up,  l.W_up),
+        W_q   =qkv(p.W_q, l.W_q), W_k=qkv(p.W_k, l.W_k), W_v=qkv(p.W_v, l.W_v),
+        W_i   =apply_hira(p.W_i,   l.W_i),
+        W_f   =apply_hira(p.W_f,   l.W_f),
+        b_f   =p.b_f, b_i=p.b_i,
+        Ry    =apply_hira(p.Ry,    l.Ry),
+        skip  =p.skip, ln_w=p.ln_w, ln_b=p.ln_b,
+        W_down=apply_hira(p.W_down, l.W_down),
+    )
+
 def apply_block_hira(base: xLSTMBlockParams, hira: BlockHiRA) -> xLSTMBlockParams:
     return xLSTMBlockParams(
         norm_w=base.norm_w, norm_b=base.norm_b,
-        mlstm=apply_mlstm_hira(base.mlstm, hira.mlstm) if base.mlstm is not None else None,
-        slstm=apply_slstm_hira(base.slstm, hira.slstm) if base.slstm is not None else None,
+        mlstm =apply_mlstm_hira(base.mlstm,   hira.mlstm)  if base.mlstm  is not None else None,
+        slstm =apply_slstm_hira(base.slstm,   hira.slstm)  if base.slstm  is not None else None,
+        mslstm=apply_mslstm_hira(base.mslstm, hira.mslstm) if base.mslstm is not None else None,
     )
 
 def apply_xlstm_hira(base: xLSTMParams, rc: RandCompressParams) -> xLSTMParams:
@@ -419,7 +486,8 @@ def mlstm_layer_parallel_with_init(p, x, num_heads, state):
     x_m, z  = xz[...,:inner], xz[...,inner:]
     xa      = jax.nn.silu(x_m)
     q,k,v,i_p,f_p = _mlstm_preacts(p, xa, x_m)
-    NH, DH = C0.shape[1], C0.shape[2]
+    NH  = q.shape[1]
+    DH  = q.shape[-1]              # get DH from q, not C0 (C0.shape[2] = D_sym now)
     log_f  = jax.nn.log_sigmoid(f_p)
     lf_cs  = jnp.concatenate([jnp.zeros((B,NH,1,1),log_f.dtype),
                                jnp.cumsum(log_f, axis=2)], axis=2)
@@ -432,17 +500,19 @@ def mlstm_layer_parallel_with_init(p, x, num_heads, state):
     D_seq  = jnp.exp(log_D_seq - max_log_D)
     d_init = jnp.exp(log_w_init - max_log_D[:,:,:,0])
     k_s    = k / jnp.sqrt(jnp.array(DH, k.dtype))
-    qk     = jnp.einsum('bnsd,bntd->bnst', q, k_s)
+    phi_k  = spow(k_s, POWER_P)   # [B, NH, S, D_sym]
+    phi_q  = spow(q,   POWER_P)   # [B, NH, S, D_sym]
+    qk     = jnp.einsum('bnsd,bntd->bnst', q, k_s) ** POWER_P
     h_num  = (jnp.einsum('bnst,bntd->bnsd', qk*D_seq, v)
-              + jnp.einsum('bnsd,bnde->bnse', q, C0)*d_init[:,:,:,None])
-    n_full = (jnp.einsum('bnst,bntd->bnsd', D_seq, k_s)
+              + jnp.einsum('bnsd,bnde->bnse', phi_q, C0)*d_init[:,:,:,None])
+    n_full = (jnp.einsum('bnst,bntd->bnsd', D_seq, phi_k)
               + n0[:,:,None,:]*d_init[:,:,:,None])
-    qn     = (q*n_full).sum(axis=-1)
+    qn     = (phi_q*n_full).sum(axis=-1)
     denom  = jnp.maximum(jnp.abs(qn), jnp.exp(-max_log_D[:,:,:,0]))
     h      = h_num / (denom[:,:,:,None]+1e-8)
     w_T  = D_seq[:,:,-1,:]
     d_T  = d_init[:,:,-1]
-    C_T  = jnp.einsum('bns,bnsd,bnse->bnde', w_T, k_s, v) + d_T[:,:,None,None]*C0
+    C_T  = jnp.einsum('bns,bnsd,bnse->bnde', w_T, phi_k, v) + d_T[:,:,None,None]*C0
     n_T  = n_full[:,:,-1,:]
     m_T  = max_log_D[:,:,-1,0]
     h_flat = h.transpose(0,2,1,3).reshape(B,S,inner)
@@ -500,8 +570,94 @@ def slstm_layer_with_init(p, x, num_heads, state):
 
 
 # ============================================================================
+# msLSTM layers  — always scan, no parallel mode
+# State: (y_prev [B,inner], C [B,NH,D_sym,DH], n [B,NH,D_sym], m [B,NH])
+# y_prev = flattened multi-head cell output h_flat, fed back via Ry to i/f gates.
+# ============================================================================
+
+def mslstm_layer_scan_with_init(p: msLSTMParams, x: jnp.ndarray, num_heads: int, state):
+    y0, C0, n0, m0 = state
+    B, S, _ = x.shape
+    inner   = p.W_up.shape[0] // 2
+    NH      = num_heads
+
+    xz     = jnp.dot(x, p.W_up.T)
+    x_m, z = xz[..., :inner], xz[..., inner:]
+    xa     = jax.nn.silu(x_m)
+
+    # precompute all sequence projections (Ry contribution added per step in scan)
+    q   = jnp.einsum('ndi,bsi->bnsd', p.W_q, xa)                           # [B,NH,S,DH]
+    k   = jnp.einsum('ndi,bsi->bnsd', p.W_k, xa)
+    v   = jnp.einsum('ndi,bsi->bnsd', p.W_v, x_m)
+    i_x = jnp.einsum('ni,bsi->bsn',  p.W_i, xa) + p.b_i                   # [B,S,NH]
+    f_x = jnp.einsum('ni,bsi->bsn',  p.W_f, xa) + p.b_f                   # [B,S,NH]
+
+    def step(carry, t_inputs):
+        y_prev, C, n, m = carry
+        q_t, k_t, v_t, i_x_t, f_x_t, xa_t, z_t = t_inputs
+        ry      = jnp.dot(y_prev, p.Ry.T)          # [B, 2*NH]
+        i_t     = i_x_t + ry[..., :NH]             # [B, NH]
+        f_t     = f_x_t + ry[..., NH:]
+        h_t, C_new, n_new, m_new = mlstm_cell_step(q_t, k_t, v_t, i_t, f_t, C, n, m)
+        h_flat  = h_t.reshape(B, inner)             # recurrent feedback
+        out_t   = (h_flat + p.skip * xa_t) * jax.nn.silu(z_t)
+        return (h_flat, C_new, n_new, m_new), out_t
+
+    (y_T, C_T, n_T, m_T), outs = jax.lax.scan(
+        step, (y0, C0, n0, m0),
+        (q.transpose(2,0,1,3),    # [S,B,NH,DH]
+         k.transpose(2,0,1,3),
+         v.transpose(2,0,1,3),
+         i_x.transpose(1,0,2),    # [S,B,NH]
+         f_x.transpose(1,0,2),
+         xa.transpose(1,0,2),     # [S,B,inner]
+         z.transpose(1,0,2)),
+    )
+    outs_norm = multihead_layer_norm(outs.transpose(1,0,2), p.ln_w, p.ln_b, num_heads)
+    return jnp.dot(outs_norm, p.W_down.T), (y_T, C_T, n_T, m_T)
+
+def mslstm_layer_scan(p: msLSTMParams, x: jnp.ndarray, num_heads: int):
+    B, S, _ = x.shape
+    inner   = p.W_up.shape[0] // 2
+    DH      = inner // num_heads
+    D_sym   = _dsym(DH, POWER_P)
+    init    = (
+        jnp.zeros((B, inner),              x.dtype),
+        jnp.zeros((B, num_heads, D_sym, DH), x.dtype),
+        jnp.zeros((B, num_heads, D_sym),   x.dtype),
+        jnp.zeros((B, num_heads),          x.dtype),
+    )
+    out, _ = mslstm_layer_scan_with_init(p, x, num_heads, init)
+    return out
+
+def mslstm_layer_step(p: msLSTMParams, x_t: jnp.ndarray, state, num_heads: int):
+    y_prev, C, n, m = state
+    B     = x_t.shape[0]
+    NH    = num_heads
+    inner = p.W_up.shape[0] // 2
+    xz    = jnp.dot(x_t, p.W_up.T)
+    x_m, z = xz[..., :inner], xz[..., inner:]
+    xa    = jax.nn.silu(x_m)
+    q, k, v, i_p, f_p = _mlstm_preacts_step(p, xa, x_m)
+    ry    = jnp.dot(y_prev, p.Ry.T)                # [B, 2*NH]
+    i_p   = i_p + ry[..., :NH]
+    f_p   = f_p + ry[..., NH:]
+    h_t, C_t, n_t, m_t = mlstm_cell_step(q, k, v, i_p, f_p, C, n, m)
+    h_flat  = h_t.reshape(B, inner)
+    out     = (h_flat + p.skip * xa) * jax.nn.silu(z)
+    out_norm = multihead_layer_norm(out, p.ln_w, p.ln_b, num_heads)
+    return jnp.dot(out_norm, p.W_down.T), (h_flat, C_t, n_t, m_t)
+
+
+# ============================================================================
 # Forward passes
 # ============================================================================
+
+def _cell_out_no_state(block, btype, x_n, num_heads):
+    if btype == 'm': return mlstm_layer_parallel(block.mlstm,  x_n, num_heads)
+    if btype == 's': return slstm_layer(block.slstm,  x_n, num_heads)
+    if btype == 'p': return mslstm_layer_scan(block.mslstm, x_n, num_heads)
+    raise ValueError(btype)
 
 def forward_train(base_xlstm, rc, tokens, num_heads, block_map, stride_map):
     xlstm = apply_xlstm_hira(base_xlstm, rc)
@@ -511,12 +667,10 @@ def forward_train(base_xlstm, rc, tokens, num_heads, block_map, stride_map):
         x_n = layer_norm(x, block.norm_w, block.norm_b)
         if stride > 1:
             x_sub = x_n[:, ::stride, :]
-            cell_out_sub = (mlstm_layer_parallel(block.mlstm, x_sub, num_heads)
-                            if btype == 'm' else slstm_layer(block.slstm, x_sub, num_heads))
-            cell_out = jnp.repeat(cell_out_sub, stride, axis=1)[:, :S, :]
+            cell_out = jnp.repeat(_cell_out_no_state(block, btype, x_sub, num_heads),
+                                  stride, axis=1)[:, :S, :]
         else:
-            cell_out = (mlstm_layer_parallel(block.mlstm, x_n, num_heads)
-                        if btype == 'm' else slstm_layer(block.slstm, x_n, num_heads))
+            cell_out = _cell_out_no_state(block, btype, x_n, num_heads)
         x = x + cell_out
     x = layer_norm(x, xlstm.norm_w, xlstm.norm_b)
     return jnp.dot(x, rc.output_proj)
@@ -538,6 +692,9 @@ def forward_train_chunked(base_xlstm, rc, inputs, layer_states, num_heads, block
             if btype == 'm':
                 cell_out_sub, new_lstm = mlstm_layer_parallel_with_init(
                     block.mlstm, x_sub, num_heads, lstm_state)
+            elif btype == 'p':
+                cell_out_sub, new_lstm = mslstm_layer_scan_with_init(
+                    block.mslstm, x_sub, num_heads, lstm_state)
             else:
                 cell_out_sub, new_lstm = slstm_layer_with_init(
                     block.slstm, x_sub, num_heads, lstm_state)
@@ -546,10 +703,13 @@ def forward_train_chunked(base_xlstm, rc, inputs, layer_states, num_heads, block
             if btype == 'm':
                 cell_out, new_lstm = mlstm_layer_parallel_with_init(
                     block.mlstm, x_n, num_heads, lstm_state)
+            elif btype == 'p':
+                cell_out, new_lstm = mslstm_layer_scan_with_init(
+                    block.mslstm, x_n, num_heads, lstm_state)
             else:
                 cell_out, new_lstm = slstm_layer_with_init(
                     block.slstm, x_n, num_heads, lstm_state)
-        last_out = cell_out[:, -1, :]  # carry to next chunk for non-firing positions
+        last_out = cell_out[:, -1, :]
         new_states.append((new_lstm, last_out))
         x = x + cell_out
     x = layer_norm(x, xlstm.norm_w, xlstm.norm_b)
@@ -569,18 +729,21 @@ def forward_step(base_xlstm, rc, token, states, num_heads, block_map, stride_map
 
         if stride == 1:
             if btype == 'm':
-                cell_out, new_lstm = mlstm_layer_step(block.mlstm, x_n, lstm_state, num_heads)
+                cell_out, new_lstm = mlstm_layer_step(block.mlstm,   x_n, lstm_state, num_heads)
+            elif btype == 'p':
+                cell_out, new_lstm = mslstm_layer_step(block.mslstm, x_n, lstm_state, num_heads)
             else:
-                cell_out, new_lstm = slstm_layer_step(block.slstm, x_n, lstm_state, num_heads)
+                cell_out, new_lstm = slstm_layer_step(block.slstm,   x_n, lstm_state, num_heads)
             new_states.append((new_lstm, cell_out))
         else:
-            # fire if at a stride boundary; otherwise hold last output
             def fire(args):
                 x_n_, lstm_state_ = args
                 if btype == 'm':
-                    return mlstm_layer_step(block.mlstm, x_n_, lstm_state_, num_heads)
+                    return mlstm_layer_step(block.mlstm,   x_n_, lstm_state_, num_heads)
+                elif btype == 'p':
+                    return mslstm_layer_step(block.mslstm, x_n_, lstm_state_, num_heads)
                 else:
-                    return slstm_layer_step(block.slstm, x_n_, lstm_state_, num_heads)
+                    return slstm_layer_step(block.slstm,   x_n_, lstm_state_, num_heads)
 
             def hold(args):
                 _x_n, lstm_state_ = args
@@ -645,10 +808,20 @@ def init_step_states(config, batch_size):
     for btype in config.block_map:
         if btype == 'm':
             inner = config.d_model
+            D_sym = _dsym(DH, config.power_p)
             lstm_state = (
-                jnp.zeros((B, NH, DH, DH), bf),  # C
-                jnp.zeros((B, NH, DH),     bf),  # n
-                jnp.zeros((B, NH),         bf),  # m
+                jnp.zeros((B, NH, D_sym, DH), bf),  # C
+                jnp.zeros((B, NH, D_sym),     bf),  # n
+                jnp.zeros((B, NH),            bf),  # m
+            )
+        elif btype == 'p':
+            inner = config.d_model
+            D_sym = _dsym(DH, config.power_p)
+            lstm_state = (
+                jnp.zeros((B, inner),            bf),  # y_prev (h_flat feedback)
+                jnp.zeros((B, NH, D_sym, DH),   bf),  # C
+                jnp.zeros((B, NH, D_sym),        bf),  # n
+                jnp.zeros((B, NH),               bf),  # m
             )
         else:
             H = config.d_model
@@ -733,14 +906,47 @@ def init_slstm_params(key, d_model, seq_len) -> sLSTMParams:
     return sLSTMParams(W_i=W_i, W_f=W_f, W_z=W_z, W_o=W_o,
                        Ry=Ry, b=b, gn_w=gn_w, gn_b=gn_b)
 
+def init_mslstm_params(key, d_model, num_heads, seq_len) -> msLSTMParams:
+    """msLSTM init: same as mLSTM for W_q/k/v/i/f; Ry near-critical like sLSTM."""
+    inner = d_model
+    DH    = inner // num_heads
+    ks    = jr.split(key, 12)
+    W_up_raw = np.array(jr.normal(ks[0], (2*inner, d_model)))
+    W_up_raw /= np.linalg.norm(W_up_raw, axis=1, keepdims=True)
+    W_up = _bf(W_up_raw / math.sqrt(d_model))
+    def _qkv(k):
+        M = np.array(_ortho(k, inner, inner))
+        return _bf(M.reshape(num_heads, DH, inner) / math.sqrt(inner))
+    W_q = _qkv(ks[1]); W_k = _qkv(ks[2]); W_v = _qkv(ks[3])
+    i_scale = np.linspace(0.5, 2.0, num_heads)[:, None]
+    W_i = _bf(np.array(jr.normal(ks[4], (num_heads, inner))) / math.sqrt(inner) * i_scale)
+    W_f = _bf(np.array(jr.normal(ks[5], (num_heads, inner))) / math.sqrt(inner))
+    b_f = _multiscale_forget_bias(num_heads, seq_len)
+    b_i = jnp.zeros((num_heads,), DTYPE)
+    # Ry: near-critical init — maps y_flat [inner] → [2*NH] for i and f gate deltas
+    raw_Ry = np.array(jr.normal(ks[6], (2*num_heads, inner)))
+    U, _, Vt = np.linalg.svd(raw_Ry, full_matrices=False)
+    Ry = _bf(0.95 * (U @ Vt))
+    W_down = _ortho(ks[7], d_model, inner) / math.sqrt(inner)
+    skip = jnp.ones((inner,), DTYPE)
+    ln_w = jnp.ones((inner,), DTYPE)
+    ln_b = jnp.zeros((inner,), DTYPE)
+    return msLSTMParams(
+        W_up=W_up, W_q=W_q, W_k=W_k, W_v=W_v,
+        W_i=W_i, W_f=W_f, b_f=b_f, b_i=b_i,
+        Ry=Ry, skip=skip, ln_w=ln_w, ln_b=ln_b,
+        W_down=W_down,
+    )
+
 def init_xlstm_block_params(key, d_model, num_heads,
                              seq_len, btype) -> xLSTMBlockParams:
     ks = jr.split(key, 2)
     return xLSTMBlockParams(
         norm_w=jnp.ones((d_model,), DTYPE),
         norm_b=jnp.zeros((d_model,), DTYPE),
-        mlstm=init_mlstm_params(ks[0], d_model, num_heads, seq_len) if btype=='m' else None,
-        slstm=init_slstm_params(ks[1], d_model, seq_len)            if btype=='s' else None,
+        mlstm =init_mlstm_params(ks[0],  d_model, num_heads, seq_len) if btype=='m' else None,
+        slstm =init_slstm_params(ks[1],  d_model, seq_len)            if btype=='s' else None,
+        mslstm=init_mslstm_params(ks[0], d_model, num_heads, seq_len) if btype=='p' else None,
     )
 
 def init_xlstm_params(key, config) -> xLSTMParams:
@@ -777,6 +983,7 @@ def init_block_hira(key, config, btype) -> BlockHiRA:
     d, r = config.d_model, config.lora_r
     inner, NH = d, config.num_heads
     ks = jr.split(key, 8); ki = 0
+    mhira = shira = mshira = None
     if btype == 'm':
         mhira = mLSTMHiRA(
             W_up  =init_hira_adapter(ks[ki],   2*inner, d,     r),
@@ -786,15 +993,26 @@ def init_block_hira(key, config, btype) -> BlockHiRA:
             W_i   =init_hira_adapter(ks[ki+4], NH,      inner, r),
             W_f   =init_hira_adapter(ks[ki+5], NH,      inner, r),
             W_down=init_hira_adapter(ks[ki+6], d,       inner, r),
-        ); shira = None
+        )
+    elif btype == 'p':
+        mshira = msLSTMHiRA(
+            W_up  =init_hira_adapter(ks[ki],   2*inner, d,     r),
+            W_q   =init_hira_adapter(ks[ki+1], inner,   inner, r),
+            W_k   =init_hira_adapter(ks[ki+2], inner,   inner, r),
+            W_v   =init_hira_adapter(ks[ki+3], inner,   inner, r),
+            W_i   =init_hira_adapter(ks[ki+4], NH,      inner, r),
+            W_f   =init_hira_adapter(ks[ki+5], NH,      inner, r),
+            Ry    =init_hira_adapter(ks[ki+6], 2*NH,    inner, r),
+            W_down=init_hira_adapter(ks[ki+7], d,       inner, r),
+        )
     else:
         shira = sLSTMHiRA(
             W_i=init_hira_adapter(ks[ki],   d, d, r),
             W_f=init_hira_adapter(ks[ki+1], d, d, r),
             W_z=init_hira_adapter(ks[ki+2], d, d, r),
             W_o=init_hira_adapter(ks[ki+3], d, d, r),
-        ); mhira = None
-    return BlockHiRA(mlstm=mhira, slstm=shira)
+        )
+    return BlockHiRA(mlstm=mhira, slstm=shira, mslstm=mshira)
 
 def init_randcompress_params(key, config) -> RandCompressParams:
     ks = jr.split(key, 2 + config.num_layers)
@@ -1025,6 +1243,71 @@ def eval_generative(base_xlstm, params, config, all_tokens):
 
 
 # ============================================================================
+# Curriculum helpers
+# ============================================================================
+
+def split_segments(raw_bytes, segment_size):
+    segs, n, i = [], len(raw_bytes), 0
+    while i < n:
+        segs.append(raw_bytes[i : i + segment_size])
+        i += segment_size
+    return segs
+
+def eval_segments_stateful(base_xlstm, params, config, seg_list):
+    """Teacher-forced byte accuracy, state flowing across segments (zero-init start).
+    Returns list of (accuracy, first_wrong_byte_idx) per segment.
+    """
+    stride_map   = _parse_stride_map(config.stride_map, config.num_layers)
+    tok_per_byte = 8 // config.input_bits
+    chunk_size   = config.segment_size * tok_per_byte
+    ob, oh       = config.output_bits, config.output_heads
+    out_mask     = (1 << ob) - 1
+    states       = init_step_states(config, batch_size=1)
+    results      = []
+
+    for seg_bytes in seg_list:
+        seg   = bytes_to_tokens(np.array(seg_bytes, dtype=np.uint8), config.input_bits)
+        n_tok = len(seg)
+        n_b   = len(seg_bytes)
+        if n_b < 2:
+            results.append((1.0, None)); continue
+
+        num_chunks = max(1, math.ceil((n_tok - 1) / chunk_size))
+        pad_len    = num_chunks * chunk_size + 1 - n_tok
+        padded     = np.concatenate([seg, np.zeros(pad_len, dtype=np.int32)])
+
+        byte_correct = []
+        for ci in range(num_chunks):
+            s   = ci * chunk_size
+            inp = jnp.array(padded[s : s + chunk_size][None], dtype=jnp.int32)
+            logits_flat, states = _fwd_chunked_jit(
+                base_xlstm, params, inp, states,
+                config.num_heads, config.block_map, stride_map)
+            logits = _reshape_logits(logits_flat, oh, ob)
+            preds  = np.array(jnp.argmax(logits[0], axis=-1))      # [S, oh]
+
+            if config.input_bits == 8 and ob < 8:
+                pred_bytes = np.zeros(preds.shape[0], np.uint8)
+                for h in range(oh):
+                    pred_bytes |= (preds[:, h].astype(np.uint8) & out_mask) << (h * ob)
+                tgt_bytes = padded[s + 1 : s + chunk_size + 1].astype(np.uint8)
+            else:
+                pred_bytes = tokens_to_bytes(preds[:, 0], config.input_bits)
+                tgt_bytes  = tokens_to_bytes(padded[s + 1 : s + chunk_size + 1], config.input_bits)
+
+            valid = min(len(pred_bytes), max(0, n_b - 1 - ci * (chunk_size // tok_per_byte)))
+            if valid > 0:
+                byte_correct.extend((pred_bytes[:valid] == tgt_bytes[:valid]).tolist())
+
+        total = len(byte_correct)
+        acc   = sum(byte_correct) / total if total > 0 else 1.0
+        wrong = [i for i, ok in enumerate(byte_correct) if not ok]
+        results.append((acc, wrong[0] if wrong else None))
+
+    return results
+
+
+# ============================================================================
 # Checkpoint
 # ============================================================================
 
@@ -1117,9 +1400,10 @@ def main():
     sys.stdout = _Tee(sys.__stdout__, log_file)
 
     config, config_diff = _parse_config()
-    global PAD_TOKEN, DTYPE
+    global PAD_TOKEN, DTYPE, POWER_P
     PAD_TOKEN = config.pad_token
     DTYPE     = jnp.dtype(config.dtype)
+    POWER_P   = config.power_p
 
     with open(os.path.join(log_dir, "config.json"), "w") as f:
         _json.dump(config._asdict(), f, indent=2)
@@ -1187,78 +1471,126 @@ def main():
     opt_state = sinkgd_init(params)
     lr        = config.learning_rate
 
-    chunk_size_tok = config.segment_size * tok_per_byte
-    all_inputs, all_targets = make_chunks_and_targets(raw_bytes, config)
-    num_chunks = all_inputs.shape[0]
-
     bytes_per_entry = 4
     budget_bytes    = int(config.residual_budget * (n_total - 1))
     max_entries     = budget_bytes // bytes_per_entry
 
-    print(f"Chunks: {num_chunks} × {chunk_size_tok} tokens  "
-          f"(segment_size={config.segment_size} bytes, tok_per_byte={tok_per_byte})")
+    segs   = split_segments(raw_bytes, config.segment_size)
+    n_segs = len(segs)
+    print(f"Curriculum segments: {n_segs} × up to {config.segment_size} bytes")
+    print(f"max_iter_per_phase={config.max_iter_per_phase}  check_every={config.check_every}  lr={lr}")
     print(f"Residual budget: {budget_bytes} bytes  ({max_entries} correction entries)")
-    print(f"max_iters={config.max_iters}  check_every={config.check_every}  "
-          f"state_reset_prob={config.state_reset_prob}  lr={lr}")
     print()
 
-    states    = init_step_states(config, batch_size=1)
-    chunk_idx = 0
-    stop_reason = None
-    np.random.seed(config.seed + 1)
-    t_start = time.perf_counter()
+    t_start      = time.perf_counter()
+    global_iters = 0
+    completed    = []
+    failed_seg   = None
 
-    pbar = tqdm(range(1, config.max_iters + 1), desc="train", unit="it",
-                file=sys.stderr, dynamic_ncols=True)
-    for it in pbar:
-        # lr = cosine_lr(it, 1000, 0.01, 0.0001,10000)
-        # lr = cosine_lr(it, 1000, config.learning_rate, config.learning_rate/100)
+    def _tbptt_phase(phase_name, inputs, targets, eval_segs, p, opt_st):
+        """TBPTT curriculum phase. Cycles chunks in order; resets state each epoch.
+        Returns (success, iters_done, last_accs, updated_params, updated_opt_state).
+        """
+        nonlocal global_iters
+        n_chunks  = inputs.shape[0]
+        chunk_idx = 0
+        states    = init_step_states(config, batch_size=1)
+        last_accs = None
+        success   = False
+        iters_done = 0
 
-        if config.state_reset_prob > 0 and np.random.random() < config.state_reset_prob:
-            states    = init_step_states(config, batch_size=1)
-            chunk_idx = int(np.random.randint(0, num_chunks))
+        pbar = tqdm(range(1, config.max_iter_per_phase + 1), desc=phase_name,
+                    unit="it", file=sys.stderr, dynamic_ncols=True)
+        for it in pbar:
+            if chunk_idx == 0:
+                states = init_step_states(config, batch_size=1)
 
-        inp = all_inputs [chunk_idx][None, :]
-        tgt = all_targets[chunk_idx][None, :]
-        chunk_idx = (chunk_idx + 1) % num_chunks
+            inp = inputs [chunk_idx][None, :]
+            tgt = targets[chunk_idx][None, :]
+            chunk_idx = (chunk_idx + 1) % n_chunks
 
-        frozen_sg = jax.lax.stop_gradient(states)
-        loss, grads, states = grad_chunk_persistent(
-            base_xlstm, params, inp, tgt, frozen_sg, config)
-        params, opt_state = sinkgd_update(
-            opt_state, grads, params, lr=lr,
-            weight_decay=config.weight_decay, max_norm=config.grad_clip_norm,
-            L=config.sinkgd_l)
+            frozen_sg = jax.lax.stop_gradient(states)
+            loss, grads, states = grad_chunk_persistent(
+                base_xlstm, p, inp, tgt, frozen_sg, config)
+            p, opt_st = sinkgd_update(
+                opt_st, grads, p, lr=lr,
+                weight_decay=config.weight_decay, max_norm=config.grad_clip_norm,
+                L=config.sinkgd_l)
+            global_iters += 1
+            iters_done    = it
 
-        bpc = math.exp(float(loss)) / math.log(2)
-        pbar.set_postfix(loss=f"{float(loss):.5f}", bpc=f"{bpc:.4f}", lr=f"{lr:.4f}")
+            bpc = math.exp(float(loss)) / math.log(2)
+            pbar.set_postfix(loss=f"{float(loss):.4f}", bpc=f"{bpc:.3f}")
 
-        if it % config.check_every == 0 or it == config.max_iters:
-            _, gen_wrong, gen_acc, gen_fw, residual = eval_generative(
-                base_xlstm, params, config, raw_bytes)
-            elapsed = time.perf_counter() - t_start
-            fw_str = f"byte {gen_fw}" if gen_fw is not None else "none"
-            print(f"\n[it={it:6d}] bpc={bpc:.4f}  gen_wrong={gen_wrong}/{n_total-1}"
-                  f"  budget={max_entries}  first_wrong={fw_str}  {elapsed:.0f}s")
+            if it % config.check_every == 0 or it == config.max_iter_per_phase:
+                accs      = eval_segments_stateful(base_xlstm, p, config, eval_segs)
+                last_accs = accs
+                min_acc   = min(a for a, _ in accs)
+                fw_str    = next((str(fw) for _, fw in accs if fw is not None), "ok")
+                print()
+                pbar.set_description(f"{phase_name} acc={min_acc:.1%} fw={fw_str}")
+                if all(a == 1.0 for a, _ in accs):
+                    success = True
+                    pbar.close()
+                    break
+        else:
+            pbar.close()
 
-            budget_done = gen_wrong <= max_entries
-            bpc_done    = config.target_bpc > 0 and bpc < config.target_bpc
+        return success, iters_done, last_accs, p, opt_st
 
-            if budget_done:
-                stop_reason = f"residual_budget ({gen_wrong} corrections <= {max_entries})"
-            elif bpc_done:
-                stop_reason = f"target_bpc ({bpc:.4f} < {config.target_bpc})"
+    for seg_idx, seg in enumerate(segs):
+        t_seg   = time.perf_counter()
+        byte_lo = seg_idx * config.segment_size
+        print(f"\nSEGMENT {seg_idx+1}/{n_segs}  bytes [{byte_lo}, {byte_lo+len(seg)})  len={len(seg)}")
 
-            if stop_reason:
-                print(f"[STOP] {stop_reason}")
-                pbar.close()
-                break
-    else:
-        pbar.close()
+        # ── SOLO phase ────────────────────────────────────────────────────────
+        seg_inp, seg_tgt = make_chunks_and_targets(seg, config)
+        print(f"[SOLO]     chunks={seg_inp.shape[0]}  budget={config.max_iter_per_phase}")
+        solo_ok, solo_iters, solo_accs, params, opt_state = _tbptt_phase(
+            f"solo s{seg_idx+1}", seg_inp, seg_tgt, [seg], params, opt_state)
 
-    if stop_reason is None:
-        stop_reason = f"max_iters ({config.max_iters})"
-        print(f"\n[STOP] {stop_reason}")
+        acc_s  = solo_accs[0][0] if solo_accs else 0.0
+        fw_s   = solo_accs[0][1] if solo_accs else None
+        fw_str = f"byte {fw_s}" if fw_s is not None else "ok"
+        elapsed = time.perf_counter() - t_seg
+        if solo_ok:
+            print(f"[PASS] solo  seg{seg_idx+1}  acc=100%  iters={solo_iters}  {elapsed:.1f}s")
+        else:
+            print(f"[FAIL] solo  seg{seg_idx+1}  acc={acc_s:.2%}  first_wrong={fw_str}"
+                  f"  iters={solo_iters}  {elapsed:.1f}s")
+            failed_seg = seg_idx + 1
+            break
+
+        completed.append(seg)
+
+        if len(completed) == 1:
+            continue
+
+        # ── COMBINED phase ────────────────────────────────────────────────────
+        combined = np.concatenate(completed)
+        comb_inp, comb_tgt = make_chunks_and_targets(combined, config)
+        n_done = len(completed)
+        print(f"[COMBINED] segs 1..{n_done}  chunks={comb_inp.shape[0]}  budget={config.max_iter_per_phase}")
+        comb_ok, comb_iters, comb_accs, params, opt_state = _tbptt_phase(
+            f"comb 1..{n_done}", comb_inp, comb_tgt, completed, params, opt_state)
+
+        min_acc = min(a for a, _ in comb_accs) if comb_accs else 0.0
+        elapsed = time.perf_counter() - t_seg
+        if comb_ok:
+            print(f"[PASS] comb  1..{n_done}  acc=100%  iters={comb_iters}  {elapsed:.1f}s")
+        else:
+            print(f"[FAIL] comb  1..{n_done}  min_acc={min_acc:.2%}"
+                  f"  iters={comb_iters}  {elapsed:.1f}s")
+            failed_seg = seg_idx + 1
+            break
+
+        save_checkpoint(os.path.join(log_dir, "ckpt_last"), params, config, seg_idx, "combined")
+
+    # ── summary ───────────────────────────────────────────────────────────────
+    elapsed_total = time.perf_counter() - t_start
+    stop_reason   = (f"FAIL at segment {failed_seg}" if failed_seg is not None
+                     else f"all {n_segs} segments mastered")
+    print(f"\n[STOP] {stop_reason}  total_iters={global_iters}  elapsed={elapsed_total:.1f}s")
 
     print("\nFinal generative eval...")
     gen_out, gen_wrong, gen_acc, gen_fw, residual = eval_generative(
