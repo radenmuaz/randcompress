@@ -87,7 +87,7 @@ class Config(NamedTuple):
     state_reset_prob: float = 1.
     # ── residual / stop ──────────────────────────────────────────────────────
     residual_budget: float = 0.
-    target_bpc:    float = 0.0
+    target_bpb:    float = 0.0
     # ── generative eval ──────────────────────────────────────────────────────
     gen_seed_len:  int   = 16   # teacher-forced warm-up bytes before eval starts
     # ── misc ─────────────────────────────────────────────────────────────────
@@ -1210,8 +1210,8 @@ def main():
             global_iters += 1
             iters_done    = it
 
-            bpc = math.exp(float(loss)) / math.log(2)
-            pbar.set_postfix(loss=f"{float(loss):.4f}", bpc=f"{bpc:.3f}")
+            bpb = float(loss) / math.log(2) * (8 // config.input_bits)
+            pbar.set_postfix(loss=f"{float(loss):.4f}", bpb=f"{bpb:.3f}")
 
             if it % config.check_every == 0 or it == config.max_iter_per_phase:
                 accs      = eval_segments_stateful(base_xlstm, p, config, eval_segs)

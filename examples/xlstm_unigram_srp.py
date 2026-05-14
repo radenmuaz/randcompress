@@ -383,7 +383,7 @@ class Config(NamedTuple):
     num_heads:        int   = 8
     d_ff:             int   = 512
     num_layers:       int   = 8      # always overridden to len(block_map)
-    segment_size:     int   = 512    # tokens per chunk (NOT bytes)
+    segment_size:     int   = 1024    # tokens per chunk (NOT bytes)
     seed:             int   = 0
     conv_kernel:      int   = 4
     block_map:        str   = "m"*8
@@ -397,15 +397,17 @@ class Config(NamedTuple):
     margin:           float = 0.0    # 0.0 → pure CE
     ce_weight:        float = 1.0
     # ── TBPTT state drop ─────────────────────────────────────────────────────
-    state_reset_prob: float = 0.1    # prob of resetting hidden state each step
+    state_reset_prob: float = 0.2    # prob of resetting hidden state each step
     # ── residual / stop ──────────────────────────────────────────────────────
-    residual_budget:  float = 0.1    # fraction of dataset bytes; stop when errors fit
+    residual_budget:  float = 0.2    # fraction of dataset bytes; stop when errors fit
     target_bpc:       float = 0.0    # also stop when BPC < this; 0.0 = disabled
     # ── misc ─────────────────────────────────────────────────────────────────
     dtype:            str   = "float32"
     max_iters:        int   = 100000
-    check_every:      int   = 20000
-    dataset:          str   = "datasets/quran-uthmani.txt"
+    check_every:      int   = 1000
+    # dataset:          str   = "datasets/quran-uthmani.txt"
+    # dataset:          str   = "datasets/surat_al-fatihah.txt"
+    dataset:          str   = "datasets/juz1.txt"
 
 # preset table
 _PRESETS = {

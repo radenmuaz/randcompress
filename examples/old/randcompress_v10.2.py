@@ -45,29 +45,44 @@ class Config(NamedTuple):
     vocab_size:    int   = 256
     # ── architecture ─────────────────────────────────────────────────────────
     d_model:       int   = 128
+    segment_size:  int   = 256
+    # segment_size:  int   = 128
     num_heads:     int   = 8
-    segment_size:  int   = 1024
+    # segment_size:  int   = 4096
     power_p:       int   = 2      # mLSTM attention kernel degree; 1 = v4.4.1 baseline
     # power_p:       int   = 2      # mLSTM attention kernel degree; 1 = v4.4.1 baseline
     seed:          int   = 0
     # stride_map:    str   = "1111"  # one digit per layer; stride-N fires every N tokens
     # block_map:     str   = "mmmm"
-    num_layers:    int   = 8      # always overridden to len(block_map)
-    block_map:     str   = "ms"*4
-    stride_map:    str   = "1,2,4,8,16,32,64"  # one digit per layer; stride-N fires every N tokens
+    # num_layers:    int   = 8      # always overridden to len(block_map)
+    # block_map:     str   = "s"*8
+    # stride_map:    str   = "1,4,16,64,256,1024,4096,16384"  # one digit per layer; stride-N fires every N tokens
+    # block_map:     str   = "m"*8
+    num_layers:    int   = 4      # always overridden to len(block_map)
+    stride_map:    str   = "1,8,64,512"  # one digit per layer; stride-N fires every N tokens
+    block_map:     str   = "m"*4
+    # stride_map:    str   = "1,2,4,8,16,64,256,1024"  # one digit per layer; stride-N fires every N tokens
+    # stride_map:    str   = "1,2,4,8,16,32,64"  # one digit per layer; stride-N fires every N tokens
+    # stride_map:    str   = "1,1,8,8,32,32,8,8,1,1"  # one digit per layer; stride-N fires every N tokens
+    # stride_map:    str   = "1,4,8,16,32,32,16,8,4,1"  # one digit per layer; stride-N fires every N tokens
+    # stride_map:    str   = "1,16,32,64,128,128,64,32,16,1"  # one digit per layer; stride-N fires every N tokens
+    # stride_map:    str   = "1,64,128,256,512,512,256,128,64,1"  # one digit per layer; stride-N fires every N tokens
     # stride_map:    str   = "11224488"  # one digit per layer; stride-N fires every N tokens
-    block_map:     str   = "smmm"
-    lora_r:        int   = 16
+    # num_layers:    int   = 16      # always overridden to len(block_map)
+    # block_map:     str   = "s"*16
+    # stride_map:    str   = "1,4,64,64,128,128,256,256,512,1024,1024,512,256,256,128,128,64,64,4,1"  # one digit per layer; stride-N fires every N tokens
+    lora_r:        int   = 32
     batch_size:    int   = 1
     # ── optimiser ────────────────────────────────────────────────────────────
-    learning_rate: float = 1e-2    # SinkGD: step = √(mn)·lr; output_proj is 64×256 → √=128, so lr≈1/128
+    # learning_rate: float = 1e-2    # SinkGD: step = √(mn)·lr; output_proj is 64×256 → √=128, so lr≈1/128
+    learning_rate: float = 1e-3    # SinkGD: step = √(mn)·lr; output_proj is 64×256 → √=128, so lr≈1/128
     # learning_rate: float = 1.0    # SinkGD: step = √(mn)·lr; output_proj is 64×256 → √=128, so lr≈1/128
     weight_decay:  float = 0.0
     grad_clip_norm:float = 1e6
-    sinkgd_l:      int   = 2
+    sinkgd_l:      int   = 4
     # ── loss ─────────────────────────────────────────────────────────────────
-    margin:        float = 1.0
-    ce_weight:     float = 0.0
+    margin:        float = 0.
+    ce_weight:     float = 1.0
     # margin:        float = 1.0
     # ce_weight:     float = 0.1
     # ── TBPTT state drop ─────────────────────────────────────────────────────
@@ -80,9 +95,11 @@ class Config(NamedTuple):
     # ── misc ─────────────────────────────────────────────────────────────────
     pad_token:     int   = 0
     dtype:         str   = "float32"
+    # dtype:         str   = "float16"
     max_iters:     int   = 100000   # kept for compat; curriculum uses max_iter_per_phase
     max_iter_per_phase: int = 100000 # SOLO / COMBINED budget per segment
-    check_every:   int   = 100
+    check_every:   int   = 1
+    # check_every:   int   = 100
     # dataset:       str   = "datasets/surat_al-fatihah.txt"
     dataset:       str   = "datasets/juz1.txt"
     # dataset:       str   = "datasets/quran-uthmani.txt"
@@ -1217,7 +1234,7 @@ def main():
                 fw_str  = next((str(fw) for _, fw in accs if fw is not None), "ok")
                 elapsed = time.perf_counter() - t_start
                 print()
-                pbar.set_description(f"seg{seg_idx+1} it={global_iters} acc={min_acc:.1%} fw={fw_str} "
+                pbar.set_description(f"seg{seg_idx+1} it={global_iters} acc={min_acc:.2%} fw={fw_str} "
                                      f"bpc={bpc:.4f} {elapsed:.0f}s")
                 if all(a == 1.0 for a, _ in accs):
                     pbar.close()
