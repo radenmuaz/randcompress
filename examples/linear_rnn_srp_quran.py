@@ -1,6 +1,6 @@
 """
-randcompress v10 — Fully linear cells: gate-free mLSTM + whitened sRNN
-Train loop: simple TBPTT with random state reset probability (SRP).
+randcompress v10 — quran-uthmani.txt stress test (full file compression).
+Config: block_map="sm", sinkgd_l=1, max_eval_tokens=0, save_ckpt=True.
 
 mLSTM (block type 'm') — linear, no gates:
   - Replace forget/input gates with frozen per-head scalar decay alpha [NH],
@@ -59,44 +59,40 @@ class Config(NamedTuple):
     vocab_size:    int   = 256
     # ── architecture ─────────────────────────────────────────────────────────
     d_model:       int   = 64
-    num_heads:     int   = 8
-    num_layers:    int   = 4      # always overridden to len(block_map)
-    segment_size:  int   = 1024
+    num_heads:     int   = 4
+    num_layers:    int   = 2      # always overridden to len(block_map)
+    segment_size:  int   = 512
     power_p:       int   = 2      # mLSTM attention kernel degree; 1 = v4.4.1 baseline
     seed:          int   = 0
-    stride_map:    str   = "1111"  # one digit per layer; stride-N fires every N tokens
-    block_map:     str   = "smmm"
-    # stride_map:    str   = "1248"  # one digit per layer; stride-N fires every N tokens
-    # block_map:     str   = "smmm"
+    stride_map:    str   = "11"
+    block_map:     str   = "sm"
     lora_r:        int   = 4
     batch_size:    int   = 1
     # ── optimiser ────────────────────────────────────────────────────────────
-    learning_rate: float = 1e-2    # SinkGD: step = √(mn)·lr; output_proj is 64×256 → √=128, so lr≈1/128
+    learning_rate: float = 1e-2
     weight_decay:  float = 0.0
     grad_clip_norm:float = 1e2
-    sinkgd_l:      int   = 5
+    sinkgd_l:      int   = 1
     # ── loss ─────────────────────────────────────────────────────────────────
     margin:        float = 0.
     ce_weight:     float = 1.0
     # ── gradient accumulation ────────────────────────────────────────────────
-    grad_accum_steps: int   = 1     # K chunks per vgrad call; state flows through all K
+    grad_accum_steps: int   = 4
     # ── hidden state dropout ──────────────────────────────────────────────────
-    state_reset_prob: float = 0.0   # prob of zeroing each layer state between chunks
+    state_reset_prob: float = 0.0
     # ── residual / stop ──────────────────────────────────────────────────────
     residual_budget: float = 0.
     target_bpb:    float = 0.0
     # ── generative eval ──────────────────────────────────────────────────────
-    gen_seed_len:  int   = 16   # teacher-forced warm-up bytes before eval starts
+    gen_seed_len:  int   = 16
     # ── misc ─────────────────────────────────────────────────────────────────
     pad_token:       int   = 0
     dtype:           str   = "float32"
-    max_iters:       int   = 100000
-    check_every:     int   = 100
-    max_eval_tokens: int   = 0     # 0 = all tokens; >0 = limit monitoring eval (fast BPB/accuracy snapshot)
+    max_iters:       int   = 200000
+    check_every:     int   = 20000
+    max_eval_tokens: int   = 0      # full file
     save_ckpt:       bool  = True  # save full compressed bundle at each checkpoint; False = log only
-    dataset:         str   = "datasets/surat_al-fatihah.txt"
-    # dataset:       str   = "datasets/juz1.txt"
-    # dataset:       str   = "datasets/quran-uthmani.txt"
+    dataset:         str   = "datasets/quran-uthmani.txt"
 
 _PRESETS = {
     "byte":         dict(input_bits=8, output_bits=8, output_heads=1, vocab_size=256, pad_token=0),
@@ -1492,8 +1488,6 @@ def save_compressed(ckpt_dir, cstats, params, config):
     first model input, then AR-decodes T_valid tokens from rc_stream.bin.
     """
     import json, pickle
-    # T_valid == n_raw_bytes - 1 is the correct "full file" case:
-    # the seed byte (token[0]) is stored separately; T_valid predictions cover bytes [1..end].
     if cstats["T_valid"] < cstats["n_raw_bytes"] - 1:
         raise ValueError(
             f"save_compressed: T_valid={cstats['T_valid']} < "
