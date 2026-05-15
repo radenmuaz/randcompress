@@ -22,6 +22,13 @@ Training (SRP — random state reset):
 
 import jax
 jax.config.update("jax_enable_x64", True)   # uint64 arithmetic for range coder
+# Suppress the scatter int64→int32 FutureWarning from jax_enable_x64 interactions.
+# Root cause: jnp.argmax returns int64 with x64 enabled; fixed with .astype(jnp.int32)
+# in _quantize_cdf. Remaining instances are harmless (correct implicit cast) until
+# a future JAX tightens the rules — suppress until then.
+import warnings as _w
+_w.filterwarnings("ignore", message="scatter inputs have incompatible types",
+                  category=FutureWarning)
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -92,7 +99,10 @@ class Config(NamedTuple):
     dtype:           str   = "float32"
     max_iters:       int   = 100000
     check_every:     int   = 100
-    max_eval_tokens: int   = 0     # 0 = all tokens; >0 = limit monitoring eval (fast BPB/accuracy snapshot)
+    max_eval_tokens: int   = 0     # 0 = all tokens; >0 = limit monitoring eval (fast BPB snapshot)
+    remat:           bool  = True  # True = chunk CDF/round-trip to stay in memory (always tests all tokens)
+                                   # False = single-shot (fast, may OOM on large files)
+    remat_chunk:     int   = 50000 # tokens per remat chunk (ignored when remat=False)
     save_ckpt:       bool  = True  # save full compressed bundle at each checkpoint; False = log only
     dataset:         str   = "datasets/surat_al-fatihah.txt"
     # dataset:       str   = "datasets/juz1.txt"
@@ -1040,6 +1050,57 @@ def rc_decode(buf, all_cumfreqs, n_tokens):
     return syms   # [n_tokens] int32
 
 
+def rc_decode_init(buf):
+    """Read first 4 bytes of buf into the RC decode carry state."""
+    _U32 = jnp.uint32; _U64 = jnp.uint64
+    x = _U32(0)
+    for i in range(4):
+        x = _U32((_U64(x) << _U64(8)) | _U64(buf[i].astype(jnp.uint32)))
+    return (_U32(0), _U32(0xFFFFFFFF), x, jnp.int32(4))
+
+
+@functools.partial(jax.jit, static_argnames=["n_chunk"])
+def rc_decode_chunk(buf, chunk_cumfreqs, n_chunk, carry):
+    """Decode n_chunk symbols continuing from carry=(low,high,x,pos).
+
+    Used by the remat round-trip verifier to decode in O(chunk × V) memory
+    instead of O(T_total × V), making it safe for files of any size.
+    Returns (syms [n_chunk] int32, new_carry).
+    """
+    _U32 = jnp.uint32; _U64 = jnp.uint64
+    _M = _U64(1 << RC_PREC); _FF = _U64(0xFF); _4G = _U64(0xFFFFFFFF)
+
+    def _refill_cond(s):
+        l, h, _x, _p = s
+        return (_U64(l) >> _U64(24)) == (_U64(h) >> _U64(24))
+
+    def _refill_body(s):
+        l, h, x, pos = s
+        l   = _U32((_U64(l) << _U64(8)) & _4G)
+        h   = _U32((_U64(h) << _U64(8) | _FF) & _4G)
+        x   = _U32((_U64(x) << _U64(8) | _U64(buf[pos].astype(jnp.uint32))) & _4G)
+        return l, h, x, pos + jnp.int32(1)
+
+    def decode_step(carry, cumfreqs):
+        low, high, x, pos = carry
+        rng  = _U64(high) - _U64(low) + _U64(1)
+        slot = _U32((_U64(x - low + _U32(1)) * _M - _U64(1)) // rng)
+        V    = cumfreqs.shape[0] - 1
+        sym  = jnp.searchsorted(cumfreqs[:V].view(jnp.int32),
+                                  slot.view(jnp.int32), side='right') - 1
+        sym  = jnp.clip(sym, 0, V - 1).astype(jnp.uint32)
+        cum_lo = _U64(cumfreqs[sym])
+        cum_hi = _U64(cumfreqs[sym + _U32(1)])
+        high   = _U32(_U64(low) + rng * cum_hi // _M - _U64(1))
+        low    = _U32(_U64(low) + rng * cum_lo // _M)
+        low, high, x, pos = jax.lax.while_loop(_refill_cond, _refill_body,
+                                                (low, high, x, pos))
+        return (low, high, x, pos), sym.astype(jnp.int32)
+
+    new_carry, syms = jax.lax.scan(decode_step, carry, chunk_cumfreqs)
+    return syms, new_carry   # [n_chunk] int32, new carry
+
+
 class ByteTokenizer:
     vocab_size = 256
     @staticmethod
@@ -1233,15 +1294,23 @@ def eval_compression(base_xlstm, params, config, all_inputs, all_targets,
     rc_bytes    = int(nb_a)
     rc_np       = np.array(buf_a[:rc_bytes], dtype=np.uint8)   # trimmed stream
 
-    # verify round-trip on a prefix (full T_v can be 1.4 GB of cumfreqs — OOM risk)
-    ROUNDTRIP_MAX = 50_000
-    rt_n      = min(T_v, ROUNDTRIP_MAX)
-    rt_cf     = cumfreqs[:rt_n]
-    rt_buf_sz = rt_n * 3 + 64
-    rt_buf, _ = rc_encode(jnp.array(vtgt[:rt_n], jnp.int32), rt_cf, rt_buf_sz)
-    rt_dec    = rc_decode(rt_buf, rt_cf, rt_n)
-    decode_ok = bool(jnp.all(rt_dec == jnp.array(vtgt[:rt_n], jnp.int32)))
-    rt_note   = "" if T_v <= ROUNDTRIP_MAX else f" (first {rt_n}/{T_v} tokens)"
+    # verify round-trip on ALL tokens
+    # remat=True  → chunked decode: O(remat_chunk × V) memory, always works
+    # remat=False → single-shot decode: O(T_v × V) memory, may OOM on large files
+    if config.remat:
+        chunk = config.remat_chunk
+        rc_carry    = rc_decode_init(buf_a)
+        decoded_all = []
+        for _i in range(0, T_v, chunk):
+            _end  = min(_i + chunk, T_v)
+            _cf   = jnp.array(cumfreqs_np[_i:_end])
+            _syms, rc_carry = rc_decode_chunk(buf_a, _cf, _end - _i, rc_carry)
+            decoded_all.append(np.array(_syms))
+        decode_ok = bool(np.all(np.concatenate(decoded_all) == vtgt))
+    else:
+        dec_a     = rc_decode(buf_a, cumfreqs, T_v)
+        decode_ok = bool(jnp.all(dec_a == jnp.array(vtgt, jnp.int32)))
+    rt_note = ""
 
     # ── Scheme B: residual raw (argmax + 4-byte corrections) ─────────────────
     resid_raw_bytes = n_wrong * 4
