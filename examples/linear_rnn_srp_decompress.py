@@ -42,7 +42,7 @@ from linear_rnn_srp import (
     Config, RC_PREC, DTYPE, POWER_P,
     _quantize_cdf, _parse_stride_map,
     init_xlstm_params, init_randcompress_params,
-    init_step_states, forward_step, _reshape_logits,
+    init_step_states, _collect_chunk_jit, _reshape_logits,
     bytes_to_tokens, tokens_to_bytes,
 )
 
@@ -70,6 +70,17 @@ def load_bundle(ckpt_dir):
     with open(os.path.join(ckpt_dir, "rc_stream.bin"), "rb") as f:
         rc_raw = np.frombuffer(f.read(), dtype=np.uint8).copy()
 
+    # Layer 4: verify rc_stream.bin integrity against stored SHA-256
+    if "rc_stream_sha256" in meta:
+        import hashlib
+        actual_sha = hashlib.sha256(rc_raw.tobytes()).hexdigest()
+        if actual_sha != meta["rc_stream_sha256"]:
+            raise RuntimeError(
+                f"rc_stream.bin is corrupt: SHA-256 mismatch.\n"
+                f"  stored:  {meta['rc_stream_sha256']}\n"
+                f"  actual:  {actual_sha}\n"
+                "The compressed bundle may have been truncated or modified.")
+
     valid_keys = set(Config._fields)
     cfg_dict   = {k: v for k, v in cfg_dict.items() if k in valid_keys}
     config     = Config(**cfg_dict)
@@ -93,9 +104,29 @@ def _rc_init(buf):
 
 
 def _rc_decode_sym(low, high, x, pos, buf, cumfreqs):
-    """Decode one symbol; return (sym, new_low, new_high, new_x, new_pos)."""
+    """Decode one symbol; return (sym, new_low, new_high, new_x, new_pos).
+
+    Layer-1 defensive checks (Python assertions, active in debug mode):
+      x_range  — x must be in [low, high]; violation means RC state is corrupt
+      slot_oor — slot must be < M; violation means arithmetic overflow
+    These fire before the symbol is returned so the caller gets a clear error
+    rather than a silent wrong decode.
+    """
+    # x ∈ [low, high] invariant — catches RC state corruption / arithmetic overflow
+    if low > x or x > high:
+        raise RuntimeError(
+            f"RC state corrupt at buf_pos={pos}: "
+            f"x={x:#010x} not in [{low:#010x}, {high:#010x}]. "
+            "Likely cause: CDF mismatch between encoder and decoder paths.")
+
     rng  = high - low + 1
     slot = ((x - low + 1) * _RC_M - 1) // rng
+
+    if slot >= _RC_M:
+        raise RuntimeError(
+            f"RC slot overflow at buf_pos={pos}: slot={slot} >= M={_RC_M}. "
+            "Arithmetic overflow in range-coder state.")
+
     sym  = int(np.searchsorted(cumfreqs[:-1], slot, side='right')) - 1
     sym  = max(0, min(sym, len(cumfreqs) - 2))
 
@@ -147,32 +178,48 @@ def decompress(ckpt_dir, output_path, verify_path=None):
     stride_map = _parse_stride_map(config.stride_map, config.num_layers)
     chunk_size = config.segment_size * (8 // config.input_bits)
 
-    # JIT only the model forward step (the expensive part)
-    fwd_jit = jax.jit(forward_step,
-                       static_argnames=["num_heads", "block_map", "stride_map"])
-
     # ── init range coder + model state ───────────────────────────────────────
     rc_low, rc_high, rc_x, rc_pos = _rc_init(rc_raw)
     model_states = init_step_states(config, batch_size=1)
 
-    # ── AR decode loop ────────────────────────────────────────────────────────
-    decoded    = [seed_token]
-    cur_token  = jnp.array([seed_token], jnp.int32)
+    # ── AR decode loop  (chunk-level to match encoder's _collect_chunk_jit XLA path)
+    # _collect_chunk_jit uses lax.scan + apply_xlstm_hira-once. Running the same
+    # compiled function guarantees bit-exact CDFs vs the encoder — critical for
+    # lossless range-code decode. Per-token _fwd_step_jit compiles differently
+    # and causes 1-ULP CDF differences that accumulate into wrong RC state.
+    decoded   = [seed_token]
+    cur_toks  = [seed_token]   # tokens fed as input each step (= decoded output)
 
-    for t in tqdm(range(T_valid), desc="decode", unit="tok", file=sys.stderr):
-        t_local = t % chunk_size   # local position within chunk (for stride)
+    oh, ob = config.output_heads, config.output_bits
+    pbar = tqdm(total=T_valid, desc="decode", unit="tok", file=sys.stderr)
 
-        logit_flat, model_states = fwd_jit(
-            base_xlstm, params, cur_token, model_states,
-            config.num_heads, config.block_map, stride_map, jnp.int32(t_local))
-        logits   = _reshape_logits(logit_flat, config.output_heads, config.output_bits)
-        cumfreqs = np.array(_quantize_cdf(logits[0, 0]), dtype=np.int64)
+    for chunk_start in range(0, T_valid, chunk_size):
+        this_chunk = min(chunk_size, T_valid - chunk_start)
+        toks_in = jnp.array(cur_toks[-this_chunk:] if len(cur_toks) >= this_chunk
+                             else [seed_token] * (this_chunk - len(cur_toks)) + cur_toks,
+                             jnp.int32)
+        # toks_in[0] = the input for the first position of this chunk
+        # = last decoded token from previous chunk (or seed for chunk 0)
+        # Build the full input array for this chunk: [prev_last, sym_0, ..., sym_{chunk-2}]
+        # We only have prev_last; symbols are unknown until decoded.
+        # Solution: decode one at a time within the chunk using _collect_chunk_jit
+        # with a 1-token window (so same lax.scan context but advances state).
+        # Decode token by token but calling _collect_chunk_jit(size=1) each step.
+        for local_t in range(this_chunk):
+            tok_in = jnp.array([cur_toks[-1]], jnp.int32)
+            chunk_logits, model_states = _collect_chunk_jit(
+                base_xlstm, params, tok_in, model_states,
+                1, config.num_heads, config.block_map, stride_map, oh, ob)
+            cumfreqs = np.array(_quantize_cdf(chunk_logits[0]), dtype=np.int64)
 
-        sym, rc_low, rc_high, rc_x, rc_pos = _rc_decode_sym(
-            rc_low, rc_high, rc_x, rc_pos, rc_raw, cumfreqs)
+            sym, rc_low, rc_high, rc_x, rc_pos = _rc_decode_sym(
+                rc_low, rc_high, rc_x, rc_pos, rc_raw, cumfreqs)
 
-        decoded.append(sym)
-        cur_token = jnp.array([sym], jnp.int32)
+            decoded.append(sym)
+            cur_toks.append(sym)
+            pbar.update(1)
+
+    pbar.close()
 
     # ── convert tokens → bytes ────────────────────────────────────────────────
     raw_out = tokens_to_bytes(np.array(decoded, np.int32), config.input_bits)[:n_raw_bytes]

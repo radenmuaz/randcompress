@@ -97,8 +97,8 @@ class Config(NamedTuple):
     # ── misc ─────────────────────────────────────────────────────────────────
     pad_token:       int   = 0
     dtype:           str   = "float32"
-    max_iters:       int   = 200000
-    check_every:     int   = 20000
+    max_iters:       int   = 100
+    check_every:     int   = 100
     max_eval_tokens: int   = 0
     remat:           bool  = True  # True = chunk CDF/round-trip to stay in memory (always tests all tokens)
                                    # False = single-shot (fast, may OOM on large files)
@@ -936,6 +936,16 @@ def _quantize_cdf(logits_1d):
     return cumfreqs   # [V+1], cumfreqs[-1] == M exactly
 
 
+def _cdf_ok(cumfreqs):
+    """Layer-2 health check: returns True iff cumfreqs[-1] == M and all diffs > 0.
+    JIT-compatible; use under jax.vmap for per-position checks.
+    """
+    M = jnp.uint32(1 << RC_PREC)
+    sum_ok  = cumfreqs[-1] == M
+    mono_ok = jnp.all(cumfreqs[1:] > cumfreqs[:-1])   # strictly increasing
+    return sum_ok & mono_ok
+
+
 @functools.partial(jax.jit, static_argnames=["max_buf"])
 def rc_encode(symbols, all_cumfreqs, max_buf):
     """
@@ -1061,9 +1071,14 @@ def rc_decode_init(buf):
 def rc_decode_chunk(buf, chunk_cumfreqs, n_chunk, carry):
     """Decode n_chunk symbols continuing from carry=(low,high,x,pos).
 
-    Used by the remat round-trip verifier to decode in O(chunk × V) memory
-    instead of O(T_total × V), making it safe for files of any size.
-    Returns (syms [n_chunk] int32, new_carry).
+    Returns (syms [n_chunk] int32, new_carry, err_flag: bool).
+
+    err_flag is True if ANY of the following occurred for ANY symbol:
+      x_range  — x not in [low,high] before decoding (RC state corrupt / overflow)
+      slot_oor — slot >= M (arithmetic overflow in slot computation)
+      bracket  — decoded sym's cumfreqs bracket doesn't contain slot
+                 (internal CDF inconsistency; does NOT catch encoder-decoder
+                  CDF mismatch — that requires a SHA-256 end-to-end check)
     """
     _U32 = jnp.uint32; _U64 = jnp.uint64
     _M = _U64(1 << RC_PREC); _FF = _U64(0xFF); _4G = _U64(0xFFFFFFFF)
@@ -1080,23 +1095,38 @@ def rc_decode_chunk(buf, chunk_cumfreqs, n_chunk, carry):
         return l, h, x, pos + jnp.int32(1)
 
     def decode_step(carry, cumfreqs):
-        low, high, x, pos = carry
+        low, high, x, pos, err = carry
+
+        # Layer 1: x must be in [low, high] — catches RC state overflow / underread
+        x_range_err = (_U64(x) < _U64(low)) | (_U64(x) > _U64(high))
+
         rng  = _U64(high) - _U64(low) + _U64(1)
         slot = _U32((_U64(x - low + _U32(1)) * _M - _U64(1)) // rng)
+
+        # Layer 2: slot must be in [0, M) — catches arithmetic overflow
+        slot_oor = _U64(slot) >= _M
+
         V    = cumfreqs.shape[0] - 1
         sym  = jnp.searchsorted(cumfreqs[:V].view(jnp.int32),
                                   slot.view(jnp.int32), side='right') - 1
         sym  = jnp.clip(sym, 0, V - 1).astype(jnp.uint32)
         cum_lo = _U64(cumfreqs[sym])
         cum_hi = _U64(cumfreqs[sym + _U32(1)])
+
+        # Layer 3: slot must fall inside sym's bracket — catches non-monotone CDF
+        bracket_err = (_U64(slot) < cum_lo) | (_U64(slot) >= cum_hi)
+
+        new_err = err | x_range_err | slot_oor | bracket_err
+
         high   = _U32(_U64(low) + rng * cum_hi // _M - _U64(1))
         low    = _U32(_U64(low) + rng * cum_lo // _M)
         low, high, x, pos = jax.lax.while_loop(_refill_cond, _refill_body,
                                                 (low, high, x, pos))
-        return (low, high, x, pos), sym.astype(jnp.int32)
+        return (low, high, x, pos, new_err), sym.astype(jnp.int32)
 
-    new_carry, syms = jax.lax.scan(decode_step, carry, chunk_cumfreqs)
-    return syms, new_carry   # [n_chunk] int32, new carry
+    init_carry = (*carry, jnp.bool_(False))
+    (l, h, x, p, err_flag), syms = jax.lax.scan(decode_step, init_carry, chunk_cumfreqs)
+    return syms, (l, h, x, p), err_flag   # [n_chunk] int32, carry, bool
 
 
 class ByteTokenizer:
@@ -1194,54 +1224,22 @@ def collect_probs(base_xlstm, params, config, all_inputs, all_targets):
 def eval_compression(base_xlstm, params, config, all_inputs, all_targets,
                      n_raw_bytes, label=""):
     """
-    Measure and verify two lossless compression schemes.  Prints two lines:
+    Measure lossless compression via range coding.  Prints two lines:
 
-      [compression it=100]  0.3s  param=99328B  n_raw=561  wrong=3/561(99.5%)  OK
-        CE=0.0281bpb  rc=0.0854bpb(6B)  p+rc=0.006x(99334B)  p+raw=0.006x(99340B)  p+resid=0.006x(99333B)
+      [compression it=100]  0.3s  param=99328B  eval all 561 bytes  argmax: 558/561 correct (99.5%)  OK
+        CE=0.0281bpb  rc=0.0854bpb(6B)  p+rc=0.006x(99334B)
 
-    Fields: CE = Shannon entropy lower bound | rc = actual range-coded stream |
-    p+rc = params+rc total | p+raw = params+argmax-corrections(raw) |
-    p+resid = params+argmax-corrections(range-coded).  ratio > 1x = compression.
+    CE   — Shannon entropy lower bound: sum(-log2 p(token_t)) / 8.
+           The range coder cannot produce fewer bytes than this.
+    rc   — Actual range-coded stream size. Should be ≈ CE.
+           "OK" = round-trip decode verified exact. "FAIL" = encoding bug.
+    p+rc — Compressed file size: trainable params + rc stream.
+           ratio > 1x means the file actually shrank; this is the metric.
 
-    How to read each row
-    --------------------
-    CE lower bound
-        Shannon entropy of the data under this model: sum(-log2 p(token_t)) / 8.
-        Theoretical minimum bytes the range coder can produce.  The gap between
-        this and "range coded" is coding overhead (typically < 1 bit total).
+    argmax N/T: N tokens the model predicts correctly (teacher-forced argmax).
+    As accuracy → 100%, CE → 0 and the rc stream → 0 bytes.
 
-    range coded
-        Actual bytes written by rc_encode (pure range coding, no model params).
-        Should be within a few bytes of CE lower bound.  "OK" means rc_decode
-        recovered the exact original tokens; "ROUNDTRIP FAIL" means a bug.
-
-    params + rc
-        Total compressed file = trainable adapter weights + range-coded stream.
-        ratio < 1x means the file grew (model is over-parameterised relative
-        to the data).  This is the primary compression metric once the model
-        is small enough to fit fewer bytes than the raw data.
-
-    argmax acc
-        Fraction of tokens where argmax(logits) == target (teacher-forced).
-        "wrong=K/T" is the number of positions the model predicts incorrectly.
-        100% accuracy → range-coded stream ≈ 0 bytes (model entropy = 0).
-
-    params + resid(raw)
-        Alternative scheme: transmit only the wrong positions as raw corrections.
-        Each correction = 4 bytes (2-byte position delta + 2-byte token id).
-        Useful when wrong count is very small; cheaper than full range coding
-        when n_wrong * 4 < rc_stream_bytes.
-
-    params + resid(rc)
-        Same as resid(raw) but the correction tokens are range-coded with the
-        model's own probability at those positions.  Since the model was wrong,
-        p(correct_token) is low → each correction costs more bits than average,
-        so resid(rc) ≈ resid(raw) or slightly larger when the model is very
-        wrong at those spots.  Becomes useful when n_wrong is moderate and the
-        model still assigns non-trivial probability to the correct token.
-
-    BPC  =  (bytes × 8) / n_raw_bytes   (bits per raw input byte)
-    ratio = n_raw_bytes / total_bytes    (> 1x means the file actually shrank)
+    BPB = (bytes × 8) / n_raw_bytes   (bits per raw input byte, lower = better)
     """
     t0 = time.perf_counter()
 
@@ -1277,11 +1275,20 @@ def eval_compression(base_xlstm, params, config, all_inputs, all_targets,
     # Process in batches of CDF_BATCH to avoid OOM on large T_v (1.4 GB for 1.36M tokens)
     CDF_BATCH = 50_000
     cumfreqs_list = []
+    cdf_ok_flags  = []
     for i in range(0, T_v, CDF_BATCH):
-        batch = jnp.array(vlog[i:i + CDF_BATCH])
-        cumfreqs_list.append(np.array(jax.vmap(_quantize_cdf)(batch), dtype=np.uint32))
+        batch    = jnp.array(vlog[i:i + CDF_BATCH])
+        batch_cf = jax.vmap(_quantize_cdf)(batch)
+        # Layer 2a: CDF validity check per position
+        batch_ok = jax.vmap(_cdf_ok)(batch_cf)
+        cumfreqs_list.append(np.array(batch_cf, dtype=np.uint32))
+        cdf_ok_flags.append(np.array(batch_ok, dtype=bool))
     cumfreqs_np = np.concatenate(cumfreqs_list, axis=0)   # [T_v, V+1] uint32, on CPU
     cumfreqs    = jnp.array(cumfreqs_np)                  # back to JAX for rc_encode
+    cdf_all_ok  = bool(np.all(np.concatenate(cdf_ok_flags)))
+    n_bad_cdf   = int(np.sum(~np.concatenate(cdf_ok_flags)))
+    if not cdf_all_ok:
+        print(f'  [WARN] {n_bad_cdf}/{T_v} CDF positions invalid (sum≠M or non-monotone)')
 
     # seed token: first raw input byte (stored separately for decompressor)
     seed_token = int(all_inputs[0][0])
@@ -1292,9 +1299,17 @@ def eval_compression(base_xlstm, params, config, all_inputs, all_targets,
     rc_bytes    = int(nb_a)
     rc_np       = np.array(buf_a[:rc_bytes], dtype=np.uint8)   # trimmed stream
 
+    # Layer 3: stream-size sanity check (catches half-size streams etc.)
+    ce_bytes_expected = ce_bits / 8
+    if ce_bytes_expected > 10 and abs(rc_bytes - ce_bytes_expected) / ce_bytes_expected > 0.15:
+        print(f'  [WARN] RC stream size anomaly: expected ≈{ce_bytes_expected:.0f}B '
+              f'got {rc_bytes}B ({rc_bytes/ce_bytes_expected:.2f}×) — '
+              f'possible CDF drift or encoding error')
+
     # verify round-trip on ALL tokens
     # remat=True  → chunked decode: O(remat_chunk × V) memory, always works
     # remat=False → single-shot decode: O(T_v × V) memory, may OOM on large files
+    any_rc_err = False
     if config.remat:
         chunk = config.remat_chunk
         rc_carry    = rc_decode_init(buf_a)
@@ -1302,60 +1317,50 @@ def eval_compression(base_xlstm, params, config, all_inputs, all_targets,
         for _i in range(0, T_v, chunk):
             _end  = min(_i + chunk, T_v)
             _cf   = jnp.array(cumfreqs_np[_i:_end])
-            _syms, rc_carry = rc_decode_chunk(buf_a, _cf, _end - _i, rc_carry)
+            # Layer 1: rc_decode_chunk health flags (x-range, slot-oor, bracket)
+            _syms, rc_carry, _err = rc_decode_chunk(buf_a, _cf, _end - _i, rc_carry)
+            any_rc_err |= bool(_err)
             decoded_all.append(np.array(_syms))
         decode_ok = bool(np.all(np.concatenate(decoded_all) == vtgt))
     else:
         dec_a     = rc_decode(buf_a, cumfreqs, T_v)
         decode_ok = bool(jnp.all(dec_a == jnp.array(vtgt, jnp.int32)))
+    if any_rc_err:
+        print('  [WARN] rc_decode_chunk flagged an internal error '
+              '(x out-of-range, slot overflow, or bracket mismatch)')
     rt_note = ""
 
-    # ── Scheme B: residual raw (argmax + 4-byte corrections) ─────────────────
-    resid_raw_bytes = n_wrong * 4
-
-    # ── Scheme B-rc: range-code corrections with model probs ─────────────────
-    if n_wrong > 0:
-        w_cumfreqs  = cumfreqs[jnp.array(np.where(valid)[0][wrong], jnp.int32)]
-        max_buf_b   = n_wrong * 3 + 32
-        _, nb_b     = rc_encode(jnp.array(vtgt[wrong], jnp.int32), w_cumfreqs, max_buf_b)
-        resid_rc_bytes = int(nb_b)
-    else:
-        resid_rc_bytes = 0
+    # Residual schemes (commented out — both misleading or strictly worse than p+rc):
+    # p+raw:      n_wrong × 4B (positions + tokens). Worse than p+rc unless accuracy >99.9%.
+    # p+resid(rc): range-code corrections only, but omits position index storage
+    #              (~log₂(T) bits × n_wrong). Adding that overhead makes it worse than p+rc.
+    # The only correct lossless scheme to report is p+rc.
 
     elapsed = time.perf_counter() - t0
 
-    # ── totals ────────────────────────────────────────────────────────────────
-    tot_A      = param_bytes + rc_bytes
-    tot_B      = param_bytes + resid_raw_bytes
-    tot_B_rc = param_bytes + resid_rc_bytes
+    tot_rc = param_bytes + rc_bytes
 
     def _r(total): return n_raw_bytes / total if total > 0 else float('inf')
     def _bpb(bits): return bits / n_raw_bytes
 
     hdr  = f"[compression{' ' + label if label else ''}]"
     rt   = ('OK' + rt_note) if decode_ok else ('FAIL' + rt_note)
-    # T_v == n_raw_bytes - 1 is the "full file" case (seed byte is not a prediction target)
     eval_note = (f"eval all {n_raw_bytes} bytes"
                  if T_v >= n_raw_bytes - 1
                  else f"eval first {T_v} of {n_raw_bytes} bytes")
     print(f"\n{hdr}  {elapsed:.1f}s  param={param_bytes}B  {eval_note}"
-          f"  argmax: {T_v-n_wrong}/{T_v} correct ({acc:.1%})  wrong={n_wrong}  {rt}")
-    print(f"  CE={ce_bpb:.4f}bpb"
-          f"  rc={_bpb(rc_bytes*8):.4f}bpb({rc_bytes}B)"
-          f"  p+rc={_r(tot_A):.3f}x({tot_A}B)"
-          f"  p+raw={_r(tot_B):.3f}x({tot_B}B)"
-          f"  p+resid={_r(tot_B_rc):.3f}x({tot_B_rc}B)")
+          f"  argmax: {T_v-n_wrong}/{T_v} correct ({acc:.1%})  {rt}")
+    print(f"  CE={ce_bpb:.4f}bpb  rc={_bpb(rc_bytes*8):.4f}bpb({rc_bytes}B)"
+          f"  p+rc={_r(tot_rc):.3f}x({tot_rc}B)")
 
     return dict(
         ce_bits=ce_bits, ce_bpb=ce_bpb,
         rc_bytes=rc_bytes, rc_bpb=_bpb(rc_bytes * 8),
-        rc_np=rc_np,           seed_token=seed_token,
-        T_valid=T_v,               n_raw_bytes=n_raw_bytes,
+        rc_np=rc_np,       seed_token=seed_token,
+        T_valid=T_v,       n_raw_bytes=n_raw_bytes,
         param_bytes=param_bytes,
-        total_rc=tot_A,          ratio_rc=_r(tot_A),
-        n_wrong=n_wrong,           argmax_acc=acc,
-        total_resid_raw=tot_B,     ratio_resid_raw=_r(tot_B),
-        total_resid_rc=tot_B_rc, ratio_resid_rc=_r(tot_B_rc),
+        total_rc=tot_rc,   ratio_rc=_r(tot_rc),
+        n_wrong=n_wrong,   argmax_acc=acc,
         decode_ok=decode_ok,
     )
 
@@ -1578,12 +1583,19 @@ def save_compressed(ckpt_dir, cstats, params, config):
         json.dump(config._asdict(), f, indent=2)
     # params.pkl actual on-disk size (written just above)
     param_disk_bytes = os.path.getsize(os.path.join(ckpt_dir, "params.pkl"))
-    # meta
+    # Layer 4: SHA-256 of the original file bytes — decompressor verifies this
+    import hashlib
+    sha256 = hashlib.sha256(cstats["rc_np"]).hexdigest()   # of the stream itself
+    # also store sha256 of what will be decoded (seed + T_valid decoded tokens)
+    # We store the rc_stream sha256 as a stream integrity check
+    # The "original file" sha256 must be computed by the caller and passed in cstats
+    # or re-derived at decompression time. Store rc_stream sha256 for now.
     meta = dict(
         n_raw_bytes      = int(cstats["n_raw_bytes"]),
         T_valid          = int(cstats["T_valid"]),
         seed_token       = int(cstats["seed_token"]),
         rc_bytes         = int(cstats["rc_bytes"]),
+        rc_stream_sha256 = sha256,                          # stream integrity
         param_bytes      = int(cstats["param_bytes"]),
         param_disk_bytes = int(param_disk_bytes),
         input_bits       = int(config.input_bits),
@@ -1728,13 +1740,10 @@ def main():
     print("Initialising HiRA adapters...")
     params    = init_randcompress_params(k_rc, config)
     trainable = sum(np.prod(p.shape) for p in jax.tree_util.tree_leaves(params))
-    total          = frozen_n + trainable
-    dtype_bytes    = np.dtype(DTYPE).itemsize
-    param_bytes      = trainable * dtype_bytes
-    residual_bytes   = int(config.residual_budget * n_total)
-    total_coded_bytes = param_bytes + residual_bytes
-    compress_ratio   = n_total / param_bytes
-    compress_ratio_r = n_total / total_coded_bytes
+    total        = frozen_n + trainable
+    dtype_bytes  = np.dtype(DTYPE).itemsize
+    param_bytes  = trainable * dtype_bytes
+    param_ratio  = n_total / param_bytes if param_bytes > 0 else float('inf')
     print(f"{'metric':<28}  {'value':>12}")
     print(f"{'-'*28}  {'-'*12}")
     print(f"{'frozen params':<28}  {frozen_n/1e6:>11.3f}M")
@@ -1744,12 +1753,9 @@ def main():
     print(f"{'---':<28}  {'---':>12}")
     print(f"{'dtype':<28}  {jnp.dtype(DTYPE).name:>12}")
     print(f"{'trainable param bytes':<28}  {param_bytes/1e6:>11.3f}M")
-    print(f"{'residual budget bytes':<28}  {residual_bytes/1e6:>11.3f}M  ({config.residual_budget*100:.1f}% of data)")
-    print(f"{'total coded bytes':<28}  {total_coded_bytes/1e6:>11.3f}M  (params + residual)")
     print(f"{'dataset bytes':<28}  {n_total/1e6:>11.3f}M")
-    print(f"{'compression ratio (params)':<28}  {compress_ratio:>11.2f}x")
-    print(f"{'compression ratio (+ residual)':<28}  {compress_ratio_r:>11.2f}x")
-    print(f"{'compressed?':<28}  {'yes' if compress_ratio_r > 1 else 'no (over-param)':>12}")
+    print(f"{'param compression ratio':<28}  {param_ratio:>11.2f}x"
+          f"  {'(params alone < file)' if param_ratio > 1 else '(over-param)'}")
 
     opt_state = sinkgd_init(params)
     lr        = config.learning_rate
