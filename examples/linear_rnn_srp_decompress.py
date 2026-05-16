@@ -46,6 +46,9 @@ from linear_rnn_srp import (
     bytes_to_tokens, tokens_to_bytes,
 )
 
+# Same jit(_quantize_cdf) as the encoder — no vmap, identical XLA, bit-exact.
+_quantize_cdf_jit = jax.jit(_quantize_cdf)
+
 
 # ============================================================================
 # Bundle I/O
@@ -182,42 +185,30 @@ def decompress(ckpt_dir, output_path, verify_path=None):
     rc_low, rc_high, rc_x, rc_pos = _rc_init(rc_raw)
     model_states = init_step_states(config, batch_size=1)
 
-    # ── AR decode loop  (chunk-level to match encoder's _collect_chunk_jit XLA path)
-    # _collect_chunk_jit uses lax.scan + apply_xlstm_hira-once. Running the same
-    # compiled function guarantees bit-exact CDFs vs the encoder — critical for
-    # lossless range-code decode. Per-token _fwd_step_jit compiles differently
-    # and causes 1-ULP CDF differences that accumulate into wrong RC state.
+    # ── AR decode loop
+    # Uses _collect_chunk_jit(size=1) — same scan body and same weight-hoisting
+    # as the encoder's collect_probs, guaranteeing bit-exact logits.
+    # CDFs computed via jax.vmap(_quantize_cdf) matching the encoder's batch path.
     decoded   = [seed_token]
-    cur_toks  = [seed_token]   # tokens fed as input each step (= decoded output)
+    cur_toks  = [seed_token]
 
     oh, ob = config.output_heads, config.output_bits
     pbar = tqdm(total=T_valid, desc="decode", unit="tok", file=sys.stderr)
 
-    for chunk_start in range(0, T_valid, chunk_size):
-        this_chunk = min(chunk_size, T_valid - chunk_start)
-        toks_in = jnp.array(cur_toks[-this_chunk:] if len(cur_toks) >= this_chunk
-                             else [seed_token] * (this_chunk - len(cur_toks)) + cur_toks,
-                             jnp.int32)
-        # toks_in[0] = the input for the first position of this chunk
-        # = last decoded token from previous chunk (or seed for chunk 0)
-        # Build the full input array for this chunk: [prev_last, sym_0, ..., sym_{chunk-2}]
-        # We only have prev_last; symbols are unknown until decoded.
-        # Solution: decode one at a time within the chunk using _collect_chunk_jit
-        # with a 1-token window (so same lax.scan context but advances state).
-        # Decode token by token but calling _collect_chunk_jit(size=1) each step.
-        for local_t in range(this_chunk):
-            tok_in = jnp.array([cur_toks[-1]], jnp.int32)
-            chunk_logits, model_states = _collect_chunk_jit(
-                base_xlstm, params, tok_in, model_states,
-                1, config.num_heads, config.block_map, stride_map, oh, ob)
-            cumfreqs = np.array(_quantize_cdf(chunk_logits[0]), dtype=np.int64)
+    for t in range(T_valid):
+        tok_in = jnp.array([cur_toks[-1]], jnp.int32)
+        chunk_logits, model_states = _collect_chunk_jit(
+            base_xlstm, params, tok_in, model_states,
+            1, config.num_heads, config.block_map, stride_map, oh, ob)
+        # chunk_logits: [1, V] — match encoder's vmap CDF path exactly
+        cumfreqs = np.array(_quantize_cdf_jit(chunk_logits[0]), dtype=np.int32)
 
-            sym, rc_low, rc_high, rc_x, rc_pos = _rc_decode_sym(
-                rc_low, rc_high, rc_x, rc_pos, rc_raw, cumfreqs)
+        sym, rc_low, rc_high, rc_x, rc_pos = _rc_decode_sym(
+            rc_low, rc_high, rc_x, rc_pos, rc_raw, cumfreqs)
 
-            decoded.append(sym)
-            cur_toks.append(sym)
-            pbar.update(1)
+        decoded.append(sym)
+        cur_toks.append(sym)
+        pbar.update(1)
 
     pbar.close()
 

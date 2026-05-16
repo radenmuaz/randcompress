@@ -97,16 +97,16 @@ class Config(NamedTuple):
     # ── misc ─────────────────────────────────────────────────────────────────
     pad_token:       int   = 0
     dtype:           str   = "float32"
-    max_iters:       int   = 100000
+    max_iters:       int   = 100
     check_every:     int   = 100
     max_eval_tokens: int   = 0     # 0 = all tokens; >0 = limit monitoring eval (fast BPB snapshot)
     remat:           bool  = True  # True = chunk CDF/round-trip to stay in memory (always tests all tokens)
                                    # False = single-shot (fast, may OOM on large files)
     remat_chunk:     int   = 50000 # tokens per remat chunk (ignored when remat=False)
     save_ckpt:       bool  = True  # save full compressed bundle at each checkpoint; False = log only
-    dataset:         str   = "datasets/surat_al-fatihah.txt"
+    # dataset:         str   = "datasets/surat_al-fatihah.txt"
     # dataset:       str   = "datasets/juz1.txt"
-    # dataset:       str   = "datasets/quran-uthmani.txt"
+    dataset:       str   = "datasets/quran-uthmani.txt"
 
 _PRESETS = {
     "byte":         dict(input_bits=8, output_bits=8, output_heads=1, vocab_size=256, pad_token=0),
@@ -917,7 +917,7 @@ def training_loss(logits, targets, margin=1.0, ce_weight=0.05):
 # ============================================================================
 
 def _quantize_cdf(logits_1d):
-    """[V] float32 → [V+1] uint32 cumulative freqs, sum = 1<<RC_PREC.
+    """[V] float32 → [V+1] int32 cumulative freqs, sum = 1<<RC_PREC.
     Min freq = 1 (no zero-prob symbol).  Deterministic; safe under jax.vmap.
 
     Deficit is absorbed into the largest-freq entry only (not element-wise
@@ -928,21 +928,21 @@ def _quantize_cdf(logits_1d):
     freqs = jnp.maximum(jnp.int32(1), jnp.round(probs * M).astype(jnp.int32))
     # absorb rounding error into the largest entry only — keeps sum == M
     deficit  = M - freqs.sum()
-    max_idx  = jnp.argmax(freqs).astype(jnp.int32)   # int32: avoid scatter int64 warning
+    max_idx  = jnp.argmax(freqs).astype(jnp.int32)
     adjusted = jnp.maximum(jnp.int32(1), freqs[max_idx] + deficit)
     freqs    = freqs.at[max_idx].set(adjusted)
-    cumfreqs = jnp.zeros(logits_1d.shape[0] + 1, jnp.uint32)
-    cumfreqs = cumfreqs.at[1:].set(jnp.cumsum(freqs).astype(jnp.uint32))
+    cumfreqs = jnp.zeros(logits_1d.shape[0] + 1, jnp.int32)
+    cumfreqs = cumfreqs.at[1:].set(jnp.cumsum(freqs))
     # Hard-force last entry = M regardless of any rounding residual (defensive)
-    cumfreqs = cumfreqs.at[-1].set(jnp.uint32(1 << RC_PREC))
-    return cumfreqs   # [V+1], cumfreqs[-1] == M exactly
+    cumfreqs = cumfreqs.at[-1].set(M)
+    return cumfreqs   # [V+1] int32, cumfreqs[-1] == M exactly
 
 
 def _cdf_ok(cumfreqs):
     """Layer-2 health check: returns True iff cumfreqs[-1] == M and all diffs > 0.
     JIT-compatible; use under jax.vmap for per-position checks.
     """
-    M = jnp.uint32(1 << RC_PREC)
+    M = jnp.int32(1 << RC_PREC)
     sum_ok  = cumfreqs[-1] == M
     mono_ok = jnp.all(cumfreqs[1:] > cumfreqs[:-1])   # strictly increasing
     return sum_ok & mono_ok
@@ -1210,17 +1210,22 @@ def collect_probs(base_xlstm, params, config, all_inputs, all_targets):
         if processed >= max_tok:
             break
         this_size = min(chunk_size, max_tok - processed)
-        toks = jnp.array(all_inputs[ci, :this_size], jnp.int32)
-        chunk_logits, states = _collect_chunk_jit(
-            base_xlstm, params, toks, states,
-            this_size, config.num_heads, config.block_map,
-            stride_map, oh, ob)                             # [this_size, V]
-        logits_list.append(np.array(chunk_logits, np.float32))
-        tgts_list.append(np.array(all_targets[ci, :this_size, 0], np.int32))
-        processed += this_size
-        pbar.update(this_size)
+        for pos in range(this_size):
+            tok = jnp.array([int(all_inputs[ci, pos])], jnp.int32)
+            # size=1: same static arg as decompressor → identical XLA → bit-exact CDFs.
+            # Different static chunk_size values compile to different XLA programs with
+            # different floating-point behavior even for the same inputs.
+            lf, states = _collect_chunk_jit(
+                base_xlstm, params, tok, states,
+                1, config.num_heads, config.block_map, stride_map, oh, ob)
+            logits_list.append(np.array(lf[0], np.float32))
+            tgts_list.append(int(all_targets[ci, pos, 0]))
+            processed += 1
+            pbar.update(1)
+            if processed >= max_tok:
+                break
     pbar.close()
-    return np.concatenate(logits_list), np.concatenate(tgts_list)
+    return np.stack(logits_list), np.array(tgts_list, np.int32)
 
 
 def eval_compression(base_xlstm, params, config, all_inputs, all_targets,
@@ -1273,22 +1278,26 @@ def eval_compression(base_xlstm, params, config, all_inputs, all_targets,
     n_wrong  = int(wrong.sum())
     acc      = (T_v - n_wrong) / max(T_v, 1)
 
-    # ── quantize CDFs (vmapped, JIT-compiled) ────────────────────────────────
-    # Process in batches of CDF_BATCH to avoid OOM on large T_v (1.4 GB for 1.36M tokens)
-    CDF_BATCH = 50_000
+    # ── quantize CDFs — jit(_quantize_cdf) per token, NO vmap ────────────────
+    # vmap over different batch sizes compiles to different XLA programs with
+    # different softmax rounding.  The decompressor calls jit(_quantize_cdf)
+    # one token at a time, so we must use the same compiled function here.
+    _qcdf_jit = jax.jit(_quantize_cdf)
+    _cdf_ok_jit = jax.jit(_cdf_ok)
     cumfreqs_list = []
     cdf_ok_flags  = []
-    for i in range(0, T_v, CDF_BATCH):
-        batch    = jnp.array(vlog[i:i + CDF_BATCH])
-        batch_cf = jax.vmap(_quantize_cdf)(batch)
-        # Layer 2a: CDF validity check per position
-        batch_ok = jax.vmap(_cdf_ok)(batch_cf)
-        cumfreqs_list.append(np.array(batch_cf, dtype=np.uint32))
-        cdf_ok_flags.append(np.array(batch_ok, dtype=bool))
-    cumfreqs_np = np.concatenate(cumfreqs_list, axis=0)   # [T_v, V+1] uint32, on CPU
-    cumfreqs    = jnp.array(cumfreqs_np)                  # back to JAX for rc_encode
-    cdf_all_ok  = bool(np.all(np.concatenate(cdf_ok_flags)))
-    n_bad_cdf   = int(np.sum(~np.concatenate(cdf_ok_flags)))
+    pbar_cdf = tqdm(total=T_v, desc="quantize CDFs", unit="tok",
+                    leave=False, file=sys.stderr)
+    for i in range(T_v):
+        cf  = _qcdf_jit(jnp.array(vlog[i]))
+        cumfreqs_list.append(np.array(cf, np.int32))
+        cdf_ok_flags.append(bool(_cdf_ok_jit(cf)))
+        pbar_cdf.update(1)
+    pbar_cdf.close()
+    cumfreqs_np = np.stack(cumfreqs_list, axis=0)   # [T_v, V+1] int32, on CPU
+    cumfreqs    = jnp.array(cumfreqs_np)             # back to JAX for rc_encode
+    cdf_all_ok  = all(cdf_ok_flags)
+    n_bad_cdf   = sum(1 for x in cdf_ok_flags if not x)
     if not cdf_all_ok:
         print(f'  [WARN] {n_bad_cdf}/{T_v} CDF positions invalid (sum≠M or non-monotone)')
 
