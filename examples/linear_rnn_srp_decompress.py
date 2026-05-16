@@ -94,59 +94,46 @@ def load_bundle(ckpt_dir):
 # Pure-Python range-coder decoder  (no JAX; model forward pass is JIT'd)
 # ============================================================================
 
-_M32 = 0xFFFFFFFF
+_M32  = 0xFFFFFFFF
 _RC_M = 1 << RC_PREC
+_kTop = _RC_M * 256   # flush threshold (LZMA-style: 1<<24)
 
 
 def _rc_init(buf):
-    """Read first 4 bytes into the range-coder state."""
-    x = 0
+    """Read first 4 bytes into the (low_val, rng) range-coder state."""
+    lv = 0
     for i in range(4):
-        x = ((x << 8) | int(buf[i])) & _M32
-    return 0, _M32, x, 4   # low, high, x, pos
+        lv = ((lv << 8) | int(buf[i])) & _M32
+    return lv, _RC_M * _RC_M - 1, 4   # low_val, rng, pos
 
 
-def _rc_decode_sym(low, high, x, pos, buf, cumfreqs):
-    """Decode one symbol; return (sym, new_low, new_high, new_x, new_pos).
+def _rc_decode_sym(lv, rng, pos, buf, cumfreqs):
+    """Decode one symbol using the (low_val, rng) range coder.
 
-    Layer-1 defensive checks (Python assertions, active in debug mode):
-      x_range  — x must be in [low, high]; violation means RC state is corrupt
-      slot_oor — slot must be < M; violation means arithmetic overflow
-    These fire before the symbol is returned so the caller gets a clear error
-    rather than a silent wrong decode.
+    Invariant: rng ∈ [M, M²).  rng_step = rng // M ≥ 1 always, so no
+    interval collapse.  Returns (sym, new_lv, new_rng, new_pos).
     """
-    # x ∈ [low, high] invariant — catches RC state corruption / arithmetic overflow
-    if low > x or x > high:
-        raise RuntimeError(
-            f"RC state corrupt at buf_pos={pos}: "
-            f"x={x:#010x} not in [{low:#010x}, {high:#010x}]. "
-            "Likely cause: CDF mismatch between encoder and decoder paths.")
+    rng_step   = rng >> RC_PREC               # rng // M, ≥ 1
 
-    rng  = high - low + 1
-    slot = ((x - low + 1) * _RC_M - 1) // rng
-
-    if slot >= _RC_M:
-        raise RuntimeError(
-            f"RC slot overflow at buf_pos={pos}: slot={slot} >= M={_RC_M}. "
-            "Arithmetic overflow in range-coder state.")
-
-    sym  = int(np.searchsorted(cumfreqs[:-1], slot, side='right')) - 1
-    sym  = max(0, min(sym, len(cumfreqs) - 2))
+    # Search on thresholds = rng_step * cf[i] — avoids division imprecision.
+    # Cast to int64 BEFORE multiply — cumfreqs is int32, product overflows int32.
+    thresholds = np.int64(rng_step) * cumfreqs[:-1].astype(np.int64)
+    sym = int(np.searchsorted(thresholds, np.int64(lv), side='right')) - 1
+    sym = max(0, min(sym, len(cumfreqs) - 2))
 
     cum_lo = int(cumfreqs[sym])
-    cum_hi = int(cumfreqs[sym + 1])
-    high   = (low + rng * cum_hi // _RC_M - 1) & _M32
-    low    = (low + rng * cum_lo // _RC_M)      & _M32
+    freq   = int(cumfreqs[sym + 1]) - cum_lo
 
-    # refill agreed bytes
-    while (low >> 24) == (high >> 24):
-        low   = (low  << 8) & _M32
-        high  = ((high << 8) | 0xFF) & _M32
-        byte  = int(buf[pos]) if pos < len(buf) else 0
-        x     = ((x << 8) | byte) & _M32
-        pos  += 1
+    lv    = (lv - rng_step * cum_lo) & _M32
+    rng   = rng_step * freq
 
-    return sym, low, high, x, pos
+    while rng < _kTop:
+        rng <<= 8
+        byte = int(buf[pos]) if pos < len(buf) else 0
+        lv   = ((lv << 8) | byte) & _M32
+        pos += 1
+
+    return sym, lv, rng, pos
 
 
 # ============================================================================
@@ -182,13 +169,9 @@ def decompress(ckpt_dir, output_path, verify_path=None):
     chunk_size = config.segment_size * (8 // config.input_bits)
 
     # ── init range coder + model state ───────────────────────────────────────
-    rc_low, rc_high, rc_x, rc_pos = _rc_init(rc_raw)
+    rc_lv, rc_rng, rc_pos = _rc_init(rc_raw)  # (low_val, rng, pos)
     model_states = init_step_states(config, batch_size=1)
 
-    # ── AR decode loop
-    # Uses _collect_chunk_jit(size=1) — same scan body and same weight-hoisting
-    # as the encoder's collect_probs, guaranteeing bit-exact logits.
-    # CDFs computed via jax.vmap(_quantize_cdf) matching the encoder's batch path.
     decoded   = [seed_token]
     cur_toks  = [seed_token]
 
@@ -200,11 +183,10 @@ def decompress(ckpt_dir, output_path, verify_path=None):
         chunk_logits, model_states = _collect_chunk_jit(
             base_xlstm, params, tok_in, model_states,
             1, config.num_heads, config.block_map, stride_map, oh, ob)
-        # chunk_logits: [1, V] — match encoder's vmap CDF path exactly
         cumfreqs = np.array(_quantize_cdf_jit(chunk_logits[0]), dtype=np.int32)
 
-        sym, rc_low, rc_high, rc_x, rc_pos = _rc_decode_sym(
-            rc_low, rc_high, rc_x, rc_pos, rc_raw, cumfreqs)
+        sym, rc_lv, rc_rng, rc_pos = _rc_decode_sym(
+            rc_lv, rc_rng, rc_pos, rc_raw, cumfreqs)
 
         decoded.append(sym)
         cur_toks.append(sym)
