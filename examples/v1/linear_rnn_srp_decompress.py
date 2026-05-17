@@ -44,7 +44,6 @@ from linear_rnn_srp import (
     init_xlstm_params,
     init_step_states, _collect_chunk_jit,
     bytes_to_tokens, tokens_to_bytes,
-    rc_encode_c, rc_decode_c,
 )
 
 _quantize_cdf_jit = jax.jit(_quantize_cdf)
@@ -125,7 +124,7 @@ def decompress(ckpt_dir, output_path, verify_path=None):
     # ── init canonical (low, high) 64-bit range coder ────────────────────────
     # Matches rc_codec.c exactly: 64-bit state, emit/refill when top bytes agree.
     rc_low  = 0
-    rc_high = _FULL64 - 1   # range = UINT64_MAX, avoids 2^64 overflow
+    rc_high = _FULL64
     rc_code = 0
     rc_pos  = 0
     for _ in range(8):

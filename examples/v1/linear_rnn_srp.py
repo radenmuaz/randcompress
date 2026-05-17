@@ -937,421 +937,111 @@ def _cdf_ok(cumfreqs):
 
 
 # ============================================================================
-# Pure JAX range coder — 64-bit (low, high) canonical coder.
-#
-# scale(range, f) = range * f // M  without u128:
-#   split range = rhi*2^32 + rlo, then
-#   range*f//2^16 = (rhi*f)<<16 + (rlo*f)>>16
-#   All intermediate products fit in uint64 (max 2^48, shifts within 2^64).
-#
-# Init: high = UINT64_MAX-1 so initial range = UINT64_MAX fits in uint64.
-#
-# Guards:
-#   Overflow  — buf write gated on pos < max_buf; prevents silent JAX OOB clamp.
-#   Underflow — not needed for 64-bit + RC_PREC=16: after normalization
-#               range >= 2^56, after one narrowing range >= 2^40, so range
-#               never collapses within the 8-step unrolled normalization loop.
-#               If lower precision is needed in the future, add byte-E3 carry-save
-#               (pending counter + complement flush on agree) to both encoder and
-#               decoder — both must use identical carry-save logic.
-#
-# Encoder: lax.scan over T symbols, unrolled 8-step normalization loop.
-# Decoder: matching lax.scan with same normalization.
+# rc_codec.c ctypes bindings
+# Build: cc -O2 -shared -fPIC examples/rc_codec.c -o examples/rc_codec.so
+# API (LZMA-style, kTop=2^24, RC_PREC=16):
+#   rc_encode(cdfs, symbols, n_sym, V, out_buf, out_cap) → size_t bytes written
+#   rc_decode(in_buf, in_len, cdfs, n_sym, V, out_syms) → 0 on success
+# CDF layout: cdfs[t*(V+1) .. t*(V+1)+V] = cumulative freqs for position t.
 # ============================================================================
-
-_U64 = jnp.uint64
-_U32 = jnp.uint32
-_U8  = jnp.uint8
-_UINT64_MAX = _U64(0xFFFFFFFFFFFFFFFF)
-_RC_MAX_BUF_PER_SYM = 3   # worst case: 2 bytes/sym + 1 headroom
-
-
-def _rc_scale(range_u64, f):
-    """range * f // M in pure uint64.  Inlined into scan bodies — not jitted alone."""
-    rhi = (range_u64 >> _U64(32)).astype(_U64)
-    rlo = (range_u64 & _U64(0xFFFFFFFF)).astype(_U64)
-    f64 = f.astype(_U64)
-    return (rhi * f64 << _U64(16)) + (rlo * f64 >> _U64(16))
-
-
-@functools.partial(jax.jit, static_argnames=["T", "V"])
-def rc_encode_jax(symbols: jnp.ndarray, all_cumfreqs: jnp.ndarray,
-                  T: int, V: int) -> tuple:
-    """Encode T symbols with per-position CDFs.
-
-    symbols:       [T] int32
-    all_cumfreqs:  [T, V+1] int32
-    Returns: (buf [T*_RC_MAX_BUF_PER_SYM+8] uint8, n_bytes int32)
-    """
-    max_buf = T * _RC_MAX_BUF_PER_SYM + 8
-
-    def _flush_once(carry):
-        low, high, buf, pos = carry
-        agreed    = (low >> _U64(56)) == (high >> _U64(56))
-        byte      = (low >> _U64(56)).astype(_U8)
-        in_bounds = pos < jnp.int32(max_buf)
-        do_write  = agreed & in_bounds
-        buf  = jax.lax.cond(do_write, lambda b: b.at[pos].set(byte), lambda b: b, buf)
-        pos  = jax.lax.cond(agreed,   lambda p: p + jnp.int32(1),    lambda p: p, pos)
-        low  = jax.lax.cond(agreed,
-                            lambda l: (l << _U64(8)).astype(_U64), lambda l: l, low)
-        high = jax.lax.cond(agreed,
-                            lambda h: ((h << _U64(8)) | _U64(0xFF)).astype(_U64),
-                            lambda h: h, high)
-        return low, high, buf, pos
-
-    def encode_step(carry, inputs):
-        low, high, buf, pos = carry
-        sym, cf = inputs
-        sym64  = sym.astype(_U64)
-        cum_lo = cf[sym64].astype(_U64)
-        cum_hi = cf[sym64 + _U64(1)].astype(_U64)
-        range_ = (high - low + _U64(1)).astype(_U64)
-        high   = (low + _rc_scale(range_, cum_hi) - _U64(1)).astype(_U64)
-        low    = (low + _rc_scale(range_, cum_lo)).astype(_U64)
-        s = (low, high, buf, pos)
-        for _ in range(8):
-            s = _flush_once(s)
-        return s, None
-
-    buf  = jnp.zeros(max_buf, _U8)
-    init = (_U64(0), _UINT64_MAX - _U64(1), buf, jnp.int32(0))
-    (low, _high, buf, pos), _ = jax.lax.scan(
-        encode_step, init,
-        (symbols.astype(jnp.int32), all_cumfreqs.astype(jnp.int32)))
-
-    # flush 8 tail bytes (overflow-guarded)
-    for _ in range(8):
-        in_bounds = pos < jnp.int32(max_buf)
-        buf  = jax.lax.cond(in_bounds,
-                            lambda b: b.at[pos].set((low >> _U64(56)).astype(_U8)),
-                            lambda b: b, buf)
-        pos  = jax.lax.cond(in_bounds, lambda p: p + jnp.int32(1), lambda p: p, pos)
-        low  = (low << _U64(8)).astype(_U64)
-
-    return buf, pos
-
-
-@functools.partial(jax.jit, static_argnames=["T", "V"])
-def rc_decode_jax(buf: jnp.ndarray, all_cumfreqs: jnp.ndarray,
-                  T: int, V: int) -> jnp.ndarray:
-    """Decode T symbols from byte buffer.
-
-    buf:           [T*_RC_MAX_BUF_PER_SYM+8] uint8  (zero-padded if shorter)
-    all_cumfreqs:  [T, V+1] int32
-    Returns: [T] int32 decoded symbols
-    """
-    max_buf = T * _RC_MAX_BUF_PER_SYM + 8
-
-    code = _U64(0)
-    for i in range(8):
-        code = (code << _U64(8)) | buf[i].astype(_U64)
-
-    def _refill_once(state):
-        low, high, code_, pos = state
-        agreed    = (low >> _U64(56)) == (high >> _U64(56))
-        in_bounds = pos < jnp.int32(max_buf)
-        byte      = jax.lax.cond(in_bounds,
-                                  lambda p: buf[p].astype(_U64),
-                                  lambda p: _U64(0), pos)
-        low   = jax.lax.cond(agreed,
-                              lambda l: (l << _U64(8)).astype(_U64), lambda l: l, low)
-        high  = jax.lax.cond(agreed,
-                              lambda h: ((h << _U64(8)) | _U64(0xFF)).astype(_U64),
-                              lambda h: h, high)
-        code_ = jax.lax.cond(agreed,
-                              lambda c: ((c << _U64(8)) | byte).astype(_U64),
-                              lambda c: c, code_)
-        pos   = jax.lax.cond(agreed & in_bounds,
-                              lambda p: p + jnp.int32(1), lambda p: p, pos)
-        return low, high, code_, pos
-
-    def decode_step(carry, cf):
-        low, high, code_, pos = carry
-        range_ = (high - low + _U64(1)).astype(_U64)
-        cf64   = cf.astype(_U64)
-
-        def bsearch_body(state):
-            lo, hi = state
-            mid      = (lo + hi + _U64(1)) >> _U64(1)
-            boundary = low + _rc_scale(range_, cf64[mid])
-            lo = jnp.where(boundary <= code_, mid, lo)
-            hi = jnp.where(boundary <= code_, hi, mid - _U64(1))
-            return lo, hi
-
-        sym, _ = jax.lax.while_loop(
-            lambda s: s[0] < s[1],
-            bsearch_body,
-            (_U64(0), _U64(V - 1)))
-
-        cum_lo = cf64[sym]
-        cum_hi = cf64[sym + _U64(1)]
-        high   = (low + _rc_scale(range_, cum_hi) - _U64(1)).astype(_U64)
-        low    = (low + _rc_scale(range_, cum_lo)).astype(_U64)
-
-        s = (low, high, code_, pos)
-        for _ in range(8):
-            s = _refill_once(s)
-
-        return s, sym.astype(jnp.int32)
-
-    init = (_U64(0), _UINT64_MAX - _U64(1), code, jnp.int32(8))
-    _, syms = jax.lax.scan(decode_step, init, all_cumfreqs.astype(jnp.int32))
-    return syms
-
-
-# ============================================================================
-# 32-bit and 16-bit canonical (low, high) range coders — pure Python/numpy.
-#
-# Scheme: same top-byte-agree normalization as 64-bit JAX coder.
-# rng = high - low + 1 computed in wider type to avoid overflow.
-# scale(rng, f) = rng * f // M, intermediates in wider type.
-#
-#   uint32: state=uint32, scale via uint64, RC_PREC=16, M=65536
-#   uint16: state=uint16, scale via uint32, RC_PREC=8,  M=256
-#           (M=256 with V=256 → flat distribution; use for small alphabets)
-# ============================================================================
-
-def _rc_requantize(cumfreqs_np, M_out):
-    """Re-quantize CDFs from any precision to M_out using largest-remainder."""
-    T, Vp1 = cumfreqs_np.shape; V = Vp1 - 1
-    out = np.zeros((T, Vp1), np.int32)
-    for i in range(T):
-        freqs = np.diff(cumfreqs_np[i]).astype(np.float64)
-        freqs = np.maximum(freqs, 0.0); freqs /= freqs.sum()
-        f     = freqs * M_out
-        ff    = np.floor(f).astype(np.int32)
-        rem   = M_out - int(ff.sum())
-        ff[np.argsort(f - ff)[::-1][:rem]] += 1
-        for j in range(V):
-            if ff[j] == 0:
-                ff[j] = 1; ff[int(ff.argmax())] -= 1
-        out[i, 1:] = np.cumsum(ff); out[i, -1] = M_out
-    return out
-
-
-def _rc_encode_np(symbols_np, cumfreqs_np, BITS, RC_PREC, np_state_t, np_scale_t):
-    """Canonical (low,high) encoder for any bit width."""
-    T, Vp1   = cumfreqs_np.shape
-    M        = 1 << RC_PREC
-    if int(cumfreqs_np[0, -1]) != M:
-        cumfreqs_np = _rc_requantize(cumfreqs_np, M)
-    MASK_PY  = (1 << BITS) - 1
-    TOP_SH   = BITS - 8
-    tail     = BITS // 8
-    max_buf  = T * (BITS // 4) + tail * 2
-
-    def scale(rng, f):
-        if np_scale_t is None:       # 64-bit: split formula
-            r = np.uint64(rng); g = np.uint64(f)
-            return np.uint64(
-                (r >> np.uint64(32)) * g << np.uint64(16)
-              + (r & np.uint64(0xFFFFFFFF)) * g >> np.uint64(16))
-        return np_state_t(int(np_scale_t(rng) * np_scale_t(f)) >> RC_PREC)
-
-    low  = np_state_t(0)
-    high = np_state_t(MASK_PY - 1)
-    buf  = bytearray()
-    ONE  = np_state_t(1)
-
-    for t in range(T):
-        sym    = int(symbols_np[t])
-        cf     = cumfreqs_np[t]
-        rng    = int(high) - int(low) + 1
-        new_hi = np_state_t(int(low) + int(scale(rng, int(cf[sym+1]))) - 1)
-        new_lo = np_state_t(int(low) + int(scale(rng, int(cf[sym]))))
-        if int(new_hi) < int(new_lo):
-            new_hi = new_lo          # collapse guard
-        high, low = new_hi, new_lo
-        for _ in range(tail):
-            lo_top = (int(low)  >> TOP_SH) & 0xFF
-            hi_top = (int(high) >> TOP_SH) & 0xFF
-            if lo_top == hi_top:
-                buf.append(lo_top)
-                low  = np_state_t((int(low)  << 8) & MASK_PY)
-                high = np_state_t(((int(high) << 8) | 0xFF) & MASK_PY)
-            else:
-                break
-
-    for _ in range(tail):
-        buf.append((int(low) >> TOP_SH) & 0xFF)
-        low = np_state_t((int(low) << 8) & MASK_PY)
-    return np.array(buf, dtype=np.uint8)
-
-
-def _rc_decode_np(in_bytes, cumfreqs_np, BITS, RC_PREC, np_state_t, np_scale_t):
-    """Canonical (low,high) decoder for any bit width."""
-    T, Vp1  = cumfreqs_np.shape
-    V       = Vp1 - 1
-    M       = 1 << RC_PREC
-    if int(cumfreqs_np[0, -1]) != M:
-        cumfreqs_np = _rc_requantize(cumfreqs_np, M)
-    MASK_PY = (1 << BITS) - 1
-    TOP_SH  = BITS - 8
-    tail    = BITS // 8
-    data    = [int(b) for b in in_bytes] + [0] * (tail * 4)
-
-    def scale(rng, f):
-        if np_scale_t is None:
-            r = np.uint64(rng); g = np.uint64(f)
-            return np.uint64(
-                (r >> np.uint64(32)) * g << np.uint64(16)
-              + (r & np.uint64(0xFFFFFFFF)) * g >> np.uint64(16))
-        return np_state_t(int(np_scale_t(rng) * np_scale_t(f)) >> RC_PREC)
-
-    code = 0
-    for i in range(tail):
-        code = ((code << 8) | data[i]) & MASK_PY
-    code  = np_state_t(code)
-    low   = np_state_t(0)
-    high  = np_state_t(MASK_PY - 1)
-    pos   = tail
-    out   = np.empty(T, dtype=np.int32)
-
-    for t in range(T):
-        cf   = cumfreqs_np[t]
-        rng  = int(high) - int(low) + 1
-        lo_s, hi_s = 0, V - 1
-        while lo_s < hi_s:
-            mid = (lo_s + hi_s + 1) // 2
-            if int(low) + int(scale(rng, int(cf[mid]))) <= int(code):
-                lo_s = mid
-            else:
-                hi_s = mid - 1
-        sym    = lo_s
-        new_hi = np_state_t(int(low) + int(scale(rng, int(cf[sym+1]))) - 1)
-        new_lo = np_state_t(int(low) + int(scale(rng, int(cf[sym]))))
-        if int(new_hi) < int(new_lo):
-            new_hi = new_lo
-        high, low = new_hi, new_lo
-        out[t] = sym
-        for _ in range(tail):
-            lo_top = (int(low)  >> TOP_SH) & 0xFF
-            hi_top = (int(high) >> TOP_SH) & 0xFF
-            if lo_top == hi_top:
-                low  = np_state_t((int(low)  << 8) & MASK_PY)
-                high = np_state_t(((int(high) << 8) | 0xFF) & MASK_PY)
-                code = np_state_t(((int(code) << 8) | data[pos]) & MASK_PY)
-                pos += 1
-            else:
-                break
-    return out
-
-
-# ── C codec via ctypes ────────────────────────────────────────────────────────
-# rc_codec.c: canonical (low,high) 64-bit with u128; same stream as canonical-uint64.
-# Auto-builds rc_codec.so if missing or .c is newer.
 
 import ctypes as _ct
+import ctypes.util as _ctu
 
-def _load_rc_lib_ctypes():
+def _load_rc_lib():
     _here = os.path.dirname(os.path.abspath(__file__))
     _so   = os.path.join(_here, "rc_codec.so")
     _src  = os.path.join(_here, "rc_codec.c")
-    if not os.path.exists(_so) or os.path.getmtime(_src) > os.path.getmtime(_so):
+    # rebuild if .so missing or older than .c
+    if (not os.path.exists(_so) or
+            os.path.getmtime(_src) > os.path.getmtime(_so)):
         import subprocess
         subprocess.check_call(["cc", "-O2", "-shared", "-fPIC", _src, "-o", _so])
     lib = _ct.CDLL(_so)
     lib.rc_encode.restype  = _ct.c_size_t
-    lib.rc_encode.argtypes = [_ct.POINTER(_ct.c_int32), _ct.POINTER(_ct.c_int32),
-                               _ct.c_size_t, _ct.c_int32,
-                               _ct.POINTER(_ct.c_uint8), _ct.c_size_t]
+    lib.rc_encode.argtypes = [
+        _ct.POINTER(_ct.c_int32),   # cdfs  [n_sym * (V+1)]
+        _ct.POINTER(_ct.c_int32),   # symbols [n_sym]
+        _ct.c_size_t,               # n_sym
+        _ct.c_int32,                # V
+        _ct.POINTER(_ct.c_uint8),   # out_buf
+        _ct.c_size_t,               # out_cap
+    ]
     lib.rc_decode.restype  = _ct.c_int
-    lib.rc_decode.argtypes = [_ct.POINTER(_ct.c_uint8), _ct.c_size_t,
-                               _ct.POINTER(_ct.c_int32), _ct.c_size_t, _ct.c_int32,
-                               _ct.POINTER(_ct.c_int32)]
+    lib.rc_decode.argtypes = [
+        _ct.POINTER(_ct.c_uint8),   # in_buf
+        _ct.c_size_t,               # in_len
+        _ct.POINTER(_ct.c_int32),   # cdfs  [n_sym * (V+1)]
+        _ct.c_size_t,               # n_sym
+        _ct.c_int32,                # V
+        _ct.POINTER(_ct.c_int32),   # out_syms [n_sym]
+    ]
     return lib
 
-_RC_CLIB = None
+_RC_LIB = None
 
-def _get_rc_clib():
-    global _RC_CLIB
-    if _RC_CLIB is None:
-        _RC_CLIB = _load_rc_lib_ctypes()
-    return _RC_CLIB
+def _get_rc_lib():
+    global _RC_LIB
+    if _RC_LIB is None:
+        _RC_LIB = _load_rc_lib()
+    return _RC_LIB
 
 
-def _rc_encode_c(symbols_np, cumfreqs_np):
-    lib = _get_rc_clib()
-    T, Vp1 = cumfreqs_np.shape; V = Vp1 - 1
-    out_cap = T * 3 + 16; out_buf = np.zeros(out_cap, np.uint8)
-    cdfs_c = cumfreqs_np.astype(np.int32).ravel(); syms_c = symbols_np.astype(np.int32)
+def rc_encode_c(symbols_np: np.ndarray, cumfreqs_np: np.ndarray) -> np.ndarray:
+    """Encode symbols using rc_codec.c via ctypes.
+
+    symbols_np:   [T] int32
+    cumfreqs_np:  [T, V+1] int32  (quantized CDFs, each row sums to 1<<RC_PREC)
+    Returns:      [n_bytes] uint8 byte stream.
+    """
+    lib    = _get_rc_lib()
+    T, Vp1 = cumfreqs_np.shape
+    V      = Vp1 - 1
+    out_cap = T * 2 + 32   # 64-bit coder: ~1B/sym worst case + 8 tail bytes
+    out_buf = np.zeros(out_cap, dtype=np.uint8)
+
+    cdfs_c  = cumfreqs_np.astype(np.int32).ravel()
+    syms_c  = symbols_np.astype(np.int32)
+
     n = lib.rc_encode(
         cdfs_c.ctypes.data_as(_ct.POINTER(_ct.c_int32)),
         syms_c.ctypes.data_as(_ct.POINTER(_ct.c_int32)),
-        _ct.c_size_t(T), _ct.c_int32(V),
+        _ct.c_size_t(T),
+        _ct.c_int32(V),
         out_buf.ctypes.data_as(_ct.POINTER(_ct.c_uint8)),
-        _ct.c_size_t(out_cap))
+        _ct.c_size_t(out_cap),
+    )
     if n == _ct.c_size_t(-1).value:
-        raise RuntimeError("rc_encode (C): output buffer overflow")
+        raise RuntimeError("rc_encode: output buffer overflow")
     return out_buf[:n]
 
 
-def _rc_decode_c(in_bytes, cumfreqs_np):
-    lib = _get_rc_clib()
-    T, Vp1 = cumfreqs_np.shape; V = Vp1 - 1
-    out_syms = np.zeros(T, np.int32)
-    in_buf   = in_bytes.astype(np.uint8)
+def rc_decode_c(in_bytes: np.ndarray, cumfreqs_np: np.ndarray) -> np.ndarray:
+    """Decode symbols using rc_codec.c via ctypes.
+
+    in_bytes:     [n_bytes] uint8 byte stream
+    cumfreqs_np:  [T, V+1] int32  (same CDFs used during encode)
+    Returns:      [T] int32 decoded symbols.
+    """
+    lib    = _get_rc_lib()
+    T, Vp1 = cumfreqs_np.shape
+    V      = Vp1 - 1
+    out_syms = np.zeros(T, dtype=np.int32)
+
+    in_buf_c = in_bytes.astype(np.uint8)
     cdfs_c   = cumfreqs_np.astype(np.int32).ravel()
+
     ret = lib.rc_decode(
-        in_buf.ctypes.data_as(_ct.POINTER(_ct.c_uint8)),
-        _ct.c_size_t(len(in_buf)),
+        in_buf_c.ctypes.data_as(_ct.POINTER(_ct.c_uint8)),
+        _ct.c_size_t(len(in_buf_c)),
         cdfs_c.ctypes.data_as(_ct.POINTER(_ct.c_int32)),
-        _ct.c_size_t(T), _ct.c_int32(V),
-        out_syms.ctypes.data_as(_ct.POINTER(_ct.c_int32)))
+        _ct.c_size_t(T),
+        _ct.c_int32(V),
+        out_syms.ctypes.data_as(_ct.POINTER(_ct.c_int32)),
+    )
     if ret != 0:
-        raise RuntimeError(f"rc_decode (C): error {ret}")
+        raise RuntimeError(f"rc_decode returned error code {ret}")
     return out_syms
-
-
-# ── Scheme/dtype dispatch ─────────────────────────────────────────────────────
-
-# scheme → (BITS, RC_PREC, np_state_t, np_scale_t)
-# np_scale_t=None means use split formula (64-bit JAX JIT)
-# 'canonical-c' uses rc_codec.c via ctypes (same stream as canonical-uint64)
-_RC_SCHEMES = {
-    'canonical-uint64': (64, 16, np.uint64, None),
-    'canonical-uint32': (32, 16, np.uint32, np.uint64),
-    'canonical-uint16': (16,  8, np.uint16, np.uint32),
-}
-
-
-def rc_encode_c(symbols_np: np.ndarray, cumfreqs_np: np.ndarray,
-                scheme: str = 'canonical-uint64') -> np.ndarray:
-    """Encode symbols → bytes.
-    scheme: canonical-uint64 (JAX JIT) | canonical-c (ctypes C) |
-            canonical-uint32 | canonical-uint16
-    """
-    if scheme == 'canonical-c':
-        return _rc_encode_c(symbols_np, cumfreqs_np)
-    if scheme == 'canonical-uint64':
-        T, Vp1 = cumfreqs_np.shape; V = Vp1 - 1
-        buf, n = rc_encode_jax(jnp.array(symbols_np, jnp.int32),
-                               jnp.array(cumfreqs_np, jnp.int32), T, V)
-        return np.array(buf[:int(n)], dtype=np.uint8)
-    BITS, RC_PREC, np_state_t, np_scale_t = _RC_SCHEMES[scheme]
-    return _rc_encode_np(symbols_np, cumfreqs_np, BITS, RC_PREC, np_state_t, np_scale_t)
-
-
-def rc_decode_c(in_bytes: np.ndarray, cumfreqs_np: np.ndarray,
-                scheme: str = 'canonical-uint64') -> np.ndarray:
-    """Decode bytes → symbols.
-    scheme: canonical-uint64 (JAX JIT) | canonical-c (ctypes C) |
-            canonical-uint32 | canonical-uint16
-    """
-    if scheme == 'canonical-c':
-        return _rc_decode_c(in_bytes, cumfreqs_np)
-    if scheme == 'canonical-uint64':
-        T, Vp1  = cumfreqs_np.shape; V = Vp1 - 1
-        max_buf = T * _RC_MAX_BUF_PER_SYM + 8
-        padded  = np.zeros(max_buf, dtype=np.uint8)
-        n       = min(len(in_bytes), max_buf)
-        padded[:n] = in_bytes.astype(np.uint8)[:n]
-        syms = rc_decode_jax(jnp.array(padded, jnp.uint8),
-                             jnp.array(cumfreqs_np, jnp.int32), T, V)
-        return np.array(syms, dtype=np.int32)
-    BITS, RC_PREC, np_state_t, np_scale_t = _RC_SCHEMES[scheme]
-    return _rc_decode_np(in_bytes, cumfreqs_np, BITS, RC_PREC, np_state_t, np_scale_t)
 
 
 class ByteTokenizer:
@@ -1901,14 +1591,7 @@ def _parse_config():
 def main():
     import json as _json
     _script = os.path.splitext(os.path.basename(__file__))[0]
-    # --log_dir overrides default "log/<script_name>"
-    _argv = sys.argv[1:]
-    if "--log_dir" in _argv:
-        _i = _argv.index("--log_dir")
-        log_dir = _argv[_i + 1]
-        sys.argv = [sys.argv[0]] + _argv[:_i] + _argv[_i+2:]  # remove from argv for _parse_config
-    else:
-        log_dir = os.path.join("log", _script)
+    log_dir = os.path.join("log", _script)
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, "train.log")
     log_file = open(log_path, "w", buffering=1)
