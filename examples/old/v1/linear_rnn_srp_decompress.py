@@ -37,8 +37,8 @@ import os, sys, json, pickle, argparse
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
-import linear_rnn_srp as _src
-from linear_rnn_srp import (
+import examples.old.v1.linear_rnn_srp as _src
+from examples.old.v1.linear_rnn_srp import (
     Config, RC_PREC, DTYPE, POWER_P,
     _quantize_cdf, _parse_stride_map,
     init_xlstm_params,

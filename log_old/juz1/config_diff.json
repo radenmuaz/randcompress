@@ -1,0 +1,6 @@
+{
+  "dataset": {
+    "default": "datasets/quran-uthmani.txt",
+    "value": "datasets/juz1.txt"
+  }
+}
