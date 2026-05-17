@@ -904,6 +904,18 @@ def training_loss(logits, targets, margin=1.0, ce_weight=0.05):
 # Data helpers
 # ============================================================================
 
+# ============================================================================
+# Range coder  (JAX JIT + lax.scan + lax.while_loop, uint64 arithmetic)
+#
+# Encode: lax.scan over tokens forward; each step narrows [low,high] then
+#   flushes agreed top bytes via while_loop → writes to fixed buffer.
+# Decode: lax.scan over positions forward; each step computes slot, binary-
+#   searches CDF for symbol, narrows [low,high], refills from buffer via
+#   while_loop. AR decoding interleaves model forward + decode_step in scan.
+#
+# All ops bit-exact across encode/decode given the same quantized CDFs.
+# ============================================================================
+
 def _quantize_cdf(logits_1d):
     """[V] float32 → [V+1] int32 cumulative freqs, sum = 1<<RC_PREC.
     Min freq = 1 (no zero-prob symbol).  Deterministic; safe under jax.vmap.
@@ -936,112 +948,248 @@ def _cdf_ok(cumfreqs):
     return sum_ok & mono_ok
 
 
-# ============================================================================
-# rc_codec.c ctypes bindings
-# Build: cc -O2 -shared -fPIC examples/rc_codec.c -o examples/rc_codec.so
-# API (LZMA-style, kTop=2^24, RC_PREC=16):
-#   rc_encode(cdfs, symbols, n_sym, V, out_buf, out_cap) → size_t bytes written
-#   rc_decode(in_buf, in_len, cdfs, n_sym, V, out_syms) → 0 on success
-# CDF layout: cdfs[t*(V+1) .. t*(V+1)+V] = cumulative freqs for position t.
-# ============================================================================
-
-import ctypes as _ct
-import ctypes.util as _ctu
-
-def _load_rc_lib():
-    _here = os.path.dirname(os.path.abspath(__file__))
-    _so   = os.path.join(_here, "rc_codec.so")
-    _src  = os.path.join(_here, "rc_codec.c")
-    # rebuild if .so missing or older than .c
-    if (not os.path.exists(_so) or
-            os.path.getmtime(_src) > os.path.getmtime(_so)):
-        import subprocess
-        subprocess.check_call(["cc", "-O2", "-shared", "-fPIC", _src, "-o", _so])
-    lib = _ct.CDLL(_so)
-    lib.rc_encode.restype  = _ct.c_size_t
-    lib.rc_encode.argtypes = [
-        _ct.POINTER(_ct.c_int32),   # cdfs  [n_sym * (V+1)]
-        _ct.POINTER(_ct.c_int32),   # symbols [n_sym]
-        _ct.c_size_t,               # n_sym
-        _ct.c_int32,                # V
-        _ct.POINTER(_ct.c_uint8),   # out_buf
-        _ct.c_size_t,               # out_cap
-    ]
-    lib.rc_decode.restype  = _ct.c_int
-    lib.rc_decode.argtypes = [
-        _ct.POINTER(_ct.c_uint8),   # in_buf
-        _ct.c_size_t,               # in_len
-        _ct.POINTER(_ct.c_int32),   # cdfs  [n_sym * (V+1)]
-        _ct.c_size_t,               # n_sym
-        _ct.c_int32,                # V
-        _ct.POINTER(_ct.c_int32),   # out_syms [n_sym]
-    ]
-    return lib
-
-_RC_LIB = None
-
-def _get_rc_lib():
-    global _RC_LIB
-    if _RC_LIB is None:
-        _RC_LIB = _load_rc_lib()
-    return _RC_LIB
-
-
-def rc_encode_c(symbols_np: np.ndarray, cumfreqs_np: np.ndarray) -> np.ndarray:
-    """Encode symbols using rc_codec.c via ctypes.
-
-    symbols_np:   [T] int32
-    cumfreqs_np:  [T, V+1] int32  (quantized CDFs, each row sums to 1<<RC_PREC)
-    Returns:      [n_bytes] uint8 byte stream.
+@functools.partial(jax.jit, static_argnames=["max_buf"])
+def rc_encode(symbols, all_cumfreqs, max_buf):
     """
-    lib    = _get_rc_lib()
-    T, Vp1 = cumfreqs_np.shape
-    V      = Vp1 - 1
-    out_cap = T * 2 + 32   # 64-bit coder: ~1B/sym worst case + 8 tail bytes
-    out_buf = np.zeros(out_cap, dtype=np.uint8)
+    symbols:      [T] int32        — token ids in [0, V)
+    all_cumfreqs: [T, V+1] uint32  — quantized CDF per position
+    max_buf:      static int       — output buffer size (bytes); T*3+64 is safe
+    Returns: (buf [max_buf] uint8, n_bytes int32)
 
-    cdfs_c  = cumfreqs_np.astype(np.int32).ravel()
-    syms_c  = symbols_np.astype(np.int32)
-
-    n = lib.rc_encode(
-        cdfs_c.ctypes.data_as(_ct.POINTER(_ct.c_int32)),
-        syms_c.ctypes.data_as(_ct.POINTER(_ct.c_int32)),
-        _ct.c_size_t(T),
-        _ct.c_int32(V),
-        out_buf.ctypes.data_as(_ct.POINTER(_ct.c_uint8)),
-        _ct.c_size_t(out_cap),
-    )
-    if n == _ct.c_size_t(-1).value:
-        raise RuntimeError("rc_encode: output buffer overflow")
-    return out_buf[:n]
-
-
-def rc_decode_c(in_bytes: np.ndarray, cumfreqs_np: np.ndarray) -> np.ndarray:
-    """Decode symbols using rc_codec.c via ctypes.
-
-    in_bytes:     [n_bytes] uint8 byte stream
-    cumfreqs_np:  [T, V+1] int32  (same CDFs used during encode)
-    Returns:      [T] int32 decoded symbols.
+    Uses int64 for all multiplications to avoid overflow (int64 avoids Metal uint64 sign-extension bug).
+    Agreed top bytes are flushed via while_loop (0–4 iters per symbol).
+    Tail: 4 unconditional bytes written after the scan to finalise the state.
     """
-    lib    = _get_rc_lib()
-    T, Vp1 = cumfreqs_np.shape
-    V      = Vp1 - 1
-    out_syms = np.zeros(T, dtype=np.int32)
+    _U32 = jnp.uint32
+    _U64 = jnp.int64
+    _M   = _U64(1 << RC_PREC)
+    _FF  = _U64(0xFF)
+    _4G  = _U64(0xFFFFFFFF)
 
-    in_buf_c = in_bytes.astype(np.uint8)
-    cdfs_c   = cumfreqs_np.astype(np.int32).ravel()
+    def _flush_body(s):
+        low, high, buf, pos = s
+        byte = (low >> _U32(24)).astype(jnp.uint8)
+        buf  = buf.at[pos].set(byte)
+        low  = _U32((_U64(low)  << _U64(8)) & _4G)
+        high = _U32((_U64(high) << _U64(8) | _FF) & _4G)
+        return low, high, buf, pos + jnp.int32(1)
 
-    ret = lib.rc_decode(
-        in_buf_c.ctypes.data_as(_ct.POINTER(_ct.c_uint8)),
-        _ct.c_size_t(len(in_buf_c)),
-        cdfs_c.ctypes.data_as(_ct.POINTER(_ct.c_int32)),
-        _ct.c_size_t(T),
-        _ct.c_int32(V),
-        out_syms.ctypes.data_as(_ct.POINTER(_ct.c_int32)),
-    )
-    if ret != 0:
-        raise RuntimeError(f"rc_decode returned error code {ret}")
-    return out_syms
+    def _flush_step(s):
+        low, high, buf, pos = s
+        agreed = (_U64(low) >> _U64(24)) == (_U64(high) >> _U64(24))
+        return jax.lax.cond(agreed, _flush_body, lambda x: x, s)
+
+    def encode_step(carry, inputs):
+        low, high, buf, pos = carry
+        sym, cumfreqs = inputs
+        rng    = _U64(high) - _U64(low) + _U64(1)
+        cum_lo = _U64(cumfreqs[sym])
+        cum_hi = _U64(cumfreqs[sym + _U32(1)])
+        high   = _U32(_U64(low) + rng * cum_hi // _M - _U64(1))
+        low    = _U32(_U64(low) + rng * cum_lo // _M)
+        # Unrolled flush: Metal's lax.while_loop can terminate prematurely,
+        # leaving rng < M. 5 iterations cover all cases (rng*256^5 ≥ M always).
+        s = (low, high, buf, pos)
+        s = _flush_step(s); s = _flush_step(s); s = _flush_step(s)
+        s = _flush_step(s); s = _flush_step(s)
+        low, high, buf, pos = s
+        return (low, high, buf, pos), None
+
+    buf  = jnp.zeros(max_buf, jnp.uint8)
+    init = (_U32(0), _U32(0xFFFFFFFF), buf, jnp.int32(0))
+    (low, _high, buf, pos), _ = jax.lax.scan(
+        encode_step, init, (symbols.astype(jnp.uint32), all_cumfreqs))
+
+    # flush 4 tail bytes to finalise
+    for _ in range(4):
+        buf = buf.at[pos].set((low >> _U32(24)).astype(jnp.uint8))
+        pos = pos + jnp.int32(1)
+        low = _U32((_U64(low) << _U64(8)) & _4G)
+
+    return buf, pos
+
+
+@functools.partial(jax.jit, static_argnames=["n_chunk", "max_buf"])
+def rc_encode_chunk(symbols, chunk_cumfreqs, n_chunk, max_buf, carry):
+    """Encode n_chunk symbols from carry=(low,high,buf_offset), append to global buf.
+
+    carry: (low uint32, high uint32, pos int32) — RC state from previous chunk.
+    Returns (partial_buf [max_buf] uint8, n_bytes int32, new_carry).
+    Does NOT flush tail bytes — caller must call rc_encode_flush after last chunk.
+    """
+    _U32 = jnp.uint32; _U64 = jnp.int64
+    _M   = _U64(1 << RC_PREC)
+    _FF  = _U64(0xFF); _4G  = _U64(0xFFFFFFFF)
+
+    def _flush_body(s):
+        low, high, buf, pos = s
+        byte = (low >> _U32(24)).astype(jnp.uint8)
+        buf  = buf.at[pos].set(byte)
+        low  = _U32((_U64(low) << _U64(8)) & _4G)
+        high = _U32((_U64(high) << _U64(8) | _FF) & _4G)
+        return low, high, buf, pos + jnp.int32(1)
+
+    def _flush_step(s):
+        low, high, buf, pos = s
+        agreed = (_U64(low) >> _U64(24)) == (_U64(high) >> _U64(24))
+        return jax.lax.cond(agreed, _flush_body, lambda x: x, s)
+
+    def encode_step(carry, inputs):
+        low, high, buf, pos = carry
+        sym, cumfreqs = inputs
+        rng    = _U64(high) - _U64(low) + _U64(1)
+        cum_lo = _U64(cumfreqs[sym])
+        cum_hi = _U64(cumfreqs[sym + _U32(1)])
+        high   = _U32(_U64(low) + rng * cum_hi // _M - _U64(1))
+        low    = _U32(_U64(low) + rng * cum_lo // _M)
+        s = (low, high, buf, pos)
+        s = _flush_step(s); s = _flush_step(s); s = _flush_step(s)
+        s = _flush_step(s); s = _flush_step(s)
+        low, high, buf, pos = s
+        return (low, high, buf, pos), None
+
+    low, high, pos_in = carry
+    buf  = jnp.zeros(max_buf, jnp.uint8)
+    init = (low, high, buf, jnp.int32(0))
+    (low_out, high_out, buf_out, pos_out), _ = jax.lax.scan(
+        encode_step, init, (symbols.astype(jnp.uint32), chunk_cumfreqs))
+    return buf_out, pos_out, (low_out, high_out, jnp.int32(0))
+
+
+@functools.partial(jax.jit)
+def rc_encode_flush(carry):
+    """Write 4 tail bytes to finalise the RC stream after the last chunk."""
+    _U32 = jnp.uint32; _U64 = jnp.int64; _4G = _U64(0xFFFFFFFF)  # int64 avoids Metal uint64 sign-extension bug
+    low, high, _ = carry
+    buf = jnp.zeros(4, jnp.uint8)
+    for i in range(4):
+        buf = buf.at[i].set((low >> _U32(24)).astype(jnp.uint8))
+        low = _U32((_U64(low) << _U64(8)) & _4G)
+    return buf
+
+
+@functools.partial(jax.jit, static_argnames=["n_tokens"])
+def rc_decode(buf, all_cumfreqs, n_tokens):
+    """
+    buf:           [max_buf] uint8 — encoded stream (from rc_encode)
+    all_cumfreqs:  [n_tokens, V+1] uint32 — same CDFs used during encode
+    n_tokens:      static int
+    Returns: [n_tokens] int32 decoded symbols.
+
+    Initialises x by reading first 4 bytes, then lax.scan forward.
+    Each step: binary-search CDF for symbol, narrow [low,high], refill via while_loop.
+    """
+    _U32 = jnp.uint32
+    _U64 = jnp.int64
+    _M   = _U64(1 << RC_PREC)
+    _FF  = _U64(0xFF)
+    _4G  = _U64(0xFFFFFFFF)
+
+    # read initial 4 bytes into x
+    x = _U32(0)
+    for i in range(4):
+        x = _U32((_U64(x) << _U64(8)) | _U64(buf[i].astype(jnp.uint32)))
+
+    def _refill_body(s):
+        low, high, x, pos = s
+        low  = _U32((_U64(low)  << _U64(8)) & _4G)
+        high = _U32((_U64(high) << _U64(8) | _FF) & _4G)
+        x    = _U32((_U64(x)   << _U64(8) | _U64(buf[pos].astype(jnp.uint32))) & _4G)
+        return low, high, x, pos + jnp.int32(1)
+
+    def _refill_step(s):
+        low, high, x, pos = s
+        agreed = (_U64(low) >> _U64(24)) == (_U64(high) >> _U64(24))
+        return jax.lax.cond(agreed, _refill_body, lambda t: t, s)
+
+    def decode_step(carry, cumfreqs):
+        low, high, x, pos = carry
+        rng  = _U64(high) - _U64(low) + _U64(1)
+        slot = _U32((_U64(x - low + _U32(1)) * _M - _U64(1)) // rng)
+        V    = cumfreqs.shape[0] - 1
+        sym  = jnp.searchsorted(cumfreqs[:V].view(jnp.int32),
+                                  slot.view(jnp.int32), side='right') - 1
+        sym  = jnp.clip(sym, 0, V - 1).astype(jnp.uint32)
+        cum_lo = _U64(cumfreqs[sym])
+        cum_hi = _U64(cumfreqs[sym + _U32(1)])
+        high   = _U32(_U64(low) + rng * cum_hi // _M - _U64(1))
+        low    = _U32(_U64(low) + rng * cum_lo // _M)
+        s = (low, high, x, pos)
+        s = _refill_step(s); s = _refill_step(s); s = _refill_step(s)
+        s = _refill_step(s); s = _refill_step(s)
+        low, high, x, pos = s
+        return (low, high, x, pos), sym.astype(jnp.int32)
+
+    init   = (_U32(0), _U32(0xFFFFFFFF), x, jnp.int32(4))
+    _, syms = jax.lax.scan(decode_step, init, all_cumfreqs)
+    return syms   # [n_tokens] int32
+
+
+def rc_decode_init(buf):
+    """Read first 4 bytes of buf into the RC decode carry state."""
+    _U32 = jnp.uint32; _U64 = jnp.int64
+    x = _U32(0)
+    for i in range(4):
+        x = _U32((_U64(x) << _U64(8)) | _U64(buf[i].astype(jnp.uint32)))
+    return (_U32(0), _U32(0xFFFFFFFF), x, jnp.int32(4))
+
+
+@functools.partial(jax.jit, static_argnames=["n_chunk"])
+def rc_decode_chunk(buf, chunk_cumfreqs, n_chunk, carry):
+    """Decode n_chunk symbols continuing from carry=(low,high,x,pos).
+
+    Returns (syms [n_chunk] int32, new_carry, err_flag: bool).
+
+    err_flag is True if ANY of the following occurred for ANY symbol:
+      x_range  — x not in [low,high] before decoding (RC state corrupt / overflow)
+      slot_oor — slot >= M (arithmetic overflow in slot computation)
+      bracket  — decoded sym's cumfreqs bracket doesn't contain slot
+                 (internal CDF inconsistency; does NOT catch encoder-decoder
+                  CDF mismatch — that requires a SHA-256 end-to-end check)
+    """
+    _U32 = jnp.uint32; _U64 = jnp.int64
+    _M = _U64(1 << RC_PREC); _FF = _U64(0xFF); _4G = _U64(0xFFFFFFFF)
+
+    def _refill_body(s):
+        l, h, x, pos = s
+        l   = _U32((_U64(l) << _U64(8)) & _4G)
+        h   = _U32((_U64(h) << _U64(8) | _FF) & _4G)
+        x   = _U32((_U64(x) << _U64(8) | _U64(buf[pos].astype(jnp.uint32))) & _4G)
+        return l, h, x, pos + jnp.int32(1)
+
+    def _refill_step(s):
+        l, h, x, pos = s
+        agreed = (_U64(l) >> _U64(24)) == (_U64(h) >> _U64(24))
+        return jax.lax.cond(agreed, _refill_body, lambda t: t, s)
+
+    def decode_step(carry, cumfreqs):
+        low, high, x, pos, err = carry
+
+        x_range_err = (_U64(x) < _U64(low)) | (_U64(x) > _U64(high))
+        rng  = _U64(high) - _U64(low) + _U64(1)
+        slot = _U32((_U64(x - low + _U32(1)) * _M - _U64(1)) // rng)
+        slot_oor = _U64(slot) >= _M
+
+        V    = cumfreqs.shape[0] - 1
+        sym  = jnp.searchsorted(cumfreqs[:V].view(jnp.int32),
+                                  slot.view(jnp.int32), side='right') - 1
+        sym  = jnp.clip(sym, 0, V - 1).astype(jnp.uint32)
+        cum_lo = _U64(cumfreqs[sym])
+        cum_hi = _U64(cumfreqs[sym + _U32(1)])
+        bracket_err = (_U64(slot) < cum_lo) | (_U64(slot) >= cum_hi)
+        new_err = err | x_range_err | slot_oor | bracket_err
+
+        high   = _U32(_U64(low) + rng * cum_hi // _M - _U64(1))
+        low    = _U32(_U64(low) + rng * cum_lo // _M)
+        s = (low, high, x, pos)
+        s = _refill_step(s); s = _refill_step(s); s = _refill_step(s)
+        s = _refill_step(s); s = _refill_step(s)
+        low, high, x, pos = s
+        return (low, high, x, pos, new_err), sym.astype(jnp.int32)
+
+    init_carry = (*carry, jnp.bool_(False))
+    (l, h, x, p, err_flag), syms = jax.lax.scan(decode_step, init_carry, chunk_cumfreqs)
+    return syms, (l, h, x, p), err_flag   # [n_chunk] int32, carry, bool
 
 
 class ByteTokenizer:
@@ -1191,14 +1339,20 @@ def eval_compression(base_xlstm, params, config, all_inputs, all_targets,
     n_wrong  = int(wrong.sum())
     acc      = (T_v - n_wrong) / max(T_v, 1)
 
-    # ── quantize all CDFs (JAX JIT, token by token to stay memory-safe) ─────────
-    _qcdf_jit   = jax.jit(_quantize_cdf)
+    # ── quantize CDFs + range-encode in remat_chunk batches ──────────────────
+    # Avoids loading a (T_v × V+1) JAX array all at once (1.4 GB for quran).
+    # Both CDF computation and encoding use the same compiled functions as the
+    # ── Pure-Python range encoder + decoder (avoids XLA while_loop/cond bugs) ─
+    _qcdf_jit  = jax.jit(_quantize_cdf)
     _cdf_ok_jit = jax.jit(_cdf_ok)
+    _M32 = 0xFFFFFFFF
+    _RC_M = 1 << RC_PREC
 
-    cdf_all_ok  = True
-    n_bad_cdf   = 0
+    cdf_all_ok = True
+    n_bad_cdf  = 0
     cumfreqs_np = np.empty((T_v, V + 1), dtype=np.int32)
 
+    # quantize all CDFs first
     pbar_cdf = tqdm(total=T_v, desc="quantize CDFs", unit="tok",
                     leave=False, file=sys.stderr)
     for i in range(T_v):
@@ -1211,11 +1365,31 @@ def eval_compression(base_xlstm, params, config, all_inputs, all_targets,
     if not cdf_all_ok:
         print(f'  [WARN] {n_bad_cdf}/{T_v} CDF positions invalid (sum≠M or non-monotone)')
 
-    # ── range-encode via rc_codec.c (ctypes) ─────────────────────────────────
-    print("  encode (rc_codec.c)...", end=" ", flush=True)
-    rc_np    = rc_encode_c(vtgt, cumfreqs_np)
+    # (low, rng) range coder. kTop = M*256 flush threshold (LZMA-style).
+    # Using kTop instead of M ensures ≥1 flush/refill per symbol, keeping
+    # dec_lv replenished and preventing slot drift in high-entropy streams.
+    _kTop = _RC_M * 256   # = 1 << 24 = 16777216
+    rc_buf = bytearray()
+    rc_low, rc_rng = 0, _RC_M * _RC_M - 1   # rng = 0xFFFFFFFF ≥ kTop ✓
+    pbar_enc = tqdm(total=T_v, desc="encode", unit="tok", leave=False, file=sys.stderr)
+    for i in range(T_v):
+        sym = int(vtgt[i]); cf = cumfreqs_np[i]
+        rng_step = rc_rng >> RC_PREC           # = rc_rng // M, ≥ 1
+        cum_lo = int(cf[sym]); cum_hi = int(cf[sym + 1])
+        rc_rng  = rng_step * (cum_hi - cum_lo)
+        rc_low  = (rc_low + rng_step * cum_lo) & _M32
+        while rc_rng < _kTop:
+            rc_buf.append(rc_low >> 24)
+            rc_low  = (rc_low  << 8) & _M32
+            rc_rng <<= 8
+        pbar_enc.update(1)
+    pbar_enc.close()
+    # flush 4 tail bytes
+    for _ in range(4):
+        rc_buf.append(rc_low >> 24)
+        rc_low = (rc_low << 8) & _M32
+    rc_np    = np.array(rc_buf, dtype=np.uint8)
     rc_bytes = len(rc_np)
-    print(f"{rc_bytes}B")
 
     # seed token: first raw input byte (stored separately for decompressor)
     seed_token = int(all_inputs[0][0])
@@ -1226,12 +1400,35 @@ def eval_compression(base_xlstm, params, config, all_inputs, all_targets,
         print(f'  [WARN] RC stream size anomaly: expected ≈{ce_bytes_expected:.0f}B '
               f'got {rc_bytes}B ({rc_bytes/ce_bytes_expected:.2f}×)')
 
-    # ── verify round-trip via rc_codec.c decoder ─────────────────────────────
-    print("  verify (rc_codec.c)...", end=" ", flush=True)
-    decoded_all = rc_decode_c(rc_np, cumfreqs_np)
-    decode_ok   = bool(np.all(decoded_all == vtgt))
-    rt_note     = ""
-    print("OK" if decode_ok else "FAIL")
+    # (low, rng) decoder — symmetric to the encoder above
+    dec_lv, dec_rng, dec_pos = 0, _RC_M * _RC_M - 1, 0
+    for i in range(4):
+        dec_lv = ((dec_lv << 8) | int(rc_np[i] if i < rc_bytes else 0)) & _M32
+    dec_pos = 4
+    decoded_all = []
+    pbar_dec = tqdm(total=T_v, desc="verify", unit="tok", leave=False, file=sys.stderr)
+    for i in range(T_v):
+        cf = cumfreqs_np[i]
+        rng_step = dec_rng >> RC_PREC          # ≥ 1
+        # Search directly on thresholds = rng_step * cf[i].
+        # Cast cf to int64 BEFORE multiply — cf is int32 and rng_step*cf can overflow int32.
+        thresholds = np.int64(rng_step) * cf[:-1].astype(np.int64)
+        sym  = int(np.searchsorted(thresholds, np.int64(dec_lv), side='right')) - 1
+        sym  = max(0, min(sym, V - 1))
+        cum_lo = int(cf[sym]); freq = int(cf[sym + 1]) - cum_lo
+        dec_lv   = (dec_lv - rng_step * cum_lo) & _M32
+        dec_rng  = rng_step * freq
+        while dec_rng < _kTop:
+            dec_rng <<= 8
+            byte = int(rc_np[dec_pos]) if dec_pos < rc_bytes else 0
+            dec_lv = ((dec_lv << 8) | byte) & _M32
+            dec_pos += 1
+        decoded_all.append(sym)
+        pbar_dec.update(1)
+    pbar_dec.close()
+    any_rc_err = False  # Python decoder doesn't have JAX health flags
+    decode_ok = bool(np.all(np.array(decoded_all, np.int32) == vtgt))
+    rt_note = ""
 
     # Residual schemes (commented out — both misleading or strictly worse than p+rc):
     # p+raw:      n_wrong × 4B (positions + tokens). Worse than p+rc unless accuracy >99.9%.
