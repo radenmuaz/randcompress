@@ -1,7 +1,13 @@
-from .msrnn import MsRNN
+from .msrnn       import MsRNN
+from .transformer  import CausalTransformer
+from .ttt_rnn      import TTTLinear
+from .deltanet     import GatedDeltaNet
 
 MODEL_REGISTRY = {
-    "msrnn": MsRNN,
+    "msrnn":       MsRNN,
+    "transformer": CausalTransformer,
+    "ttt":         TTTLinear,
+    "deltanet":    GatedDeltaNet,
 }
 
 

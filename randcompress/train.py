@@ -229,6 +229,21 @@ def eval_segments_stateful(model, frozen, adapters, tcfg: TrainConfig,
     return results
 
 
+# ── State utilities ───────────────────────────────────────────────────────────
+
+def _detach_states(states):
+    """Recursively detach all tensors in a state structure (list of tensors or tuples)."""
+    def _det(x):
+        if isinstance(x, torch.Tensor):
+            return x.detach()
+        if isinstance(x, tuple):
+            return tuple(_det(v) for v in x)
+        if isinstance(x, list):
+            return [_det(v) for v in x]
+        return x
+    return _det(states)
+
+
 # ── TBPTT chunk step ──────────────────────────────────────────────────────────
 
 def compute_loss_and_grads(model, frozen, adapters, inp, tgt,
@@ -253,7 +268,7 @@ def compute_loss_and_grads(model, frozen, adapters, inp, tgt,
 
     grads = {k: (p.grad.clone() if p.grad is not None else None)
              for k, p in adapters.items() if p.requires_grad}
-    return loss.detach().item(), grads, [(s[0].detach(), s[1].detach()) for s in new_states]
+    return loss.detach().item(), grads, _detach_states(new_states)
 
 
 # ── Curriculum trainer ────────────────────────────────────────────────────────
@@ -328,7 +343,7 @@ class CurriculumTrainer:
             tgt = targets[chunk_idx][None, :]   # [1, S, oh]
             chunk_idx = (chunk_idx + 1) % n_chunks
 
-            frozen_states = [(s[0].detach(), s[1].detach()) for s in states]
+            frozen_states = _detach_states(states)
             loss, grads, states = compute_loss_and_grads(
                 self.model, self.frozen, self.adapters,
                 inp, tgt, frozen_states, tcfg)

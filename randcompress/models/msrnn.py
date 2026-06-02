@@ -27,13 +27,21 @@ from .hira import apply_adapter, make_adapter_params, center_b, init_hira_A, ini
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _ortho(rng: np.random.Generator, n: int, m: int, dtype) -> Tensor:
-    raw = rng.standard_normal((max(n, m), min(n, m)))
-    Q, _ = np.linalg.qr(raw)
-    mat = Q.T
-    if n > m:
+    """Return [n, m] matrix. Rows are orthonormal when n <= m."""
+    if n <= m:
+        # QR of [m, n] tall matrix → Q is [m, n] with orthonormal columns
+        # Q.T is [n, m] with orthonormal rows
+        raw = rng.standard_normal((m, n))
+        Q, _ = np.linalg.qr(raw)
+        mat = Q.T          # [n, m], orthonormal rows
+    else:
+        # n > m: take m orthonormal rows from [m, m] QR, pad remainder
+        raw = rng.standard_normal((m, m))
+        Q, _ = np.linalg.qr(raw)
+        base  = Q.T        # [m, m], orthonormal rows
         extra = rng.standard_normal((n - m, m)) / math.sqrt(m)
-        mat = np.concatenate([mat, extra], axis=0)
-    return torch.tensor(mat[:n], dtype=dtype)
+        mat   = np.concatenate([base, extra], axis=0)  # [n, m]
+    return torch.tensor(mat, dtype=dtype)
 
 
 def _dsym(DH: int, p: int) -> int:

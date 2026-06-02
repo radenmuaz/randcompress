@@ -16,9 +16,14 @@ class ModelConfig:
     stride_map:  str   = "1111"     # msrnn only: temporal stride per layer
     lora_r:      int   = 4          # HiRA / LoRA rank
     use_hira:    bool  = True       # False → plain LoRA baseline (same param count)
-    rope_scale:  float = 1.0        # transformer only (YaRN linear scale)
-    power_p:     int   = 2          # msrnn mLSTM symmetric power map degree
-    seed:        int   = 0
+    rope_scale:    float = 1.0        # transformer: YaRN linear frequency scale
+    power_p:       int   = 2          # msrnn mLSTM symmetric power map degree
+    seed:          int   = 0
+    # ── transformer long-context ───────────────────────────────────────────────
+    kv_window:     int   = 0          # 0=full cache; N=sliding window (N slots after dilation)
+    attn_dilation: int   = 1          # attend every d-th past position (1=no dilation)
+    n_sinks_zero:  int   = 1          # constant-zero sink KV (no params, score=exp(0) always)
+    n_sinks_train: int   = 1          # trainable sink KV (learned attraction + output)
 
 
 @dataclass
