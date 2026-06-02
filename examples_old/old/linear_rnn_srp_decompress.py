@@ -14,9 +14,9 @@ Decompression steps
 2. Reconstruct frozen base model from config.seed (deterministic)
 3. Restore HiRA adapter weights
 4. AR decode: for each token t = 0..T_valid-1
-     logits = forward_step(model, cur_token, state, t % chunk_size)
-     cdf    = quantize_cdf(logits[head=0])
-     token  = rc_decode_step(cdf, rc_state)   [pure Python, no JAX]
+     logits = forward_step(model, cur_token, state)   [JAX JIT]
+     cdf    = quantize_cdf(logits[head=0])             [JAX JIT]
+     token  = canonical (low,high) 64-bit RC step      [pure Python]
      cur_token = token
 5. Concatenate seed_token + decoded tokens → raw bytes → output file
 
@@ -37,17 +37,20 @@ import os, sys, json, pickle, argparse
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
-import linear_rnn_srp as _src
-from linear_rnn_srp import (
+import examples.old.linear_rnn_srp as _src
+from examples.old.linear_rnn_srp import (
     Config, RC_PREC, DTYPE, POWER_P,
     _quantize_cdf, _parse_stride_map,
-    init_xlstm_params, init_randcompress_params,
-    init_step_states, _collect_chunk_jit, _reshape_logits,
+    init_xlstm_params,
+    init_step_states, _collect_chunk_jit,
     bytes_to_tokens, tokens_to_bytes,
+    rc_encode_c, rc_decode_c,
 )
 
-# Same jit(_quantize_cdf) as the encoder — no vmap, identical XLA, bit-exact.
 _quantize_cdf_jit = jax.jit(_quantize_cdf)
+
+_FULL64 = 0xFFFFFFFFFFFFFFFF
+_M      = 1 << RC_PREC  # 65536
 
 
 # ============================================================================
@@ -55,8 +58,7 @@ _quantize_cdf_jit = jax.jit(_quantize_cdf)
 # ============================================================================
 
 class _SrcUnpickler(pickle.Unpickler):
-    """Redirect __main__.* lookups to linear_rnn_srp so params load correctly
-    regardless of whether training was run as __main__ or as a module."""
+    """Redirect __main__.* lookups to linear_rnn_srp."""
     def find_class(self, module, name):
         if module == '__main__':
             return getattr(_src, name)
@@ -73,7 +75,6 @@ def load_bundle(ckpt_dir):
     with open(os.path.join(ckpt_dir, "rc_stream.bin"), "rb") as f:
         rc_raw = np.frombuffer(f.read(), dtype=np.uint8).copy()
 
-    # Layer 4: verify rc_stream.bin integrity against stored SHA-256
     if "rc_stream_sha256" in meta:
         import hashlib
         actual_sha = hashlib.sha256(rc_raw.tobytes()).hexdigest()
@@ -91,52 +92,6 @@ def load_bundle(ckpt_dir):
 
 
 # ============================================================================
-# Pure-Python range-coder decoder  (no JAX; model forward pass is JIT'd)
-# ============================================================================
-
-_M32  = 0xFFFFFFFF
-_RC_M = 1 << RC_PREC
-_kTop = _RC_M * 256   # flush threshold (LZMA-style: 1<<24)
-
-
-def _rc_init(buf):
-    """Read first 4 bytes into the (low_val, rng) range-coder state."""
-    lv = 0
-    for i in range(4):
-        lv = ((lv << 8) | int(buf[i])) & _M32
-    return lv, _RC_M * _RC_M - 1, 4   # low_val, rng, pos
-
-
-def _rc_decode_sym(lv, rng, pos, buf, cumfreqs):
-    """Decode one symbol using the (low_val, rng) range coder.
-
-    Invariant: rng ∈ [M, M²).  rng_step = rng // M ≥ 1 always, so no
-    interval collapse.  Returns (sym, new_lv, new_rng, new_pos).
-    """
-    rng_step   = rng >> RC_PREC               # rng // M, ≥ 1
-
-    # Search on thresholds = rng_step * cf[i] — avoids division imprecision.
-    # Cast to int64 BEFORE multiply — cumfreqs is int32, product overflows int32.
-    thresholds = np.int64(rng_step) * cumfreqs[:-1].astype(np.int64)
-    sym = int(np.searchsorted(thresholds, np.int64(lv), side='right')) - 1
-    sym = max(0, min(sym, len(cumfreqs) - 2))
-
-    cum_lo = int(cumfreqs[sym])
-    freq   = int(cumfreqs[sym + 1]) - cum_lo
-
-    lv    = (lv - rng_step * cum_lo) & _M32
-    rng   = rng_step * freq
-
-    while rng < _kTop:
-        rng <<= 8
-        byte = int(buf[pos]) if pos < len(buf) else 0
-        lv   = ((lv << 8) | byte) & _M32
-        pos += 1
-
-    return sym, lv, rng, pos
-
-
-# ============================================================================
 # Main decompression
 # ============================================================================
 
@@ -151,7 +106,6 @@ def decompress(ckpt_dir, output_path, verify_path=None):
     print(f"Bundle:  {ckpt_dir}")
     print(f"  n_raw={n_raw_bytes}  T_valid={T_valid}  seed={seed_token}  rc_bytes={rc_bytes}")
 
-    # ── set global dtype/power so model functions use correct settings ────────
     _src.DTYPE   = jnp.dtype(config.dtype)
     _src.POWER_P = config.power_p
 
@@ -164,45 +118,77 @@ def decompress(ckpt_dir, output_path, verify_path=None):
     print("Restoring HiRA adapter params...")
     params = jax.tree_util.tree_map(jnp.array, params_np)
 
-    # ── stride / chunk config ─────────────────────────────────────────────────
     stride_map = _parse_stride_map(config.stride_map, config.num_layers)
-    chunk_size = config.segment_size * (8 // config.input_bits)
+    oh, ob     = config.output_heads, config.output_bits
+    V          = 1 << ob
 
-    # ── init range coder + model state ───────────────────────────────────────
-    rc_lv, rc_rng, rc_pos = _rc_init(rc_raw)  # (low_val, rng, pos)
+    # ── init canonical (low, high) 64-bit range coder ────────────────────────
+    # Matches rc_codec.c exactly: 64-bit state, emit/refill when top bytes agree.
+    rc_low  = 0
+    rc_high = _FULL64 - 1   # range = UINT64_MAX, avoids 2^64 overflow
+    rc_code = 0
+    rc_pos  = 0
+    for _ in range(8):
+        byte    = int(rc_raw[rc_pos]) if rc_pos < len(rc_raw) else 0
+        rc_code = ((rc_code << 8) | byte) & _FULL64
+        rc_pos += 1
+
     model_states = init_step_states(config, batch_size=1)
+    decoded      = [seed_token]
+    cur_tok      = jnp.array([seed_token], jnp.int32)
 
-    decoded   = [seed_token]
-    cur_toks  = [seed_token]
-
-    oh, ob = config.output_heads, config.output_bits
+    print("AR decoding (JAX JIT forward + Python RC step)...")
     pbar = tqdm(total=T_valid, desc="decode", unit="tok", file=sys.stderr)
 
     for t in range(T_valid):
-        tok_in = jnp.array([cur_toks[-1]], jnp.int32)
+        # model forward: one token → logits
         chunk_logits, model_states = _collect_chunk_jit(
-            base_xlstm, params, tok_in, model_states,
+            base_xlstm, params, cur_tok, model_states,
             1, config.num_heads, config.block_map, stride_map, oh, ob)
-        cumfreqs = np.array(_quantize_cdf_jit(chunk_logits[0]), dtype=np.int32)
+        cf = np.array(_quantize_cdf_jit(chunk_logits[0]), dtype=np.int32)
 
-        sym, rc_lv, rc_rng, rc_pos = _rc_decode_sym(
-            rc_lv, rc_rng, rc_pos, rc_raw, cumfreqs)
+        # RC decode step: find sym where rc_low + scale(range, cf[sym]) <= rc_code.
+        # Uses same boundary formula as rc_codec.c to avoid rounding mismatches.
+        rc_range = rc_high - rc_low + 1   # Python int, up to 2^64
+        lo_s, hi_s = 0, V - 1
+        while lo_s < hi_s:
+            mid = (lo_s + hi_s + 1) // 2
+            # scale(range, cf[mid]) = range * cf[mid] // M
+            if rc_low + rc_range * int(cf[mid]) // _M <= rc_code:
+                lo_s = mid
+            else:
+                hi_s = mid - 1
+        sym = lo_s
+
+        # narrow interval (same formula as rc_codec.c: scale = range*f//M)
+        cum_lo  = int(cf[sym])
+        cum_hi  = int(cf[sym + 1])
+        rc_high = rc_low + rc_range * cum_hi // _M - 1
+        rc_low  = rc_low + rc_range * cum_lo // _M
+
+        # refill agreed top bytes (Python int arithmetic, no masking needed until emit)
+        while (rc_low >> 56) == (rc_high >> 56):
+            rc_low  = rc_low  << 8
+            rc_high = (rc_high << 8) | 0xFF
+            byte    = int(rc_raw[rc_pos]) if rc_pos < len(rc_raw) else 0
+            rc_code = (rc_code << 8) | byte
+            rc_pos += 1
 
         decoded.append(sym)
-        cur_toks.append(sym)
+        cur_tok = jnp.array([sym], jnp.int32)
         pbar.update(1)
 
     pbar.close()
 
     # ── convert tokens → bytes ────────────────────────────────────────────────
-    raw_out = tokens_to_bytes(np.array(decoded, np.int32), config.input_bits)[:n_raw_bytes]
+    raw_out = tokens_to_bytes(
+        np.array(decoded, dtype=np.int32), config.input_bits)[:n_raw_bytes]
     print(f"Decoded {len(raw_out)} bytes  (expected {n_raw_bytes})")
 
     with open(output_path, "wb") as f:
         f.write(bytes(raw_out.tolist()))
     print(f"Written: {output_path}")
 
-    # ── optional verification ─────────────────────────────────────────────────
     if verify_path is not None:
         with open(verify_path, "rb") as f:
             original = np.frombuffer(f.read(), dtype=np.uint8)

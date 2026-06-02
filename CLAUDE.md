@@ -1,113 +1,166 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## What this project is
 
-Neural compression via memorization: freeze a randomly-initialized xLSTM, then train only HiRA adapters to overfit a single file. The trained adapter weights *are* the compressed representation. Decompression reconstructs the file autoregressively from a zero hidden state seeded with the first byte.
+Neural compression via memorization: freeze a randomly-initialized model, then train only adapters (HiRA or LoRA) to overfit a single file. The adapter weights *are* the compressed representation. Decompression reconstructs the file autoregressively using range coding.
 
-**Active file**: `examples/randcompress_v2.py`. v1 is kept for reference. The `randcompress/` package and other `examples/` scripts are earlier experiments.
+**Active package**: `randcompress/` (PyTorch). Old JAX experiments are in `examples_old/`.
 
 ## Running
 
 ```bash
 uv sync
-uv run python examples/randcompress_v2.py
+uv run python examples/train_msrnn.py                     # default: datasets/juz1.txt
+uv run python examples/train_msrnn.py \
+    --dataset datasets/surat_al-fatihah.txt \
+    --max_iter_per_phase 2000 --check_every 100
+uv run python examples/train_msrnn_baseline.py            # plain LoRA + AdamW ablation
+
+# Compress + decompress round-trip
+uv run python examples/compress.py \
+    --ckpt runs/train_msrnn/ckpt_last \
+    --input datasets/surat_al-fatihah.txt \
+    --output runs/compressed
+uv run python examples/decompress.py \
+    --bundle runs/compressed \
+    --output /tmp/recovered.bin \
+    --verify datasets/surat_al-fatihah.txt
 ```
 
-Logs: `train_v2_persistent.log` (training + validation each epoch), `eval_v2_final.log` (post-training evaluation on full train set).
+Logs land in `--log_dir` (default `runs/<script_name>/`). `train.log` captures stdout + stderr (including tqdm) with eager flushing — safe to `tail -f`.
 
 Datasets:
 ```
-datasets/quran-uthmani.txt      # training
-datasets/surat_al-fatihah.txt   # validation (al-Fatihah, ~300 bytes, fits in one forward pass)
+datasets/juz1.txt               # default (~44 KB)
+datasets/surat_al-fatihah.txt   # tiny (~562 B), fast iteration
+datasets/quran-uthmani.txt      # full quran (~1.4 MB)
 ```
 
-No test suite. `pytest` is a dev dep but unused.
+No test suite.
 
-## Architecture (`randcompress_v2.py`)
+## Package structure (`randcompress/`)
+
+```
+randcompress/
+  config.py        ModelConfig + TrainConfig dataclasses; parse_configs() argparse CLI
+  tokenizer.py     bytes_to_tokens, tokens_to_bytes, ByteTokenizer, load_bytes
+  codec.py         ctypes binding to rc_codec.c: quantize_cdf, rc_encode, rc_decode
+  train.py         CurriculumTrainer, loss fns (CE + AGD), SinkGD + AdamW + SGD
+  compress.py      encode(): teacher-forced logits → CDF → rc_encode → bundle
+  decompress.py    decode(): rc_decode AR loop → tokens → bytes
+  checkpoint.py    save/load checkpoint and full bundle (config+params+rc_stream+meta)
+  models/
+    base.py        RandCompressModel ABC
+    hira.py        apply_hira, apply_lora, apply_adapter, make_adapter_params, center_b
+    msrnn.py       MsRNN — linear mLSTM + whitened sRNN (active model)
+    __init__.py    MODEL_REGISTRY, get_model(mcfg, tcfg)
+
+rc_codec.c         C range coder (compiled to /tmp/*.so on first use)
+examples/          Clean usage scripts (one per setup)
+examples_old/      Old JAX monolithic scripts (reference only)
+```
+
+## Architecture: MsRNN (`models/msrnn.py`)
 
 ### Compression scheme
 
-- **Base xLSTM** (`xLSTMParams`): structured-randomly initialized, fully frozen. Seed + structured init rules fully determine it — no need to store weights.
-- **HiRA adapters** (`RandCompressParams`): only trainable parameters. Update rule: `W = W₀ + W₀ ⊙ (B·A)`. B zero-init (ΔW=0 at start), A orthonormal rows (SVD init). Adapters on: embedding, all mLSTM/sLSTM weight matrices, FFN up/down.
-- **output_proj**: directly trainable (no HiRA), maps `d_model → vocab_size`.
+- **Frozen base** (`init_frozen`): structured-randomly initialized, never updated. Seed + init rules fully determine it — not stored.
+- **Adapters** (`init_adapters`): only trainable parameters.
+  - **HiRA** (`use_hira=True`, default): `W = W₀ + W₀ ⊙ (B·A)` — full-rank update from rank-r factors. B zero-init, A orthonormal rows.
+  - **Baseline** (`use_hira=False`): `W = W₀ + B·A` — plain LoRA delta, same rank r, same param count.
+- **output_proj**: always a direct trainable parameter, no adapter wrapper.
 
-**Why HiRA over LoRA**: `ΔW = W₀ ⊙ (B·A)` decomposes as `Σₖ diag(bₖ) W₀ diag(aₖ)`, which has `rank = rank(W₀)` even for rank-1 B·A. Same parameter count as LoRA but full-rank updates.
+### Cell types (set by `block_map`, one char per layer)
 
-### xLSTM blocks
+**`m` — linear mLSTM** (no gates, no sigmoid/tanh/exp at runtime):
+- State: `C ∈ [B, NH, D_sym, DH]`
+- Update: `C_t = α[:,None,None] * C_{t-1} + phi_k ⊗ v_t`, output `h = phi_q @ C`
+- `phi` = symmetric degree-`power_p` feature map (`_spow`). p=2 default → `D_sym = C(DH+1,2)`
+- Per-head decay `α[NH]` log-uniform in `[1, segment_size]`, frozen
+- Scan: pre-projects Q/K/V for full sequence, then Python loop over time (einsum ops batched)
 
-Each block: `LayerNorm → [mLSTM or sLSTM] → residual → LayerNorm → gated FFN → residual`. Layer type set by `block_map` (e.g. `"msms"`).
+**`s` — whitened sRNN**:
+- State: `h ∈ [B, d_model]`
+- Update: `h_t = LayerNorm(W_hh h_{t-1} + W_hx x_t + b)`
+- `W_hh` near-critical SVD init (σ=0.95), `W_hx` orthonormal
+- Scan: pre-projects `x @ W_hx.T` for full sequence, then Python loop for recurrent part
 
-**mLSTM** — matrix memory `C ∈ [B, NH, DH, DH]`. Training uses parallel attention-like computation over the chunk. Eval steps recurrently. Has per-head gate biases `b_f [NH]` and `b_i [NH]` for multi-timescale control.
+### Structured frozen init
 
-**sLSTM** — scalar states `(y, c, n, m) ∈ [B, H]`. Always `jax.lax.scan` (training and eval identical). Has explicit recurrent connection `Ry`.
+| component | strategy |
+|---|---|
+| `W_q, W_k, W_v` (mLSTM) | orthonormal rows, `[NH, DH, d]` |
+| `alpha [NH]` (mLSTM) | `exp(-1/τ)`, τ log-uniform `[1, seq_len]` |
+| `W_hh` (sRNN) | SVD init, all singular values = 0.95 |
+| `W_hx` (sRNN) | orthonormal |
+| `W_down` (mLSTM) | orthonormal rows / d |
+| `embedding` | N(0, 0.01) |
 
-### Structured frozen initialization (v2)
+### HiRA B-centering
 
-The frozen basis is initialized to maximize diversity and signal richness:
+After each SinkGD step, `center_b(adapters)` zero-centers columns of every `.B` tensor in-place. This maintains zero-mean activations, which is required for SinkGD's Sinkhorn normalization to be exact.
 
-| component | init strategy | theory |
-|---|---|---|
-| `W_q, W_k, W_v` | orthonormal rows (QR), reshaped to `[NH, DH, inner]` | each head attends to an orthogonal subspace (observability) |
-| `b_f [NH]` (mLSTM forget bias) | `logit(exp(-1/τ))`, τ log-uniform in `[1, max_seq_len]` | multi-timescale memory, head 0 = fast, head NH-1 = full-window |
-| `b[H:2H]` (sLSTM forget bias) | same log-uniform spread over H units | multi-timescale for sLSTM |
-| `Ry` (sLSTM recurrent) | SVD → all singular values = 0.95 | near-critical (ESN principle): max memory capacity, guaranteed stability |
-| `conv_w` | DCT-II basis tiled across channels | structured FIR filter bank: DC, fundamental, 2nd, 3rd harmonic |
-| `W_up, W_down, ffn_*` | row-normalised or orthonormal rows | flat singular value spectrum, no dead input directions |
+### Stride map
 
-Helper functions: `_ortho(key, n, m)`, `_fir_bank(n_channels, K)`, `_multiscale_forget_bias(n, seq_len)`.
+`stride_map` (one digit per layer) controls temporal subsampling. A layer with stride N fires every N tokens; its output is `repeat_interleave`-ed back to full resolution.
 
-### HiRA initialization (v2)
+## Training (`train.py`)
 
-`init_hira_adapter`: A rows are right singular vectors of a random matrix (via SVD). This gives exact row orthonormality so each HiRA direction produces an independent gradient signal to B from step one. B remains zero.
+### Loss functions
 
-### Training: Persistent TBPTT with gradient accumulation
+- `cross_entropy_loss(logits, targets, pad_token)` — standard masked CE
+- `agd_loss(logits, targets, pad_token, detach_weights)` — Arithmetic Gradient Descent: weights each position by `1/I_t` where `I_t = ∏_{s≤t} P(y_s)`. Up-weights hard early tokens. **Slower to overfit** (~5-9× vs CE) — CE is better for this memorization task.
+- `training_loss(logits, targets, tcfg)` — dispatches via `tcfg.use_agd_loss`
 
-File split into non-overlapping chunks of `chunk_size` tokens. State carried across chunks via `stop_gradient`. State reset to zeros at epoch start (matching eval).
+### Optimizers (`--optimizer` flag)
 
-**Gradient accumulation** (`grad_accum_k=K`):
-- K chunks processed with params fixed (zero intra-block staleness)
-- Gradients summed and averaged, one param update per block
-- K=1 is the base case (standard per-chunk update)
-- Compared to standard TBPTT (K=1): intra-block staleness goes from 0→K-1 updates to 0; inter-block staleness is K updates (same as before)
+1. **`sinkgd`** (default): `sinkgd_step()` — global grad clip, then Sinkhorn row/col normalization per tensor (`_sinkhorn_2d`, `L` iterations), then `p -= lr * norm_g`. B-centering applied after. No momentum state.
+2. **`adamw`**: `torch.optim.AdamW`
+3. **`sgd`**: `torch.optim.SGD` with momentum
 
-Key functions:
-- `forward_train_chunked` — one chunk forward from initial layer state
-- `grad_chunk_persistent` — gradients only, no update (used for accumulation)
-- `adamw_update` — hand-written AdamW with grad clipping before moment updates
+### Curriculum TBPTT (`CurriculumTrainer.run`)
 
-### Validation (per epoch)
+File split into `segment_size`-byte segments. Per segment:
+1. **SOLO**: train on this segment until 100% argmax accuracy or `max_iter_per_phase` iters
+2. **COMBINED**: train on all segments seen so far
 
-After each epoch, on `surat_al-fatihah.txt`:
-1. **Teacher-forced BPC**: single `forward_train` call (file fits in one chunk)
-2. **Generative**: seed = first byte, zero states, greedy decode. Reports accuracy, bytes wrong, first wrong byte index, decoded text.
+State resets to zeros at each epoch boundary. State carried across chunks via `.detach()` (TBPTT). Eval (`eval_segments_stateful`) uses teacher-forced chunked forward + argmax accuracy.
 
-### Final evaluation (post-training)
+## Config (`config.py`)
 
-On full training dataset:
-1. **Teacher-forced BPC**: chunked stateful forward (same as training)
-2. **Generative**: seed = `tokens[0]`, generate `n_real - 1` bytes, compare to `tokens[1:]`. Reports bytes wrong, first wrong byte index, accuracy, CER.
+Two dataclasses, all fields CLI-overridable as `--field value`:
 
-Logged to `eval_v2_final.log`.
+**`ModelConfig`**: `model`, `d_model`, `num_heads`, `num_layers`, `block_map`, `stride_map`, `lora_r`, `use_hira`, `rope_scale` (transformer), `power_p`, `seed`
+
+**`TrainConfig`**: `dataset`, `log_dir`, `input_bits`, `output_bits`, `output_heads`, `vocab_size`, `pad_token`, `segment_size`, `max_iter_per_phase`, `check_every`, `learning_rate`, `weight_decay`, `grad_clip_norm`, `optimizer`, `sgd_momentum`, `sinkgd_l`, `use_agd_loss`, `agd_detach_weights`, `gen_seed_len`, `residual_budget`, `dtype`
+
+`--no_hira` sets `use_hira=False`.
+
+## Range codec (`codec.py` + `rc_codec.c`)
+
+- `rc_codec.c` compiled on first import to `/tmp/rc_codec_<sha1>.so` via ctypes
+- `quantize_cdf(logits_1d)` → `(V+1,)` int32 cumfreqs summing to 65536
+- `rc_encode(symbols, cdfs)` → `bytes`; `rc_decode(stream, cdfs)` → `(T,)` int32
+- CDF layout: `cdfs[t, 0]=0`, `cdfs[t, V]=65536`, strictly increasing
+
+## Bundle format (compress/decompress)
+
+```
+ckpt_dir/
+  config.json      ModelConfig + TrainConfig fields
+  params.pkl       {name: np.ndarray} adapter weights
+  rc_stream.bin    range-coded byte stream
+  meta.json        {n_raw_bytes, seed_token, rc_bytes, rc_stream_sha256, param_bytes, ...}
+```
+
+Decompression: load bundle → reconstruct frozen from seed → AR decode with RC state machine → `tokens_to_bytes`.
 
 ## Key design decisions
 
-- **Goal is overfitting**: weight_decay=0, no dropout. Everything pushes toward lower train loss.
-- **Eval always uses zero hidden state**: training carry-over states are never used at eval time; eval always starts fresh from token[0] with zero states.
-- **`PAD_TOKEN = 0`** masked from loss — safe because dataset is Arabic UTF-8 (never produces 0x00).
-- **Cosine LR with warmup**: `global_step` increments per chunk, so the LR schedule is identical at K=1 and K>1 (same total decay curve, just fewer actual updates).
-- **No optax**: AdamW hand-written for full control and no dependency.
-- **DTYPE = float32** throughout (bfloat16 disabled; swap in DTYPE line if needed).
-
-## Staleness analysis (TBPTT)
-
-The carry-over hidden state passed to chunk t+1 was computed with params from chunk t. Staleness = how many gradient updates old the state is.
-
-| strategy | intra-block staleness | inter-block staleness |
-|---|---|---|
-| standard TBPTT (K=1) | 0 (trivially) | 1 update per chunk |
-| grad accumulation (K>1) | **0** (params frozen within block) | K updates at block boundary |
-| K-chunk EM (double-pass) | 0→K-1 (grows) | ~0 (last step fresh) |
-
-xLSTM's forget gates attenuate stale state in ~50-100 tokens, so inter-block staleness is self-correcting. Intra-block staleness is the more persistent problem — grad accumulation eliminates it.
+- **Goal is overfitting**: `weight_decay=0`, no dropout. Everything pushes toward lower train loss.
+- **Eval always resets state to zero**: carry-over training states never used at eval time.
+- **`pad_token=0`** masked from loss — safe for Arabic UTF-8 (no 0x00 in dataset).
+- **PyTorch only**: no JAX, no optax. SinkGD is hand-written.
+- **`float32` default** — swap via `--dtype bfloat16` if needed.

@@ -1,34 +1,35 @@
 """
 randcompress v10 — Fully linear cells: gate-free mLSTM + whitened sRNN
-Train loop: simple TBPTT with random state reset probability (SRP).
+
+Changes from v9:
 
 mLSTM (block type 'm') — linear, no gates:
+  - Remove all nonlinear gates (W_i, W_f, b_f, b_i, W_up, z-branch, act_ln).
   - Replace forget/input gates with frozen per-head scalar decay alpha [NH],
-    log-uniform τ in [1, seq_len], alpha_h = exp(-1/τ_h).
+    log-uniform τ in [1, seq_len], alpha_h = exp(-1/τ_h). Implicit forgetting
+    via spectral radius, no sigmoid/exp at runtime.
   - Cell: C_t = alpha[:,None,None]*C_{t-1} + phi_k⊗v  (pure linear accumulation)
   - Output: h = phi_q @ C, then additive skip + multihead LayerNorm + W_down.
-  - State: C only [B,NH,D_sym,DH].
+  - q, k, v projected directly from layer-normed block input x (no W_up/silu).
+  - State: C only [B,NH,D_sym,DH]. No n, no m, no stabilizer.
+  - Training via jax.lax.scan (same path as eval). No parallel kernel needed.
 
 sRNN (block type 's') — whitened vanilla RNN:
+  - Replaces sLSTM entirely (sLSTMParams, sLSTMHiRA removed).
   - h_t = LayerNorm(W_hh h_{t-1} + W_hx x_t + b)
-  - W_hh: near-critical SVD init, spectral radius=0.95.
-  - State: h only [B, d_model].
+  - W_hh: near-critical SVD init, spectral radius=0.95 (implicit forgetting).
+  - W_hx: orthonormal init (white input → white pre-activation).
+  - LayerNorm inside cell enforces E[h_t]=0, Var[h_t_i]=1 at every step.
+    This makes H_B = I_r for both W_hx and W_hh HiRA adapters → SinkGD exact.
+  - State: h only [B, d_model]. No gates, no c, no n, no m.
+  - Only nonlinearity: LayerNorm (normalization, not a learnable gate).
 
-Training (SRP — random state reset):
-  Each iteration: with prob state_reset_prob, reset hidden state and jump to a
-  random chunk. Otherwise carry state forward from previous chunk (stop_gradient
-  at chunk boundary). Matches zero-state eval regime.
+Both cells: no silu, no tanh, no sigmoid, no exp at runtime.
+HiRA B column-centering retained from v9.
+Curriculum learning (from v4.4.2.1) retained unchanged.
 """
 
 import jax
-jax.config.update("jax_enable_x64", True)   # uint64 arithmetic for range coder
-# Suppress the scatter int64→int32 FutureWarning from jax_enable_x64 interactions.
-# Root cause: jnp.argmax returns int64 with x64 enabled; fixed with .astype(jnp.int32)
-# in _quantize_cdf. Remaining instances are harmless (correct implicit cast) until
-# a future JAX tightens the rules — suppress until then.
-import warnings as _w
-_w.filterwarnings("ignore", message="scatter inputs have incompatible types",
-                  category=FutureWarning)
 import jax.numpy as jnp
 import jax.random as jr
 import numpy as np
@@ -43,16 +44,18 @@ from tqdm import tqdm
 PAD_TOKEN = 0
 DTYPE     = jnp.float32
 POWER_P   = 2
-RC_PREC   = 16   # range coder CDF precision; cumfreqs sum to 1 << RC_PREC
 
 class _Tee:
     def __init__(self, *files): self.files = files
     def write(self, s):
         for f in self.files:
             f.write(s)
-            f.flush()   # flush immediately so tail -f log works in real time
+            f.flush()
     def flush(self):
         for f in self.files: f.flush()
+    # tqdm checks for this
+    @property
+    def encoding(self): return getattr(self.files[0], "encoding", "utf-8")
 
 
 # ============================================================================
@@ -83,30 +86,25 @@ class Config(NamedTuple):
     grad_clip_norm:float = 1e2
     sinkgd_l:      int   = 5
     # ── loss ─────────────────────────────────────────────────────────────────
-    margin:        float = 0.
-    ce_weight:     float = 1.0
-    # ── gradient accumulation ────────────────────────────────────────────────
-    grad_accum_steps: int   = 1     # K chunks per vgrad call; state flows through all K
-    # ── hidden state dropout ──────────────────────────────────────────────────
-    state_reset_prob: float = 0.0   # prob of zeroing each layer state between chunks
+    use_agd_loss:  bool  = False
+    agd_detach_weights: bool = True
+    # ── TBPTT state drop ─────────────────────────────────────────────────────
+    state_reset_prob: float = 1.
     # ── residual / stop ──────────────────────────────────────────────────────
     residual_budget: float = 0.
     target_bpb:    float = 0.0
     # ── generative eval ──────────────────────────────────────────────────────
     gen_seed_len:  int   = 16   # teacher-forced warm-up bytes before eval starts
     # ── misc ─────────────────────────────────────────────────────────────────
-    pad_token:       int   = 0
-    dtype:           str   = "float32"
-    max_iters:       int   = 100
-    check_every:     int   = 100
-    max_eval_tokens: int   = 0     # 0 = all tokens; >0 = limit monitoring eval (fast BPB snapshot)
-    remat:           bool  = True  # True = chunk CDF/round-trip to stay in memory (always tests all tokens)
-                                   # False = single-shot (fast, may OOM on large files)
-    remat_chunk:     int   = 50000 # tokens per remat chunk (ignored when remat=False)
-    save_ckpt:       bool  = True  # save full compressed bundle at each checkpoint; False = log only
-    # dataset:         str   = "datasets/surat_al-fatihah.txt"
-    # dataset:       str   = "datasets/juz1.txt"
-    dataset:       str   = "datasets/quran-uthmani.txt"
+    pad_token:     int   = 0
+    dtype:         str   = "float32"
+    max_iters:     int   = 100000   # kept for compat; curriculum uses max_iter_per_phase
+    max_iter_per_phase: int = 10000 # SOLO / COMBINED budget per segment
+    check_every:   int   = 100
+    # dataset:       str   = "datasets/surat_al-fatihah.txt"
+    dataset:       str   = "datasets/juz1.txt"
+    # dataset:       str   = "datasets/quran-uthmani.txt"
+    log_dir:       str   = ""   # overrides default log/<script_name>
 
 _PRESETS = {
     "byte":         dict(input_bits=8, output_bits=8, output_heads=1, vocab_size=256, pad_token=0),
@@ -325,24 +323,17 @@ def _dsym(DH, p):
     if p == 1: return DH
     return math.comb(DH + p - 1, p)
 
-_SPOW_CACHE: dict = {}   # (D, p) → (i_idx, j_idx, scale); computed once per unique (D,p)
-
 def spow(x, p):
     """Symmetric degree-p polynomial feature map.
 
     p=1: identity.  p=2: all products x_i*x_j (i<=j), off-diagonal * sqrt(2).
     [..., D] → [..., D_sym] where D_sym = C(D+p-1, p).
-    Indices and scale cached on first call for each (D, p) pair.
     """
     if p == 1:
         return x
     D = x.shape[-1]
-    key = (D, p)
-    if key not in _SPOW_CACHE:
-        i_idx, j_idx = np.tril_indices(D)
-        scale = np.where(i_idx == j_idx, 1.0, np.sqrt(2.0)).astype(np.float32)
-        _SPOW_CACHE[key] = (i_idx, j_idx, scale)
-    i_idx, j_idx, scale = _SPOW_CACHE[key]
+    i_idx, j_idx = np.tril_indices(D)
+    scale = np.where(i_idx == j_idx, 1.0, np.sqrt(2.0)).astype(np.float32)
     return x[..., i_idx] * x[..., j_idx] * scale
 
 
@@ -536,132 +527,34 @@ def forward_step(base_xlstm, rc, token, states, num_heads, block_map, stride_map
 _fwd_step_jit    = jax.jit(forward_step,          static_argnames=["num_heads","block_map","stride_map"])
 _fwd_chunked_jit = jax.jit(forward_train_chunked,  static_argnames=["num_heads","block_map","stride_map"])
 
-
-@functools.partial(jax.jit, static_argnames=[
-    "chunk_size", "num_heads", "block_map", "stride_map", "oh", "ob"])
-def _collect_chunk_jit(base_xlstm, params, toks_chunk, init_states,
-                        chunk_size, num_heads, block_map, stride_map, oh, ob):
-    """Scan forward_step over chunk_size tokens in one JIT call.
-
-    Key optimisations vs calling _fwd_step_jit per token:
-      - apply_xlstm_hira called ONCE per chunk (not per token)
-      - lax.scan eliminates Python dispatch overhead (O(T) → O(T/S) JIT calls)
-      - Uses mlstm_layer_step / srnn_layer_step (same ops as _fwd_step_jit),
-        so logits are bit-identical to the sequential decoder — round-trip OK.
-
-    Returns: chunk_logits [chunk_size, V] (head-0), new_states
-    """
-    xlstm      = apply_xlstm_hira(base_xlstm, params)   # hoisted out of scan
-    stride_tup = stride_map                               # static tuple
-
-    def step(states, t_tok):
-        t, tok = t_tok
-        x = xlstm.embedding[tok][None, :]                # [1, d_model]
-        new_states = []
-        for block, btype, stride, state in zip(
-                xlstm.blocks, block_map, stride_tup, states):
-            lstm_state, last_out = state
-            x_n = layer_norm(x, block.norm_w, block.norm_b)
-            if stride == 1:
-                if btype == 'm':
-                    cell_out, new_lstm = mlstm_layer_step(
-                        block.mlstm, x_n, lstm_state, num_heads)
-                else:
-                    cell_out, new_lstm = srnn_layer_step(
-                        block.srnn, x_n, lstm_state, num_heads)
-                new_states.append((new_lstm, cell_out))
-            else:
-                # stride > 1: fire/hold decided at runtime
-                _block, _btype = block, btype          # capture loop vars
-                def fire(args):
-                    xn, ls = args
-                    if _btype == 'm':
-                        return mlstm_layer_step(_block.mlstm, xn, ls, num_heads)
-                    return srnn_layer_step(_block.srnn, xn, ls, num_heads)
-                def hold(args):
-                    _, ls = args
-                    return last_out, ls
-                cell_out, new_lstm = jax.lax.cond(
-                    t % jnp.int32(stride) == jnp.int32(0),
-                    fire, hold, (x_n, lstm_state))
-                new_states.append((new_lstm, cell_out))
-            x = x + cell_out
-        x = layer_norm(x, xlstm.norm_w, xlstm.norm_b)
-        logit_flat = jnp.dot(x, params.output_proj)
-        logits     = _reshape_logits(logit_flat, oh, ob)  # [1, oh, V]
-        return new_states, logits[0, 0, :]                # carry, [V]
-
-    new_states, chunk_logits = jax.lax.scan(
-        step, init_states,
-        (jnp.arange(chunk_size, dtype=jnp.int32), toks_chunk))
-    return chunk_logits, new_states   # [chunk_size, V], states
-
-
 def _reshape_logits(flat, output_heads, output_bits):
     output_vocab = 2 ** output_bits
     return flat.reshape(*flat.shape[:-1], output_heads, output_vocab)
 
 
 # ============================================================================
-# Hidden-state dropout  (applied between chunks inside the grad window)
+# Single TBPTT step with carry-in state
 # ============================================================================
 
-def _dropout_states(states, key, prob):
-    """Independently zero each layer's full state with probability `prob`.
-    Scalar Bernoulli mask per layer — either keep everything or zero everything.
-    Gradient flows through kept layers; zeroed layers break the chain (mask=0 → grad=0).
-    """
-    new_states = []
-    for i, (lstm_state, last_out) in enumerate(states):
-        mask = jr.bernoulli(jr.fold_in(key, i), 1.0 - prob).astype(DTYPE)
-        new_states.append((
-            jax.tree_util.tree_map(lambda s: s * mask, lstm_state),
-            last_out * mask,
-        ))
-    return new_states
-
-
-# ============================================================================
-# K-chunk BPTT with state flowing through (no stop_gradient within window)
-# ============================================================================
-
-@functools.partial(jax.jit, static_argnames=["config", "K"])
-def grad_accum_persistent(base_xlstm, params, inputs_K, targets_K, init_states, rng_key, config, K):
-    """
-    inputs_K:    [K, 1, S] int32
-    targets_K:   [K, 1, S, oh] int32
-    init_states: carry-in state (stop_gradient applied by caller at window boundary)
-    rng_key:     for hidden-state dropout between chunks
-
-    State flows through all K chunks without stop_gradient.
-    Hidden-state dropout (state_reset_prob) applied between chunks (not after last).
-    One vgrad call → one optimizer update.
-    Returns (avg_loss, grads, final_states).
-    """
+@functools.partial(jax.jit, static_argnames=["config"])
+def grad_chunk_persistent(base_xlstm, params, inputs, targets, layer_states, config):
     oh         = config.output_heads
     ob         = config.output_bits
     num_heads  = config.num_heads
     block_map  = config.block_map
     stride_map = _parse_stride_map(config.stride_map, config.num_layers)
-    margin     = config.margin
-    ce_weight  = config.ce_weight
-    srp        = config.state_reset_prob
+    use_agd    = config.use_agd_loss
+    agd_detach = config.agd_detach_weights
 
     def loss_fn(p):
-        states     = init_states
-        total_loss = jnp.zeros(())
-        for k in range(K):
-            logits_flat, states = forward_train_chunked(
-                base_xlstm, p, inputs_K[k], states, num_heads, block_map, stride_map)
-            logits = _reshape_logits(logits_flat, oh, ob)
-            chunk_loss = sum(
-                training_loss(logits[..., h, :], targets_K[k][..., h], margin, ce_weight)
-                for h in range(oh)
-            ) / oh
-            total_loss = total_loss + chunk_loss
-            if k < K - 1 and srp > 0.0:
-                states = _dropout_states(states, jr.fold_in(rng_key, k), srp)
-        return total_loss / K, states
+        logits_flat, new_states = forward_train_chunked(
+            base_xlstm, p, inputs, layer_states, num_heads, block_map, stride_map)
+        logits = _reshape_logits(logits_flat, oh, ob)
+        loss = sum(
+            training_loss(logits[..., h, :], targets[..., h], use_agd, agd_detach)
+            for h in range(oh)
+        ) / oh
+        return loss, new_states
 
     (loss, new_states), grads = jax.value_and_grad(loss_fn, has_aux=True)(params)
     return loss, grads, new_states
@@ -878,238 +771,40 @@ def sinkgd_update(state, grads, params, lr, weight_decay=0.0, max_norm=1.0, L=1)
 # ============================================================================
 
 def cross_entropy_loss(logits, targets):
-    log_probs   = jax.nn.log_softmax(logits, axis=-1)
-    loss_per_tok= -jnp.take_along_axis(log_probs, jnp.maximum(targets, 0)[...,None], axis=-1)[...,0]
-    mask        = (targets >= 0).astype(jnp.float32)   # -1 padding; handles all binary files
-    return (loss_per_tok*mask).sum() / (mask.sum()+1e-8)
-
-def argmax_margin_loss(logits, targets, margin=1.0):
-    safe_tgt      = jnp.maximum(targets, 0)
-    target_logits = jnp.take_along_axis(logits, safe_tgt[..., None], axis=-1)[..., 0]
-    neg_inf       = jax.nn.one_hot(safe_tgt, logits.shape[-1]) * 1e9
-    best_wrong    = (logits - neg_inf).max(axis=-1)
-    loss_per_tok  = jnp.maximum(0.0, best_wrong - target_logits + margin)
-    mask          = (targets >= 0).astype(jnp.float32)
+    log_probs    = jax.nn.log_softmax(logits, axis=-1)
+    loss_per_tok = -jnp.take_along_axis(log_probs, targets[..., None], axis=-1)[..., 0]
+    mask         = (targets != PAD_TOKEN).astype(jnp.float32)
     return (loss_per_tok * mask).sum() / (mask.sum() + 1e-8)
 
-def training_loss(logits, targets, margin=1.0, ce_weight=0.05):
-    if margin == 0.0:
-        return cross_entropy_loss(logits, targets)
-    ce = cross_entropy_loss(logits, targets)
-    mg = argmax_margin_loss(logits, targets, margin)
-    return mg + ce_weight * ce
+def agd_loss(logits, targets, detach_weights=True):
+    """Arithmetic Gradient Descent loss. Works with any leading batch dims.
+
+    logits:  [..., T, V]
+    targets: [..., T]
+    """
+    log_probs_full = jax.nn.log_softmax(logits, axis=-1)           # [..., T, V]
+    log_probs = jnp.take_along_axis(
+        log_probs_full, targets[..., None], axis=-1)[..., 0]       # [..., T]
+
+    src = jax.lax.stop_gradient(log_probs) if detach_weights else log_probs
+    # cumsum along time axis (last axis)
+    log_I        = jnp.cumsum(src, axis=-1)
+    neg_log_I    = -log_I
+    log_weights  = neg_log_I - jax.nn.logsumexp(neg_log_I, axis=-1, keepdims=True)
+    weights      = jnp.exp(log_weights)                            # [..., T], sums to 1
+
+    mask = (targets != PAD_TOKEN).astype(jnp.float32)
+    return (weights * (-log_probs) * mask).sum() / (mask.sum() + 1e-8)
+
+def training_loss(logits, targets, use_agd=False, agd_detach=True):
+    if use_agd:
+        return agd_loss(logits, targets, detach_weights=agd_detach)
+    return cross_entropy_loss(logits, targets)
 
 
 # ============================================================================
 # Data helpers
 # ============================================================================
-
-def _quantize_cdf(logits_1d):
-    """[V] float32 → [V+1] int32 cumulative freqs, sum = 1<<RC_PREC.
-    Min freq = 1 (no zero-prob symbol).  Deterministic; safe under jax.vmap.
-
-    Deficit is absorbed into the largest-freq entry only (not element-wise
-    maximum), so the sum stays exactly M even in pathological distributions.
-    """
-    M     = jnp.int32(1 << RC_PREC)
-    probs = jax.nn.softmax(logits_1d.astype(jnp.float32))
-    freqs = jnp.maximum(jnp.int32(1), jnp.round(probs * M).astype(jnp.int32))
-    # absorb rounding error into the largest entry only — keeps sum == M
-    deficit  = M - freqs.sum()
-    max_idx  = jnp.argmax(freqs).astype(jnp.int32)
-    adjusted = jnp.maximum(jnp.int32(1), freqs[max_idx] + deficit)
-    freqs    = freqs.at[max_idx].set(adjusted)
-    cumfreqs = jnp.zeros(logits_1d.shape[0] + 1, jnp.int32)
-    cumfreqs = cumfreqs.at[1:].set(jnp.cumsum(freqs))
-    # Hard-force last entry = M regardless of any rounding residual (defensive)
-    cumfreqs = cumfreqs.at[-1].set(M)
-    return cumfreqs   # [V+1] int32, cumfreqs[-1] == M exactly
-
-
-def _cdf_ok(cumfreqs):
-    """Layer-2 health check: returns True iff cumfreqs[-1] == M and all diffs > 0.
-    JIT-compatible; use under jax.vmap for per-position checks.
-    """
-    M = jnp.int32(1 << RC_PREC)
-    sum_ok  = cumfreqs[-1] == M
-    mono_ok = jnp.all(cumfreqs[1:] > cumfreqs[:-1])   # strictly increasing
-    return sum_ok & mono_ok
-
-
-# ============================================================================
-# Pure JAX range coder — 64-bit (low, high) canonical coder.
-#
-# scale(range, f) = range * f // M  without u128:
-#   split range = rhi*2^32 + rlo, then
-#   range*f//2^16 = (rhi*f)<<16 + (rlo*f)>>16
-#   All intermediate products fit in uint64 (max 2^48, shifts within 2^64).
-#
-# Encoder: lax.scan over T symbols, unrolled 8-step flush loop.
-# Decoder: lax.scan over T CDFs, reading from fixed-length padded byte buffer.
-# Both are JIT-compiled and produce identical output to rc_codec.c.
-# ============================================================================
-
-_U64 = jnp.uint64
-_U32 = jnp.uint32
-_U8  = jnp.uint8
-_UINT64_MAX = _U64(0xFFFFFFFFFFFFFFFF)
-
-
-def _rc_scale(range_u64, f):
-    """range * f // M in pure uint64.  Inlined into scan bodies — not jitted alone."""
-    rhi = (range_u64 >> _U64(32)).astype(_U64)
-    rlo = (range_u64 & _U64(0xFFFFFFFF)).astype(_U64)
-    f64 = f.astype(_U64)
-    return (rhi * f64 << _U64(16)) + (rlo * f64 >> _U64(16))
-
-
-@functools.partial(jax.jit, static_argnames=["T", "V"])
-def rc_encode_jax(symbols: jnp.ndarray, all_cumfreqs: jnp.ndarray,
-                  T: int, V: int) -> tuple:
-    """Encode T symbols with per-position CDFs.
-
-    symbols:       [T] int32
-    all_cumfreqs:  [T, V+1] int32
-    Returns: (buf [T*3+8] uint8, n_bytes int32)
-    """
-    max_buf = T * 3 + 8
-
-    def _flush_once(carry):
-        low, high, buf, pos = carry
-        agreed = (low >> _U64(56)) == (high >> _U64(56))
-        byte   = (low >> _U64(56)).astype(_U8)
-        buf    = jax.lax.cond(agreed, lambda b: b.at[pos].set(byte), lambda b: b, buf)
-        pos    = jax.lax.cond(agreed,
-                              lambda p: p + jnp.int32(1), lambda p: p, pos)
-        low    = jax.lax.cond(agreed,
-                              lambda l: (l << _U64(8)).astype(_U64), lambda l: l, low)
-        high   = jax.lax.cond(agreed,
-                              lambda h: ((h << _U64(8)) | _U64(0xFF)).astype(_U64),
-                              lambda h: h, high)
-        return low, high, buf, pos
-
-    def encode_step(carry, inputs):
-        low, high, buf, pos = carry
-        sym, cf = inputs
-        sym64  = sym.astype(_U64)
-        cum_lo = cf[sym64].astype(_U64)
-        cum_hi = cf[sym64 + _U64(1)].astype(_U64)
-        range_ = (high - low + _U64(1)).astype(_U64)
-        high   = (low + _rc_scale(range_, cum_hi) - _U64(1)).astype(_U64)
-        low    = (low + _rc_scale(range_, cum_lo)).astype(_U64)
-        # unrolled flush: at most 8 agreed top-bytes per symbol
-        s = (low, high, buf, pos)
-        for _ in range(8):
-            s = _flush_once(s)
-        return s, None
-
-    # Init: high = UINT64_MAX-1 so range = UINT64_MAX fits in uint64 (avoids 2^64 overflow).
-    buf  = jnp.zeros(max_buf, _U8)
-    init = (_U64(0), _UINT64_MAX - _U64(1), buf, jnp.int32(0))
-    (low, _high, buf, pos), _ = jax.lax.scan(
-        encode_step, init,
-        (symbols.astype(jnp.int32), all_cumfreqs.astype(jnp.int32)))
-
-    # flush 8 tail bytes
-    for _ in range(8):
-        buf = buf.at[pos].set((low >> _U64(56)).astype(_U8))
-        pos = pos + jnp.int32(1)
-        low = (low << _U64(8)).astype(_U64)
-
-    return buf, pos
-
-
-@functools.partial(jax.jit, static_argnames=["T", "V"])
-def rc_decode_jax(buf: jnp.ndarray, all_cumfreqs: jnp.ndarray,
-                  T: int, V: int) -> jnp.ndarray:
-    """Decode T symbols from byte buffer using per-position CDFs.
-
-    buf:           [T*3+8] uint8  (padded with zeros if stream is shorter)
-    all_cumfreqs:  [T, V+1] int32
-    Returns: [T] int32 decoded symbols
-    """
-    # init code from first 8 bytes
-    code = _U64(0)
-    for i in range(8):
-        code = (code << _U64(8)) | buf[i].astype(_U64)
-
-    def _refill_once(state):
-        low, high, code_, pos = state
-        agreed = (low >> _U64(56)) == (high >> _U64(56))
-        byte   = buf[pos].astype(_U64)
-        low    = jax.lax.cond(agreed,
-                              lambda l: (l << _U64(8)).astype(_U64), lambda l: l, low)
-        high   = jax.lax.cond(agreed,
-                              lambda h: ((h << _U64(8)) | _U64(0xFF)).astype(_U64),
-                              lambda h: h, high)
-        code_  = jax.lax.cond(agreed,
-                               lambda c: ((c << _U64(8)) | byte).astype(_U64),
-                               lambda c: c, code_)
-        pos    = jax.lax.cond(agreed,
-                              lambda p: p + jnp.int32(1), lambda p: p, pos)
-        return low, high, code_, pos
-
-    def decode_step(carry, cf):
-        low, high, code_, pos = carry
-        range_ = (high - low + _U64(1)).astype(_U64)
-        cf64   = cf.astype(_U64)
-
-        # Binary search: largest sym where low + scale(range, cf[sym]) <= code_
-        def bsearch_body(state):
-            lo, hi = state
-            mid      = (lo + hi + _U64(1)) >> _U64(1)
-            boundary = low + _rc_scale(range_, cf64[mid])
-            lo = jnp.where(boundary <= code_, mid, lo)
-            hi = jnp.where(boundary <= code_, hi, mid - _U64(1))
-            return lo, hi
-
-        sym, _ = jax.lax.while_loop(
-            lambda s: s[0] < s[1],
-            bsearch_body,
-            (_U64(0), _U64(V - 1)))
-
-        cum_lo = cf64[sym]
-        cum_hi = cf64[sym + _U64(1)]
-        high   = (low + _rc_scale(range_, cum_hi) - _U64(1)).astype(_U64)
-        low    = (low + _rc_scale(range_, cum_lo)).astype(_U64)
-
-        s = (low, high, code_, pos)
-        for _ in range(8):
-            s = _refill_once(s)
-
-        return s, sym.astype(jnp.int32)
-
-    init = (_U64(0), _UINT64_MAX - _U64(1), code, jnp.int32(8))
-    _, syms = jax.lax.scan(decode_step, init, all_cumfreqs.astype(jnp.int32))
-    return syms
-
-
-def rc_encode_c(symbols_np: np.ndarray, cumfreqs_np: np.ndarray) -> np.ndarray:
-    """Encode symbols → bytes using JAX JIT range coder."""
-    T, Vp1 = cumfreqs_np.shape
-    V = Vp1 - 1
-    buf, n = rc_encode_jax(
-        jnp.array(symbols_np, jnp.int32),
-        jnp.array(cumfreqs_np, jnp.int32),
-        T, V)
-    return np.array(buf[:int(n)], dtype=np.uint8)
-
-
-def rc_decode_c(in_bytes: np.ndarray, cumfreqs_np: np.ndarray) -> np.ndarray:
-    """Decode bytes → symbols using JAX JIT range coder."""
-    T, Vp1 = cumfreqs_np.shape
-    V = Vp1 - 1
-    max_buf = T * 3 + 8
-    # pad buffer to fixed size for JAX
-    padded = np.zeros(max_buf, dtype=np.uint8)
-    n = min(len(in_bytes), max_buf)
-    padded[:n] = in_bytes[:n]
-    syms = rc_decode_jax(
-        jnp.array(padded, jnp.uint8),
-        jnp.array(cumfreqs_np, jnp.int32),
-        T, V)
-    return np.array(syms, dtype=np.int32)
-
 
 class ByteTokenizer:
     vocab_size = 256
@@ -1122,9 +817,8 @@ class ByteTokenizer:
         return bytes(np.array(tokens, dtype=np.uint8)).decode('utf-8', errors='replace')
 
 def load_dataset(path):
-    """Load any file as raw bytes (binary-safe, no encoding assumed)."""
-    with open(path, 'rb') as f:
-        return np.frombuffer(f.read(), dtype=np.uint8).copy()
+    with open(path, 'r', encoding='utf-8') as f:
+        return ByteTokenizer.encode(f.read())
 
 def make_chunks_and_targets(raw_bytes, config):
     toks       = bytes_to_tokens(np.asarray(raw_bytes, dtype=np.uint8), config.input_bits)
@@ -1136,8 +830,7 @@ def make_chunks_and_targets(raw_bytes, config):
     out_mask   = (1 << ob) - 1
     pad_len = num_chunks * chunk_size + oh - n
     pad_len = max(pad_len, 0)
-    # pad with -1: impossible for any uint8/nibble/bit token → safe for binary files
-    padded  = np.concatenate([toks, np.full(pad_len + oh, -1, dtype=np.int32)])
+    padded  = np.concatenate([toks, np.zeros(pad_len + oh, dtype=np.int32)])
     all_inputs  = np.stack([padded[i*chunk_size : i*chunk_size + chunk_size]
                              for i in range(num_chunks)]).astype(np.int32)
     tgt_chunks = []
@@ -1153,186 +846,6 @@ def make_chunks_and_targets(raw_bytes, config):
         tgt_chunks.append(chunk_tgts)
     all_targets = np.stack(tgt_chunks)
     return jnp.array(all_inputs, dtype=jnp.int32), jnp.array(all_targets, dtype=jnp.int32)
-
-
-# ============================================================================
-# Teacher-forced prob collection + compression eval
-# ============================================================================
-
-def collect_probs(base_xlstm, params, config, all_inputs, all_targets):
-    """Collect teacher-forced logits using _collect_chunk_jit (chunk-level lax.scan).
-
-    Correctness: _collect_chunk_jit inlines mlstm_layer_step / srnn_layer_step
-    (the same ops as _fwd_step_jit), so logits are bit-identical to the
-    decoder — RC round-trip is guaranteed OK.
-
-    Speed vs per-token _fwd_step_jit:
-      - apply_xlstm_hira called O(num_chunks) times instead of O(T)
-      - Python dispatch overhead O(T) → O(T / chunk_size)
-      - XLA can pipeline across tokens within the scan
-
-    Returns:
-      logits_np [T, V]  float32  — head-0 logits at every valid position
-      tgts_np   [T]     int32    — head-0 targets
-    """
-    stride_map = _parse_stride_map(config.stride_map, config.num_layers)
-    num_chunks = all_inputs.shape[0]
-    chunk_size = all_inputs.shape[1]
-    oh, ob     = config.output_heads, config.output_bits
-    states     = init_step_states(config, batch_size=1)
-    max_tok    = (config.max_eval_tokens if config.max_eval_tokens > 0
-                  else num_chunks * chunk_size)
-    logits_list, tgts_list = [], []
-    processed = 0
-    pbar = tqdm(total=max_tok, desc="collect probs", unit="tok",
-                leave=False, file=sys.stderr)
-    for ci in range(num_chunks):
-        if processed >= max_tok:
-            break
-        this_size = min(chunk_size, max_tok - processed)
-        for pos in range(this_size):
-            tok = jnp.array([int(all_inputs[ci, pos])], jnp.int32)
-            # size=1: same static arg as decompressor → identical XLA → bit-exact CDFs.
-            # Different static chunk_size values compile to different XLA programs with
-            # different floating-point behavior even for the same inputs.
-            lf, states = _collect_chunk_jit(
-                base_xlstm, params, tok, states,
-                1, config.num_heads, config.block_map, stride_map, oh, ob)
-            logits_list.append(np.array(lf[0], np.float32))
-            tgts_list.append(int(all_targets[ci, pos, 0]))
-            processed += 1
-            pbar.update(1)
-            if processed >= max_tok:
-                break
-    pbar.close()
-    return np.stack(logits_list), np.array(tgts_list, np.int32)
-
-
-def eval_compression(base_xlstm, params, config, all_inputs, all_targets,
-                     n_raw_bytes, label=""):
-    """
-    Measure lossless compression via range coding.  Prints two lines:
-
-      [compression it=100]  0.3s  param=99328B  eval all 561 bytes  argmax: 558/561 correct (99.5%)  OK
-        CE=0.0281bpb  rc=0.0854bpb(6B)  p+rc=0.006x(99334B)
-
-    CE   — Shannon entropy lower bound: sum(-log2 p(token_t)) / 8.
-           The range coder cannot produce fewer bytes than this.
-    rc   — Actual range-coded stream size. Should be ≈ CE.
-           "OK" = round-trip decode verified exact. "FAIL" = encoding bug.
-    p+rc — Compressed file size: trainable params + rc stream.
-           ratio > 1x means the file actually shrank; this is the metric.
-
-    argmax N/T: N tokens the model predicts correctly (teacher-forced argmax).
-    As accuracy → 100%, CE → 0 and the rc stream → 0 bytes.
-
-    BPB = (bytes × 8) / n_raw_bytes   (bits per raw input byte, lower = better)
-    """
-    t0 = time.perf_counter()
-
-    # ── trainable param size ─────────────────────────────────────────────────
-    param_bytes = sum(
-        np.prod(p.shape) * np.dtype(DTYPE).itemsize
-        for p in jax.tree_util.tree_leaves(params))
-
-    # ── collect teacher-forced logits ────────────────────────────────────────
-    logits_np, tgts_np = collect_probs(base_xlstm, params, config, all_inputs, all_targets)
-    T     = len(tgts_np)
-    V     = 1 << config.output_bits
-
-    # strip padding positions (-1 sentinel covers all file types including binary)
-    valid = tgts_np >= 0
-    vlog  = logits_np[valid]     # [T_v, V]
-    vtgt  = tgts_np[valid]       # [T_v]
-    T_v   = int(valid.sum())
-
-    # ── CE lower bound ───────────────────────────────────────────────────────
-    lp       = jax.nn.log_softmax(jnp.array(vlog), axis=-1)
-    tgt_lp   = np.array(lp)[np.arange(T_v), vtgt]
-    ce_bits  = float(-np.sum(tgt_lp) / math.log(2))
-    ce_bpb   = ce_bits / n_raw_bytes
-
-    # ── argmax accuracy ──────────────────────────────────────────────────────
-    preds    = np.argmax(vlog, axis=-1)
-    wrong    = preds != vtgt
-    n_wrong  = int(wrong.sum())
-    acc      = (T_v - n_wrong) / max(T_v, 1)
-
-    # ── quantize all CDFs (JAX JIT, token by token to stay memory-safe) ─────────
-    _qcdf_jit   = jax.jit(_quantize_cdf)
-    _cdf_ok_jit = jax.jit(_cdf_ok)
-
-    cdf_all_ok  = True
-    n_bad_cdf   = 0
-    cumfreqs_np = np.empty((T_v, V + 1), dtype=np.int32)
-
-    pbar_cdf = tqdm(total=T_v, desc="quantize CDFs", unit="tok",
-                    leave=False, file=sys.stderr)
-    for i in range(T_v):
-        cf = _qcdf_jit(jnp.array(vlog[i]))
-        cumfreqs_np[i] = np.array(cf, np.int32)
-        if not bool(_cdf_ok_jit(cf)):
-            cdf_all_ok = False; n_bad_cdf += 1
-        pbar_cdf.update(1)
-    pbar_cdf.close()
-    if not cdf_all_ok:
-        print(f'  [WARN] {n_bad_cdf}/{T_v} CDF positions invalid (sum≠M or non-monotone)')
-
-    # ── range-encode via rc_codec.c (ctypes) ─────────────────────────────────
-    print("  encode (rc_codec.c)...", end=" ", flush=True)
-    rc_np    = rc_encode_c(vtgt, cumfreqs_np)
-    rc_bytes = len(rc_np)
-    print(f"{rc_bytes}B")
-
-    # seed token: first raw input byte (stored separately for decompressor)
-    seed_token = int(all_inputs[0][0])
-
-    # Layer 3: stream-size sanity check
-    ce_bytes_expected = ce_bits / 8
-    if ce_bytes_expected > 10 and abs(rc_bytes - ce_bytes_expected) / ce_bytes_expected > 0.15:
-        print(f'  [WARN] RC stream size anomaly: expected ≈{ce_bytes_expected:.0f}B '
-              f'got {rc_bytes}B ({rc_bytes/ce_bytes_expected:.2f}×)')
-
-    # ── verify round-trip via rc_codec.c decoder ─────────────────────────────
-    print("  verify (rc_codec.c)...", end=" ", flush=True)
-    decoded_all = rc_decode_c(rc_np, cumfreqs_np)
-    decode_ok   = bool(np.all(decoded_all == vtgt))
-    rt_note     = ""
-    print("OK" if decode_ok else "FAIL")
-
-    # Residual schemes (commented out — both misleading or strictly worse than p+rc):
-    # p+raw:      n_wrong × 4B (positions + tokens). Worse than p+rc unless accuracy >99.9%.
-    # p+resid(rc): range-code corrections only, but omits position index storage
-    #              (~log₂(T) bits × n_wrong). Adding that overhead makes it worse than p+rc.
-    # The only correct lossless scheme to report is p+rc.
-
-    elapsed = time.perf_counter() - t0
-
-    tot_rc = param_bytes + rc_bytes
-
-    def _r(total): return n_raw_bytes / total if total > 0 else float('inf')
-    def _bpb(bits): return bits / n_raw_bytes
-
-    hdr  = f"[compression{' ' + label if label else ''}]"
-    rt   = ('OK' + rt_note) if decode_ok else ('FAIL' + rt_note)
-    eval_note = (f"eval all {n_raw_bytes} bytes"
-                 if T_v >= n_raw_bytes - 1
-                 else f"eval first {T_v} of {n_raw_bytes} bytes")
-    print(f"\n{hdr}  {elapsed:.1f}s  param={param_bytes}B  {eval_note}"
-          f"  argmax: {T_v-n_wrong}/{T_v} correct ({acc:.1%})  {rt}")
-    print(f"  CE={ce_bpb:.4f}bpb  rc={_bpb(rc_bytes*8):.4f}bpb({rc_bytes}B)"
-          f"  p+rc={_r(tot_rc):.3f}x({tot_rc}B)")
-
-    return dict(
-        ce_bits=ce_bits, ce_bpb=ce_bpb,
-        rc_bytes=rc_bytes, rc_bpb=_bpb(rc_bytes * 8),
-        rc_np=rc_np,       seed_token=seed_token,
-        T_valid=T_v,       n_raw_bytes=n_raw_bytes,
-        param_bytes=param_bytes,
-        total_rc=tot_rc,   ratio_rc=_r(tot_rc),
-        n_wrong=n_wrong,   argmax_acc=acc,
-        decode_ok=decode_ok,
-    )
 
 
 # ============================================================================
@@ -1381,7 +894,7 @@ def eval_generative(base_xlstm, params, config, all_tokens):
     if tok_per_byte > 1:
         pred_subtoks = []
         n_pred = (n - seed_bytes) * tok_per_byte
-        for i in tqdm(range(n_pred), desc="gen", unit="tok", leave=False, file=sys.stderr):
+        for i in tqdm(range(n_pred), desc="gen", unit="tok", leave=False):
             t = seed_toks + i
             logit_flat, states = _fwd_step_jit(
                 base_xlstm, params, cur_token, states, config.num_heads,
@@ -1394,7 +907,7 @@ def eval_generative(base_xlstm, params, config, all_tokens):
     else:
         gen_bytes_tail = []
         _pbar = tqdm(range(seed_bytes, n), desc="gen", unit="B", unit_scale=True,
-                     leave=False, file=sys.stderr)
+                     leave=False)
         for byte_idx in _pbar:
             t = byte_idx
             logit_flat, states = _fwd_step_jit(
@@ -1505,77 +1018,6 @@ def eval_segments_stateful(base_xlstm, params, config, seg_list):
 # Checkpoint
 # ============================================================================
 
-def save_checkpoint_params(ckpt_dir, params, config):
-    """Save params + config only — no rc_stream (used for mid-training snapshots).
-    Safe to call with a partial eval (max_eval_tokens < n_raw_bytes).
-    """
-    import json, pickle
-    os.makedirs(ckpt_dir, exist_ok=True)
-    with open(os.path.join(ckpt_dir, "params.pkl"), "wb") as f:
-        pickle.dump(jax.tree_util.tree_map(np.array, params), f)
-    with open(os.path.join(ckpt_dir, "config.json"), "w") as f:
-        json.dump(config._asdict(), f, indent=2)
-
-
-def save_compressed(ckpt_dir, cstats, params, config):
-    """Save a complete decompressible bundle.  Only call when cstats covers the
-    FULL file (max_eval_tokens=0 or T_valid == n_raw_bytes), otherwise the
-    rc_stream would be for a prefix only and the decompressor would recover
-    fewer bytes than the original file.
-
-    Bundle layout:
-      config.json      — full Config dict (architecture + seed)
-      params.pkl       — HiRA adapter weights as numpy arrays
-      rc_stream.bin    — range-coded bytes covering ALL T_valid tokens
-      meta.json        — {n_raw_bytes, T_valid, seed_token, rc_bytes, …}
-
-    The decompressor reconstructs the frozen base model from the seed
-    (deterministic), restores HiRA from params.pkl, reads seed_token as the
-    first model input, then AR-decodes T_valid tokens from rc_stream.bin.
-    """
-    import json, pickle
-    # T_valid == n_raw_bytes - 1 is the correct "full file" case:
-    # the seed byte (token[0]) is stored separately; T_valid predictions cover bytes [1..end].
-    if cstats["T_valid"] < cstats["n_raw_bytes"] - 1:
-        raise ValueError(
-            f"save_compressed: T_valid={cstats['T_valid']} < "
-            f"n_raw_bytes-1={cstats['n_raw_bytes']-1}. "
-            "Run eval_compression with max_eval_tokens=0 (full file) before saving.")
-    os.makedirs(ckpt_dir, exist_ok=True)
-    # range-coded stream
-    with open(os.path.join(ckpt_dir, "rc_stream.bin"), "wb") as f:
-        f.write(bytes(cstats["rc_np"].tolist()))
-    # HiRA params
-    with open(os.path.join(ckpt_dir, "params.pkl"), "wb") as f:
-        pickle.dump(jax.tree_util.tree_map(np.array, params), f)
-    # config
-    with open(os.path.join(ckpt_dir, "config.json"), "w") as f:
-        json.dump(config._asdict(), f, indent=2)
-    # params.pkl actual on-disk size (written just above)
-    param_disk_bytes = os.path.getsize(os.path.join(ckpt_dir, "params.pkl"))
-    # Layer 4: SHA-256 of the original file bytes — decompressor verifies this
-    import hashlib
-    sha256 = hashlib.sha256(cstats["rc_np"]).hexdigest()   # of the stream itself
-    # also store sha256 of what will be decoded (seed + T_valid decoded tokens)
-    # We store the rc_stream sha256 as a stream integrity check
-    # The "original file" sha256 must be computed by the caller and passed in cstats
-    # or re-derived at decompression time. Store rc_stream sha256 for now.
-    meta = dict(
-        n_raw_bytes      = int(cstats["n_raw_bytes"]),
-        T_valid          = int(cstats["T_valid"]),
-        seed_token       = int(cstats["seed_token"]),
-        rc_bytes         = int(cstats["rc_bytes"]),
-        rc_stream_sha256 = sha256,                          # stream integrity
-        param_bytes      = int(cstats["param_bytes"]),
-        param_disk_bytes = int(param_disk_bytes),
-        input_bits       = int(config.input_bits),
-        output_bits      = int(config.output_bits),
-        output_heads     = int(config.output_heads),
-    )
-    with open(os.path.join(ckpt_dir, "meta.json"), "w") as f:
-        json.dump(meta, f, indent=2)
-
-
 def save_checkpoint(ckpt_dir, params, config, seg_idx, phase):
     import json, pickle
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -1658,13 +1100,16 @@ def _parse_config():
 def main():
     import json as _json
     _script = os.path.splitext(os.path.basename(__file__))[0]
-    log_dir = os.path.join("log", _script)
+    config, config_diff = _parse_config()
+    log_dir = config.log_dir or os.path.join("log", _script)
     os.makedirs(log_dir, exist_ok=True)
     log_path = os.path.join(log_dir, "train.log")
-    log_file = open(log_path, "w", buffering=1)
-    sys.stdout = _Tee(sys.__stdout__, log_file)
+    log_file   = open(log_path, "w", buffering=1)
+    tee_out    = _Tee(sys.__stdout__, log_file)
+    tee_err    = _Tee(sys.__stderr__, log_file)
+    sys.stdout = tee_out
+    sys.stderr = tee_err
 
-    config, config_diff = _parse_config()
     global PAD_TOKEN, DTYPE, POWER_P
     PAD_TOKEN = config.pad_token
     DTYPE     = jnp.dtype(config.dtype)
@@ -1710,10 +1155,13 @@ def main():
     print("Initialising HiRA adapters...")
     params    = init_randcompress_params(k_rc, config)
     trainable = sum(np.prod(p.shape) for p in jax.tree_util.tree_leaves(params))
-    total        = frozen_n + trainable
-    dtype_bytes  = np.dtype(DTYPE).itemsize
-    param_bytes  = trainable * dtype_bytes
-    param_ratio  = n_total / param_bytes if param_bytes > 0 else float('inf')
+    total          = frozen_n + trainable
+    dtype_bytes    = np.dtype(DTYPE).itemsize
+    param_bytes      = trainable * dtype_bytes
+    residual_bytes   = int(config.residual_budget * n_total)
+    total_coded_bytes = param_bytes + residual_bytes
+    compress_ratio   = n_total / param_bytes
+    compress_ratio_r = n_total / total_coded_bytes
     print(f"{'metric':<28}  {'value':>12}")
     print(f"{'-'*28}  {'-'*12}")
     print(f"{'frozen params':<28}  {frozen_n/1e6:>11.3f}M")
@@ -1723,9 +1171,12 @@ def main():
     print(f"{'---':<28}  {'---':>12}")
     print(f"{'dtype':<28}  {jnp.dtype(DTYPE).name:>12}")
     print(f"{'trainable param bytes':<28}  {param_bytes/1e6:>11.3f}M")
+    print(f"{'residual budget bytes':<28}  {residual_bytes/1e6:>11.3f}M  ({config.residual_budget*100:.1f}% of data)")
+    print(f"{'total coded bytes':<28}  {total_coded_bytes/1e6:>11.3f}M  (params + residual)")
     print(f"{'dataset bytes':<28}  {n_total/1e6:>11.3f}M")
-    print(f"{'param compression ratio':<28}  {param_ratio:>11.2f}x"
-          f"  {'(params alone < file)' if param_ratio > 1 else '(over-param)'}")
+    print(f"{'compression ratio (params)':<28}  {compress_ratio:>11.2f}x")
+    print(f"{'compression ratio (+ residual)':<28}  {compress_ratio_r:>11.2f}x")
+    print(f"{'compressed?':<28}  {'yes' if compress_ratio_r > 1 else 'no (over-param)':>12}")
 
     opt_state = sinkgd_init(params)
     lr        = config.learning_rate
@@ -1734,96 +1185,153 @@ def main():
     budget_bytes    = int(config.residual_budget * (n_total - 1))
     max_entries     = budget_bytes // bytes_per_entry
 
-    all_inputs, all_targets = make_chunks_and_targets(raw_bytes, config)
-    num_chunks = all_inputs.shape[0]
-
-    K = config.grad_accum_steps
-    print(f"Chunks: {num_chunks} × {all_inputs.shape[1]} tokens")
-    print(f"max_iters={config.max_iters}  check_every={config.check_every}  "
-          f"grad_accum_steps={K}  state_reset_prob={config.state_reset_prob}  lr={lr}")
+    segs   = split_segments(raw_bytes, config.segment_size)
+    n_segs = len(segs)
+    print(f"Curriculum segments: {n_segs} × up to {config.segment_size} bytes")
+    print(f"max_iter_per_phase={config.max_iter_per_phase}  check_every={config.check_every}  lr={lr}")
+    print(f"Residual budget: {budget_bytes} bytes  ({max_entries} correction entries)")
     print()
 
-    # ── step-0 baseline: compression with random weights ─────────────────────
-    print("Step 0 — baseline compression (random weights):")
-    eval_compression(base_xlstm, params, config, all_inputs, all_targets,
-                     n_total, label="step=0")
+    t_start      = time.perf_counter()
+    global_iters = 0
+    completed    = []     # list of byte segments that passed both phases
+    failed_seg   = None
 
-    # ── training loop: K-chunk BPTT, hidden-state dropout, stop_gradient at window boundary ──
-    states      = init_step_states(config, batch_size=1)
-    chunk_idx   = 0
-    stop_reason = None
-    rng_key     = jr.key(config.seed + 2)
-    t_start     = time.perf_counter()
+    def _tbptt_phase(phase_name, inputs, targets, eval_segs, p, opt_st):
+        """TBPTT curriculum phase. Cycles chunks in order; resets state each epoch.
+        Returns (success, iters_done, last_accs, updated_params, updated_opt_state).
+        """
+        nonlocal global_iters
+        n_chunks  = inputs.shape[0]
+        chunk_idx = 0
+        states    = init_step_states(config, batch_size=1)
+        last_accs = None
+        success   = False
+        iters_done = 0
 
-    pbar = tqdm(range(1, config.max_iters + 1), desc="train", unit="it",
-                file=sys.stderr, dynamic_ncols=True)
-    for it in pbar:
-        # Collect K sequential chunks
-        inputs_K  = jnp.stack([all_inputs [( chunk_idx + k) % num_chunks][None, :] for k in range(K)])
-        targets_K = jnp.stack([all_targets[(chunk_idx + k) % num_chunks][None, :] for k in range(K)])
-        chunk_idx = (chunk_idx + K) % num_chunks
+        pbar = tqdm(range(1, config.max_iter_per_phase + 1), desc=phase_name,
+                    unit="it", dynamic_ncols=True)
+        for it in pbar:
+            if chunk_idx == 0:                          # epoch boundary → reset state
+                states = init_step_states(config, batch_size=1)
 
-        # stop_gradient only at the window boundary (between optimizer steps)
-        boundary_states = jax.lax.stop_gradient(states)
-        rng_key, subkey = jr.split(rng_key)
-        loss, grads, states = grad_accum_persistent(
-            base_xlstm, params, inputs_K, targets_K, boundary_states, subkey, config, K)
-        params, opt_state = sinkgd_update(
-            opt_state, grads, params, lr=lr,
-            weight_decay=config.weight_decay, max_norm=config.grad_clip_norm,
-            L=config.sinkgd_l)
+            inp = inputs [chunk_idx][None, :]
+            tgt = targets[chunk_idx][None, :]
+            chunk_idx = (chunk_idx + 1) % n_chunks
 
-        # CE in nats/token → bits/byte: divide by ln2, multiply by tokens_per_byte
-        bpb = float(loss) / math.log(2) * (8 // config.input_bits)
-        pbar.set_postfix(loss=f"{float(loss):.5f}", bpb=f"{bpb:.4f}")
+            frozen_sg = jax.lax.stop_gradient(states)
+            loss, grads, states = grad_chunk_persistent(
+                base_xlstm, p, inp, tgt, frozen_sg, config)
+            p, opt_st = sinkgd_update(
+                opt_st, grads, p, lr=lr,
+                weight_decay=config.weight_decay, max_norm=config.grad_clip_norm,
+                L=config.sinkgd_l)
+            global_iters += 1
+            iters_done    = it
 
-        if it % config.check_every == 0 or it == config.max_iters:
-            elapsed = time.perf_counter() - t_start
-            print(f"\n[it={it:6d}] train_bpb={bpb:.4f}  {elapsed:.0f}s")
-            # monitoring eval: respects max_eval_tokens (fast prefix snapshot)
-            cstats = eval_compression(base_xlstm, params, config, all_inputs, all_targets,
-                                      n_total, label=f"it={it}")
-            ckpt_it = os.path.join(log_dir, f"ckpt_it{it:06d}")
-            if config.save_ckpt:
-                # full eval over entire file for a valid compressed bundle
-                full_config = config._replace(max_eval_tokens=0)
-                full_cstats = eval_compression(base_xlstm, params, full_config,
-                                               all_inputs, all_targets, n_total,
-                                               label=f"it={it} full")
-                save_compressed(ckpt_it, full_cstats, params, config)
-            else:
-                save_checkpoint_params(ckpt_it, params, config)
+            bpb = float(loss) / math.log(2) * (8 // config.input_bits)
+            pbar.set_postfix(loss=f"{float(loss):.4f}", bpb=f"{bpb:.3f}")
 
-            bpb_done = config.target_bpb > 0 and cstats["rc_bpb"] < config.target_bpb
-            if bpb_done:
-                stop_reason = f"target_bpb (rc_bpb={cstats['rc_bpb']:.4f} < {config.target_bpb})"
-                print(f"[STOP] {stop_reason}")
-                pbar.close()
-                break
-    else:
-        pbar.close()
+            if it % config.check_every == 0 or it == config.max_iter_per_phase:
+                accs      = eval_segments_stateful(base_xlstm, p, config, eval_segs)
+                last_accs = accs
+                min_acc   = min(a for a, _ in accs)
+                fw_str    = next((str(fw) for _, fw in accs if fw is not None), "ok")
+                print()
+                pbar.set_description(f"{phase_name} acc={min_acc:.1%} fw={fw_str}")
+                if all(a == 1.0 for a, _ in accs):
+                    success = True
+                    pbar.close()
+                    break
+        else:
+            pbar.close()
 
+        return success, iters_done, last_accs, p, opt_st
+
+    for seg_idx, seg in enumerate(segs):
+        t_seg   = time.perf_counter()
+        byte_lo = seg_idx * config.segment_size
+        print(f"\nSEGMENT {seg_idx+1}/{n_segs}  bytes [{byte_lo}, {byte_lo+len(seg)})  len={len(seg)}")
+
+        # ── SOLO phase ────────────────────────────────────────────────────────
+        seg_inp, seg_tgt = make_chunks_and_targets(seg, config)
+        print(f"[SOLO]     chunks={seg_inp.shape[0]}  budget={config.max_iter_per_phase}")
+        solo_ok, solo_iters, solo_accs, params, opt_state = _tbptt_phase(
+            f"solo s{seg_idx+1}", seg_inp, seg_tgt, [seg], params, opt_state)
+
+        acc_s  = solo_accs[0][0] if solo_accs else 0.0
+        fw_s   = solo_accs[0][1] if solo_accs else None
+        fw_str = f"byte {fw_s}" if fw_s is not None else "ok"
+        elapsed = time.perf_counter() - t_seg
+        if solo_ok:
+            print(f"[PASS] solo  seg{seg_idx+1}  acc=100%  iters={solo_iters}  {elapsed:.1f}s")
+        else:
+            print(f"[FAIL] solo  seg{seg_idx+1}  acc={acc_s:.2%}  first_wrong={fw_str}"
+                  f"  iters={solo_iters}  {elapsed:.1f}s")
+            failed_seg = seg_idx + 1
+            break
+
+        completed.append(seg)
+
+        if len(completed) == 1:
+            continue     # no COMBINED phase for the very first segment
+
+        # ── COMBINED phase ────────────────────────────────────────────────────
+        combined = np.concatenate(completed)
+        comb_inp, comb_tgt = make_chunks_and_targets(combined, config)
+        n_done = len(completed)
+        print(f"[COMBINED] segs 1..{n_done}  chunks={comb_inp.shape[0]}  budget={config.max_iter_per_phase}")
+        comb_ok, comb_iters, comb_accs, params, opt_state = _tbptt_phase(
+            f"comb 1..{n_done}", comb_inp, comb_tgt, completed, params, opt_state)
+
+        min_acc = min(a for a, _ in comb_accs) if comb_accs else 0.0
+        elapsed = time.perf_counter() - t_seg
+        if comb_ok:
+            print(f"[PASS] comb  1..{n_done}  acc=100%  iters={comb_iters}  {elapsed:.1f}s")
+        else:
+            print(f"[FAIL] comb  1..{n_done}  min_acc={min_acc:.2%}"
+                  f"  iters={comb_iters}  {elapsed:.1f}s")
+            failed_seg = seg_idx + 1
+            break
+
+        save_checkpoint(os.path.join(log_dir, "ckpt_last"), params, config, seg_idx, "combined")
+
+    # ── summary ───────────────────────────────────────────────────────────────
     elapsed_total = time.perf_counter() - t_start
-    if stop_reason is None:
-        stop_reason = f"max_iters ({config.max_iters})"
-        print(f"\n[STOP] {stop_reason}  elapsed={elapsed_total:.1f}s")
+    stop_reason   = (f"FAIL at segment {failed_seg}" if failed_seg is not None
+                     else f"all {n_segs} segments mastered")
+    print(f"\n[STOP] {stop_reason}  total_iters={global_iters}  elapsed={elapsed_total:.1f}s")
 
-    # ── final compression eval + checkpoint (full file, no token limit) ──────
-    print("\nFinal compression eval (full file)...")
-    full_config = config._replace(max_eval_tokens=0)   # override: encode all tokens
-    cstats      = eval_compression(base_xlstm, params, full_config, all_inputs, all_targets,
-                                   n_total, label="final")
+    print("\nFinal generative eval...")
+    gen_out, gen_wrong, gen_acc, gen_fw, residual = eval_generative(
+        base_xlstm, params, config, raw_bytes)
+    gen_fw_str  = f"byte {gen_fw}" if gen_fw is not None else "none (perfect)"
+    residual_kb = len(residual) * bytes_per_entry / 1024
+    print(f"  gen_wrong={gen_wrong}  gen_acc={gen_acc:.4%}  first_wrong={gen_fw_str}")
+    print(f"  corrections={len(residual)} entries  {residual_kb:.2f} KB  "
+          f"budget={max_entries} entries ({budget_bytes} bytes)")
+    print(f"  reconstructable={'YES' if gen_wrong <= max_entries else 'NO'}")
+
+    gen_path = os.path.join(log_dir, "gen_final.txt")
+    full_gen  = np.concatenate([[raw_bytes[0]], gen_out])
+    with open(gen_path, "w", encoding="utf-8", errors="replace") as gf:
+        gf.write(f"stop_reason:  {stop_reason}\n"
+                 f"gen_wrong:    {gen_wrong}\n"
+                 f"gen_acc:      {gen_acc:.4%}\n"
+                 f"first_wrong:  {gen_fw_str}\n"
+                 f"corrections:  {len(residual)} entries  {residual_kb:.2f} KB\n"
+                 f"budget:       {max_entries} entries  {budget_bytes} bytes\n"
+                 f"\n--- target ---\n{ByteTokenizer.decode(raw_bytes)}\n"
+                 f"\n--- generated ---\n{ByteTokenizer.decode(full_gen)}\n")
+
     ckpt_dir = os.path.join(log_dir, "ckpt_last")
-    save_compressed(ckpt_dir, cstats, params, config)   # guard raises if T_valid < n_raw
-
-    import json as _js, pickle as _pk
-    with open(os.path.join(ckpt_dir, "compression.json"), "w") as f:
-        _js.dump({k: (v if isinstance(v, (int, float, bool, str)) else str(v))
-                  for k, v in cstats.items()}, f, indent=2)
+    save_checkpoint(ckpt_dir, params, config, 0, "final")
+    _save_residual(ckpt_dir, residual)
 
     print(f"\nLog: {log_path}")
     log_file.close()
     sys.stdout = sys.__stdout__
+    sys.stderr = sys.__stderr__
 
 
 if __name__ == "__main__":

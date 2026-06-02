@@ -10,7 +10,7 @@ readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "Raden Muaz Munim"}]
 requires-python = ">=3.10"
-dependencies = ["jax", "tqdm", "optax"]
+dependencies = ["torch", "numpy", "tqdm"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -29,4 +29,4 @@ dev = ["zstandard", "lz4", "pytest"]
 Repository = "https://github.com/yourusername/randcompress"
 
 [tool.setuptools]
-packages = ["randcompress"]
+packages = ["randcompress", "randcompress.models"]

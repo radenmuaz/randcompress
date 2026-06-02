@@ -18,13 +18,13 @@ import os, sys, json, pickle, argparse
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(__file__))
-import linear_rnn_srp as _src
-from linear_rnn_srp import (
+import examples.old.linear_rnn_srp as _src
+from examples.old.linear_rnn_srp import (
     Config, RC_PREC, _quantize_cdf, _parse_stride_map,
     init_xlstm_params, init_step_states, _collect_chunk_jit,
     bytes_to_tokens, rc_decode_init,
 )
-from linear_rnn_srp_decompress import load_bundle, _rc_init, _rc_decode_sym
+from examples.old.linear_rnn_srp_decompress import load_bundle, _rc_init, _rc_decode_sym
 
 _RC_M = 1 << RC_PREC
 _quantize_cdf_one = jax.jit(lambda x: jax.vmap(_quantize_cdf)(x)[0])

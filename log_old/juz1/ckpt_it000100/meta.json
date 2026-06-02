@@ -1,0 +1,12 @@
+{
+  "n_raw_bytes": 44443,
+  "T_valid": 44442,
+  "seed_token": 216,
+  "rc_bytes": 9685,
+  "rc_stream_sha256": "1912b2256a3273c0c48ac3f2d096fe5207ca553a405491ab5cd2ca4c7a0c029e",
+  "param_bytes": 99328,
+  "param_disk_bytes": 100522,
+  "input_bits": 8,
+  "output_bits": 8,
+  "output_heads": 1
+}
