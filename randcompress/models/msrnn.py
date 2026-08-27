@@ -9,6 +9,10 @@ block_map chars:
 
 Frozen weights fully determine the model given seed + config.
 Adapters: HiRA (W = W₀ + W₀⊙BA) or LoRA (W = W₀ + BA), same param count.
+
+MTP (mtp_k > 1): model outputs k distributions per step using k output projections.
+Head j predicts x_{t+j+1} from state at t, without seeing x_{t+1}..x_{t+j}.
+k=1 is standard AR (no change in behaviour).
 """
 from __future__ import annotations
 
@@ -29,18 +33,15 @@ from .hira import apply_adapter, make_adapter_params, center_b, init_hira_A, ini
 def _ortho(rng: np.random.Generator, n: int, m: int, dtype) -> Tensor:
     """Return [n, m] matrix. Rows are orthonormal when n <= m."""
     if n <= m:
-        # QR of [m, n] tall matrix → Q is [m, n] with orthonormal columns
-        # Q.T is [n, m] with orthonormal rows
         raw = rng.standard_normal((m, n))
         Q, _ = np.linalg.qr(raw)
-        mat = Q.T          # [n, m], orthonormal rows
+        mat = Q.T
     else:
-        # n > m: take m orthonormal rows from [m, m] QR, pad remainder
         raw = rng.standard_normal((m, m))
         Q, _ = np.linalg.qr(raw)
-        base  = Q.T        # [m, m], orthonormal rows
+        base  = Q.T
         extra = rng.standard_normal((n - m, m)) / math.sqrt(m)
-        mat   = np.concatenate([base, extra], axis=0)  # [n, m]
+        mat   = np.concatenate([base, extra], axis=0)
     return torch.tensor(mat, dtype=dtype)
 
 
@@ -119,22 +120,16 @@ def _init_srnn_frozen(rng: np.random.Generator, d: int, dtype) -> dict[str, Tens
 
 def _mlstm_scan(fw: dict, x: Tensor, NH: int, p: int,
                 C0: Tensor | None = None) -> tuple[Tensor, Tensor]:
-    """mLSTM scan. x: [B, S, d]. Returns (out [B, S, d], C_T).
-
-    Pre-projects Q/K/V for the full sequence, then scans recurrently.
-    The Python loop is over time steps only; all per-step ops are batched.
-    """
+    """mLSTM scan. x: [B, S, d]. Returns (out [B, S, d], C_T)."""
     B, S, d = x.shape
     DH    = d // NH
     D_sym = _dsym(DH, p)
-    alpha = fw["alpha"]   # [NH]
+    alpha = fw["alpha"]
 
-    # Project all at once: [B, NH, S, DH]
     q = torch.einsum("ndi,bsi->bnsd", fw["W_q"], x)
     k = torch.einsum("ndi,bsi->bnsd", fw["W_k"], x)
     v = torch.einsum("ndi,bsi->bnsd", fw["W_v"], x)
 
-    # Feature maps for full sequence: [B, NH, S, D_sym]
     phi_q = _spow(q, p)
     phi_k = _spow(k / math.sqrt(DH), p)
 
@@ -143,14 +138,14 @@ def _mlstm_scan(fw: dict, x: Tensor, NH: int, p: int,
 
     C  = C0
     hs = []
-    a  = alpha[:, None, None]   # [NH, 1, 1] for broadcasting
+    a  = alpha[:, None, None]
     for t in range(S):
         kv    = torch.einsum("bnd,bne->bnde", phi_k[:, :, t], v[:, :, t])
         C     = a * C + kv
         h_num = torch.einsum("bnd,bnde->bne", phi_q[:, :, t], C)
         hs.append(h_num)
 
-    hs_t   = torch.stack(hs, dim=2)              # [B, NH, S, DH]
+    hs_t   = torch.stack(hs, dim=2)
     h_flat = hs_t.permute(0, 2, 1, 3).reshape(B, S, d)
     h_out  = h_flat + fw["skip"] * x
     h_norm = _multihead_layer_norm(h_out, fw["ln_w"], fw["ln_b"], NH)
@@ -181,26 +176,20 @@ def _mlstm_step(fw: dict, x_t: Tensor, C: Tensor,
 
 def _srnn_scan(fw: dict, x: Tensor,
                h0: Tensor | None = None) -> tuple[Tensor, Tensor]:
-    """sRNN scan. x: [B, S, d]. Returns (out [B, S, d], h_T).
-
-    Sequential by nature (recurrent). Uses a Python loop but pre-projects
-    all x @ W_hx.T up-front to amortize that cost.
-    """
+    """sRNN scan. x: [B, S, d]. Returns (out [B, S, d], h_T)."""
     B, S, d = x.shape
     if h0 is None:
         h0 = torch.zeros(B, d, dtype=x.dtype, device=x.device)
 
-    # Pre-project inputs without b (add b inside loop to match _srnn_step order)
-    x_proj = x @ fw["W_hx"].T   # [B, S, d]
+    x_proj = x @ fw["W_hx"].T
 
     h  = h0
     hs = []
     for t in range(S):
-        # Matches _srnn_step: (x_t @ W_hx.T + h @ W_hh.T) + b
         pre = x_proj[:, t, :] + h @ fw["W_hh"].T + fw["b"]
         h   = _layer_norm(pre, fw["ln_w"], fw["ln_b"])
         hs.append(h)
-    out = torch.stack(hs, dim=1)   # [B, S, d]
+    out = torch.stack(hs, dim=1)
     return out, h
 
 
@@ -230,7 +219,6 @@ class MsRNN(RandCompressModel):
         dt = self.dtype
         out: dict[str, Tensor] = {}
 
-        # embedding
         emb_raw = rng.standard_normal((tcfg.vocab_size, d)).astype(np.float32) * 0.01
         out["embedding"] = torch.tensor(emb_raw, dtype=dt)
 
@@ -278,9 +266,12 @@ class MsRNN(RandCompressModel):
                 for name in ("W_hx", "W_hh"):
                     _add(f"block{i}.srnn.{name}", d, d)
 
-        # output_proj: always direct param (no HiRA wrapper)
-        op_raw = rng.standard_normal((d, oh * ov)).astype(np.float32) * 0.01
-        out["output_proj"] = torch.tensor(op_raw, dtype=dt).requires_grad_(True)
+        # output projections: always direct trainable params (no HiRA wrapper)
+        # head 0 is the standard AR head; heads 1..k-1 are MTP lookahead heads
+        for j in range(cfg.mtp_k):
+            key = "output_proj" if j == 0 else f"output_proj_{j}"
+            op_raw = rng.standard_normal((d, oh * ov)).astype(np.float32) * 0.01
+            out[key] = torch.tensor(op_raw, dtype=dt).requires_grad_(True)
 
         return out
 
@@ -292,10 +283,10 @@ class MsRNN(RandCompressModel):
 
     def _eff_mlstm(self, frozen, adapters, i) -> dict[str, Tensor]:
         fw: dict[str, Tensor] = {}
+        NH, DH, d = (self.mcfg.num_heads, self.mcfg.d_model // self.mcfg.num_heads,
+                     self.mcfg.d_model)
         for k in ("W_q", "W_k", "W_v", "W_down"):
             W0 = frozen[f"block{i}.mlstm.{k}"]
-            NH, DH, d = (self.mcfg.num_heads, self.mcfg.d_model // self.mcfg.num_heads,
-                         self.mcfg.d_model)
             flat = apply_adapter(
                 W0.reshape(NH * DH, d),
                 adapters[f"block{i}.mlstm.{k}.A"],
@@ -321,31 +312,24 @@ class MsRNN(RandCompressModel):
             fw[k] = frozen[f"block{i}.srnn.{k}"]
         return fw
 
-    # ── parse stride map ──────────────────────────────────────────────────────
+    # ── stride map ────────────────────────────────────────────────────────────
 
     def _strides(self) -> list[int]:
         sm = self.mcfg.stride_map
         return [int(c) for c in sm[: self.mcfg.num_layers]]
 
-    # ── forward (chunked train) ───────────────────────────────────────────────
+    # ── shared layer loop helpers ─────────────────────────────────────────────
 
-    def forward(self, frozen, adapters, tokens: Tensor,
-                states: Any) -> tuple[Tensor, Any]:
-        cfg   = self.mcfg
-        tcfg  = self.tcfg
-        oh    = tcfg.output_heads
-        ov    = 2 ** tcfg.output_bits
+    def _layer_scan(self, frozen, adapters, x: Tensor,
+                    states: Any) -> tuple[Tensor, list]:
+        """Run all layers over sequence x [B, S, d]. Returns (x_out, new_states)."""
+        cfg = self.mcfg
         strides = self._strides()
-
-        emb = self._eff_emb(frozen, adapters)
-        x   = F.embedding(tokens, emb)              # [B, S, d]
         B, S, _ = x.shape
-
         new_states = []
         for i, (btype, stride) in enumerate(zip(cfg.block_map, strides)):
             lstm_state, _last_out = states[i]
             x_n = _layer_norm(x, frozen[f"block{i}.norm_w"], frozen[f"block{i}.norm_b"])
-
             if stride > 1:
                 x_sub = x_n[:, ::stride, :]
                 if btype == "m":
@@ -364,33 +348,19 @@ class MsRNN(RandCompressModel):
                 else:
                     fw = self._eff_srnn(frozen, adapters, i)
                     cell, new_lstm = _srnn_scan(fw, x_n, lstm_state)
-
             new_states.append((new_lstm, cell[:, -1, :]))
             x = x + cell
+        return x, new_states
 
-        x    = _layer_norm(x, frozen["final_norm_w"], frozen["final_norm_b"])
-        flat = x @ adapters["output_proj"]           # [B, S, oh*ov]
-        logits = flat.reshape(B, S, oh, ov)
-        return logits, new_states
-
-    # ── single step (AR decode) ───────────────────────────────────────────────
-
-    def step(self, frozen, adapters, token: Tensor,
-             state: Any, t: int) -> tuple[Tensor, Any]:
-        cfg     = self.mcfg
-        tcfg    = self.tcfg
-        oh      = tcfg.output_heads
-        ov      = 2 ** tcfg.output_bits
+    def _layer_step(self, frozen, adapters, x: Tensor,
+                    state: Any, t: int) -> tuple[Tensor, list]:
+        """Run all layers for single token x [B, d]. Returns (x_out, new_state)."""
+        cfg = self.mcfg
         strides = self._strides()
-
-        emb = self._eff_emb(frozen, adapters)
-        x   = F.embedding(token, emb)               # [B, d]
-
         new_state = []
         for i, (btype, stride) in enumerate(zip(cfg.block_map, strides)):
             lstm_state, last_out = state[i]
             x_n = _layer_norm(x, frozen[f"block{i}.norm_w"], frozen[f"block{i}.norm_b"])
-
             if stride == 1:
                 if btype == "m":
                     fw = self._eff_mlstm(frozen, adapters, i)
@@ -413,27 +383,173 @@ class MsRNN(RandCompressModel):
                 else:
                     new_state.append((lstm_state, last_out))
                     cell = last_out
-
             x = x + cell
+        return x, new_state
 
-        x      = _layer_norm(x, frozen["final_norm_w"], frozen["final_norm_b"])
-        flat   = x @ adapters["output_proj"]         # [B, oh*ov]
-        logits = flat.reshape(token.shape[0], oh, ov)
+    def _layer_scan_eff(self, ew: dict, x: Tensor,
+                        states: Any) -> tuple[Tensor, list]:
+        """_layer_scan using precomputed effective weights."""
+        cfg = self.mcfg
+        strides = self._strides()
+        B, S, _ = x.shape
+        new_states = []
+        for i, (btype, stride) in enumerate(zip(cfg.block_map, strides)):
+            lstm_state, _last_out = states[i]
+            x_n = _layer_norm(x, ew[f"block{i}.norm_w"], ew[f"block{i}.norm_b"])
+            if btype == "m":
+                fw = {k: ew[f"block{i}.mlstm.{k}"]
+                      for k in ("W_q", "W_k", "W_v", "W_down",
+                                "alpha", "skip", "ln_w", "ln_b")}
+            else:
+                fw = {k: ew[f"block{i}.srnn.{k}"]
+                      for k in ("W_hx", "W_hh", "b", "ln_w", "ln_b")}
+            if stride > 1:
+                x_sub = x_n[:, ::stride, :]
+                if btype == "m":
+                    cell_sub, new_lstm = _mlstm_scan(fw, x_sub, cfg.num_heads,
+                                                     cfg.power_p, lstm_state)
+                else:
+                    cell_sub, new_lstm = _srnn_scan(fw, x_sub, lstm_state)
+                cell = cell_sub.repeat_interleave(stride, dim=1)[:, :S, :]
+            else:
+                if btype == "m":
+                    cell, new_lstm = _mlstm_scan(fw, x_n, cfg.num_heads,
+                                                 cfg.power_p, lstm_state)
+                else:
+                    cell, new_lstm = _srnn_scan(fw, x_n, lstm_state)
+            new_states.append((new_lstm, cell[:, -1, :]))
+            x = x + cell
+        return x, new_states
+
+    def _layer_step_eff(self, ew: dict, x: Tensor,
+                        state: Any, t: int) -> tuple[Tensor, list]:
+        """_layer_step using precomputed effective weights."""
+        cfg = self.mcfg
+        strides = self._strides()
+        new_state = []
+        for i, (btype, stride) in enumerate(zip(cfg.block_map, strides)):
+            lstm_state, last_out = state[i]
+            x_n = _layer_norm(x, ew[f"block{i}.norm_w"], ew[f"block{i}.norm_b"])
+            if btype == "m":
+                fw = {k: ew[f"block{i}.mlstm.{k}"]
+                      for k in ("W_q", "W_k", "W_v", "W_down",
+                                "alpha", "skip", "ln_w", "ln_b")}
+            else:
+                fw = {k: ew[f"block{i}.srnn.{k}"]
+                      for k in ("W_hx", "W_hh", "b", "ln_w", "ln_b")}
+            if stride == 1:
+                if btype == "m":
+                    cell, new_lstm = _mlstm_step(fw, x_n, lstm_state,
+                                                 cfg.num_heads, cfg.power_p)
+                else:
+                    cell, new_lstm = _srnn_step(fw, x_n, lstm_state)
+                new_state.append((new_lstm, cell))
+            else:
+                if t % stride == 0:
+                    if btype == "m":
+                        cell, new_lstm = _mlstm_step(fw, x_n, lstm_state,
+                                                     cfg.num_heads, cfg.power_p)
+                    else:
+                        cell, new_lstm = _srnn_step(fw, x_n, lstm_state)
+                    new_state.append((new_lstm, cell))
+                else:
+                    new_state.append((lstm_state, last_out))
+                    cell = last_out
+            x = x + cell
+        return x, new_state
+
+    def _apply_output_heads(self, adapters, x: Tensor, B: int,
+                            S_or_none: int | None) -> Tensor:
+        """Apply k output projections to x. Returns [B, S, k, oh, ov] or [B, k, oh, ov]."""
+        cfg = self.mcfg
+        tcfg = self.tcfg
+        oh = tcfg.output_heads
+        ov = 2 ** tcfg.output_bits
+        k  = cfg.mtp_k
+        heads = []
+        for j in range(k):
+            key = "output_proj" if j == 0 else f"output_proj_{j}"
+            flat = x @ adapters[key]
+            if S_or_none is not None:
+                heads.append(flat.reshape(B, S_or_none, oh, ov))
+            else:
+                heads.append(flat.reshape(B, oh, ov))
+        # stack on the k dimension
+        dim = 2 if S_or_none is not None else 1
+        return torch.stack(heads, dim=dim)
+
+    def _apply_output_heads_eff(self, ew: dict, x: Tensor, B: int,
+                                S_or_none: int | None) -> Tensor:
+        cfg = self.mcfg
+        tcfg = self.tcfg
+        oh = tcfg.output_heads
+        ov = 2 ** tcfg.output_bits
+        k  = cfg.mtp_k
+        heads = []
+        for j in range(k):
+            key = "output_proj" if j == 0 else f"output_proj_{j}"
+            flat = x @ ew[key]
+            if S_or_none is not None:
+                heads.append(flat.reshape(B, S_or_none, oh, ov))
+            else:
+                heads.append(flat.reshape(B, oh, ov))
+        dim = 2 if S_or_none is not None else 1
+        return torch.stack(heads, dim=dim)
+
+    # ── forward (chunked train) ───────────────────────────────────────────────
+
+    def forward(self, frozen, adapters, tokens: Tensor,
+                states: Any) -> tuple[Tensor, Any]:
+        """Returns (logits [B, S, k, oh, ov], new_states). k=1 for mtp_k=1."""
+        emb = self._eff_emb(frozen, adapters)
+        x   = F.embedding(tokens, emb)
+        B, S, _ = x.shape
+
+        x, new_states = self._layer_scan(frozen, adapters, x, states)
+        x = _layer_norm(x, frozen["final_norm_w"], frozen["final_norm_b"])
+        logits = self._apply_output_heads(adapters, x, B, S)
+        return logits, new_states
+
+    # ── step_mtp: 1 token → k logit sets + state after 1 RNN step ────────────
+
+    def step_mtp(self, frozen, adapters, token: Tensor,
+                 state: Any, t: int) -> tuple[Tensor, Any]:
+        """Returns (logits [B, k, oh, ov], new_state)."""
+        emb = self._eff_emb(frozen, adapters)
+        x   = F.embedding(token, emb)
+        B   = token.shape[0]
+
+        x, new_state = self._layer_step(frozen, adapters, x, state, t)
+        x = _layer_norm(x, frozen["final_norm_w"], frozen["final_norm_b"])
+        logits = self._apply_output_heads(adapters, x, B, None)
         return logits, new_state
+
+    # ── scan_states: advance state through n tokens, no output ───────────────
+
+    def scan_states(self, frozen, adapters, tokens: Tensor,
+                    states: Any, t_start: int = 0) -> list:
+        """Process tokens [B, n] through RNN layers. Returns final states."""
+        emb = self._eff_emb(frozen, adapters)
+        x   = F.embedding(tokens, emb)
+        _, new_states = self._layer_scan(frozen, adapters, x, states)
+        return new_states
+
+    # ── step (AR compat): head 0 only ────────────────────────────────────────
+
+    def step(self, frozen, adapters, token: Tensor,
+             state: Any, t: int) -> tuple[Tensor, Any]:
+        """Returns (logits [B, oh, ov], new_state) — head 0 only (AR-compatible)."""
+        logits_k, new_state = self.step_mtp(frozen, adapters, token, state, t)
+        return logits_k[:, 0, :, :], new_state
 
     # ── precompute effective weights for fast collect ─────────────────────────
 
     def precompute_eff_weights(self, frozen, adapters) -> dict:
-        """Apply HiRA/LoRA once, return all effective weights as a flat dict.
-        Called once before the collect_logits loop; eliminates O(T) adapter math.
-        """
         cfg = self.mcfg
         ew: dict[str, Tensor] = {}
 
-        # Embedding
-        W0 = frozen["embedding"]
-        ew["embedding"] = apply_adapter(W0, adapters["emb.A"], adapters["emb.B"],
-                                        cfg.use_hira)
+        ew["embedding"] = apply_adapter(
+            frozen["embedding"], adapters["emb.A"], adapters["emb.B"], cfg.use_hira)
 
         for i, btype in enumerate(cfg.block_map):
             ew[f"block{i}.norm_w"] = frozen[f"block{i}.norm_w"]
@@ -465,57 +581,35 @@ class MsRNN(RandCompressModel):
 
         ew["final_norm_w"] = frozen["final_norm_w"]
         ew["final_norm_b"] = frozen["final_norm_b"]
-        ew["output_proj"]  = adapters["output_proj"]
+        for j in range(cfg.mtp_k):
+            key = "output_proj" if j == 0 else f"output_proj_{j}"
+            ew[key] = adapters[key]
         return ew
 
-    def step_eff(self, ew: dict, token: Tensor, state: list,
-                 t: int) -> tuple[Tensor, list]:
-        """Same as step() but uses pre-computed effective weights (no adapter math)."""
-        cfg     = self.mcfg
-        tcfg    = self.tcfg
-        oh      = tcfg.output_heads
-        ov      = 2 ** tcfg.output_bits
-        strides = self._strides()
+    # ── eff variants ──────────────────────────────────────────────────────────
 
-        x         = ew["embedding"][token]
-        new_state = []
-
-        for i, (btype, stride) in enumerate(zip(cfg.block_map, strides)):
-            lstm_state, last_out = state[i]
-            x_n = _layer_norm(x, ew[f"block{i}.norm_w"], ew[f"block{i}.norm_b"])
-
-            if btype == "m":
-                fw = {k: ew[f"block{i}.mlstm.{k}"]
-                      for k in ("W_q", "W_k", "W_v", "W_down",
-                                "alpha", "skip", "ln_w", "ln_b")}
-            else:
-                fw = {k: ew[f"block{i}.srnn.{k}"]
-                      for k in ("W_hx", "W_hh", "b", "ln_w", "ln_b")}
-
-            if stride == 1:
-                if btype == "m":
-                    cell, new_lstm = _mlstm_step(fw, x_n, lstm_state,
-                                                 cfg.num_heads, cfg.power_p)
-                else:
-                    cell, new_lstm = _srnn_step(fw, x_n, lstm_state)
-                new_state.append((new_lstm, cell))
-            else:
-                if t % stride == 0:
-                    if btype == "m":
-                        cell, new_lstm = _mlstm_step(fw, x_n, lstm_state,
-                                                     cfg.num_heads, cfg.power_p)
-                    else:
-                        cell, new_lstm = _srnn_step(fw, x_n, lstm_state)
-                    new_state.append((new_lstm, cell))
-                else:
-                    new_state.append((lstm_state, last_out))
-                    cell = last_out
-            x = x + cell
-
-        x      = _layer_norm(x, ew["final_norm_w"], ew["final_norm_b"])
-        flat   = x @ ew["output_proj"]
-        logits = flat.reshape(token.shape[0], oh, ov)
+    def step_mtp_eff(self, ew: dict, token: Tensor,
+                     state: Any, t: int) -> tuple[Tensor, Any]:
+        """step_mtp using precomputed effective weights."""
+        x   = ew["embedding"][token]
+        B   = token.shape[0]
+        x, new_state = self._layer_step_eff(ew, x, state, t)
+        x = _layer_norm(x, ew["final_norm_w"], ew["final_norm_b"])
+        logits = self._apply_output_heads_eff(ew, x, B, None)
         return logits, new_state
+
+    def scan_states_eff(self, ew: dict, tokens: Tensor,
+                        states: Any, t_start: int = 0) -> list:
+        """scan_states using precomputed effective weights."""
+        x = ew["embedding"][tokens]
+        _, new_states = self._layer_scan_eff(ew, x, states)
+        return new_states
+
+    def step_eff(self, ew: dict, token: Tensor,
+                 state: Any, t: int) -> tuple[Tensor, Any]:
+        """AR-compatible step using precomputed weights — head 0 only."""
+        logits_k, new_state = self.step_mtp_eff(ew, token, state, t)
+        return logits_k[:, 0, :, :], new_state
 
     # ── state init ────────────────────────────────────────────────────────────
 

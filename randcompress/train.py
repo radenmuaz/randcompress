@@ -47,8 +47,13 @@ class _Tee:
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
 
-def make_chunks(raw_bytes: np.ndarray, tcfg: TrainConfig):
-    """Returns (all_inputs [NC, S], all_targets [NC, S, oh]) int32 numpy."""
+def make_chunks(raw_bytes: np.ndarray, tcfg: TrainConfig, mtp_k: int = 1):
+    """Returns (all_inputs [NC, S], all_targets [NC, S, k, oh]) int32 numpy.
+
+    targets[c, s, j, h] = token at position c*S + s + j + 1 (shifted by j+1).
+    j=0 is the standard AR target; j>0 are MTP lookahead targets.
+    mtp_k=1 (default) gives targets [NC, S, 1, oh] — same data as the old [NC, S, oh].
+    """
     ib, ob, oh = tcfg.input_bits, tcfg.output_bits, tcfg.output_heads
     toks       = bytes_to_tokens(raw_bytes, ib)
     chunk_size = tcfg.segment_size * (8 // ib)
@@ -56,25 +61,28 @@ def make_chunks(raw_bytes: np.ndarray, tcfg: TrainConfig):
     out_mask   = (1 << ob) - 1
     num_chunks = max(1, math.ceil((n - 1) / chunk_size))
 
-    pad_len = max(0, num_chunks * chunk_size + oh - n)
-    padded  = np.concatenate([toks, np.zeros(pad_len + oh, dtype=np.int32)])
+    # extra padding: mtp_k-1 additional positions for lookahead heads
+    pad_len = max(0, num_chunks * chunk_size + oh + mtp_k - 1 - n)
+    padded  = np.concatenate([toks, np.zeros(pad_len + oh + mtp_k - 1, dtype=np.int32)])
 
     inputs  = np.stack([padded[i * chunk_size: i * chunk_size + chunk_size]
                         for i in range(num_chunks)]).astype(np.int32)
 
     tgt_chunks = []
     for i in range(num_chunks):
-        tgt = np.zeros((chunk_size, oh), dtype=np.int32)
-        if ib == 8 and ob < 8:
-            nxt = padded[i * chunk_size + 1: i * chunk_size + chunk_size + 1]
-            for h in range(oh):
-                tgt[:, h] = (nxt >> (h * ob)) & out_mask
-        else:
-            for h in range(oh):
-                tgt[:, h] = padded[i * chunk_size + 1 + h: i * chunk_size + chunk_size + 1 + h]
+        tgt = np.zeros((chunk_size, mtp_k, oh), dtype=np.int32)
+        for j in range(mtp_k):
+            if ib == 8 and ob < 8:
+                nxt = padded[i * chunk_size + 1 + j: i * chunk_size + chunk_size + 1 + j]
+                for h in range(oh):
+                    tgt[:, j, h] = (nxt >> (h * ob)) & out_mask
+            else:
+                for h in range(oh):
+                    tgt[:, j, h] = padded[i * chunk_size + 1 + j + h:
+                                          i * chunk_size + chunk_size + 1 + j + h]
         tgt_chunks.append(tgt)
 
-    return inputs, np.stack(tgt_chunks)
+    return inputs, np.stack(tgt_chunks)  # [NC, S, k, oh]
 
 
 def split_segments(raw_bytes: np.ndarray, segment_size: int) -> list[np.ndarray]:
@@ -204,8 +212,8 @@ def eval_segments_stateful(model, frozen, adapters, tcfg: TrainConfig,
             s    = ci * chunk_size
             inp  = torch.tensor(padded[s: s + chunk_size][None], dtype=torch.long, device=device)
             logits, states = model.forward(frozen, adapters, inp, states)
-            # logits: [1, S, oh, ov]
-            preds = logits[0].argmax(dim=-1).cpu().numpy()  # [S, oh]
+            # logits: [1, S, k, oh, ov] — use head 0 (AR head) for accuracy
+            preds = logits[0, :, 0, :, :].argmax(dim=-1).cpu().numpy()  # [S, oh]
 
             if ib == 8 and ob < 8:
                 pred_bytes = np.zeros(preds.shape[0], np.uint8)
@@ -248,7 +256,12 @@ def _detach_states(states):
 
 def compute_loss_and_grads(model, frozen, adapters, inp, tgt,
                            states, tcfg: TrainConfig):
-    """One TBPTT chunk: forward, loss, backward. Returns (loss, grads, new_states)."""
+    """One TBPTT chunk: forward, loss, backward. Returns (loss, grads, new_states).
+
+    tgt: [B, S, k, oh] — targets for all k MTP heads.
+    logits: [B, S, k, oh, ov] from model.forward.
+    Loss is averaged over k heads and oh sub-heads.
+    """
     for p in adapters.values():
         if p.requires_grad and p.grad is not None:
             p.grad = None
@@ -257,12 +270,14 @@ def compute_loss_and_grads(model, frozen, adapters, inp, tgt,
     tgt_t = torch.tensor(tgt, dtype=torch.long)
 
     logits, new_states = model.forward(frozen, adapters, inp_t, states)
+    # logits: [B, S, k, oh, ov]
+    k  = logits.shape[2]
     oh = tcfg.output_heads
 
     loss = sum(
-        training_loss(logits[:, :, h, :], tgt_t[:, :, h], tcfg)
-        for h in range(oh)
-    ) / oh
+        training_loss(logits[:, :, j, h, :], tgt_t[:, :, j, h], tcfg)
+        for j in range(k) for h in range(oh)
+    ) / (k * oh)
 
     loss.backward()
 
@@ -385,12 +400,13 @@ class CurriculumTrainer:
         print(f"Optimizer: {tcfg.optimizer}  lr={tcfg.learning_rate}  "
               f"max_iter/phase={tcfg.max_iter_per_phase}  check_every={tcfg.check_every}")
 
+        k = self.mcfg.mtp_k
         for seg_idx, seg in enumerate(segs):
             t_seg   = time.perf_counter()
             byte_lo = seg_idx * tcfg.segment_size
             print(f"\nSEGMENT {seg_idx+1}/{n_segs}  bytes [{byte_lo}, {byte_lo+len(seg)})")
 
-            inp, tgt = make_chunks(seg, tcfg)
+            inp, tgt = make_chunks(seg, tcfg, mtp_k=k)
             print(f"[SOLO] chunks={inp.shape[0]}")
             ok, iters, accs = self._tbptt_phase(f"solo s{seg_idx+1}", inp, tgt, [seg])
 
@@ -410,7 +426,7 @@ class CurriculumTrainer:
                 continue
 
             combined = np.concatenate(completed)
-            cinp, ctgt = make_chunks(combined, tcfg)
+            cinp, ctgt = make_chunks(combined, tcfg, mtp_k=k)
             n_done = len(completed)
             print(f"[COMBINED] segs 1..{n_done}  chunks={cinp.shape[0]}")
             cok, citers, caccs = self._tbptt_phase(

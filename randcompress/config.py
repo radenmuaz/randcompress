@@ -24,6 +24,11 @@ class ModelConfig:
     attn_dilation: int   = 1          # attend every d-th past position (1=no dilation)
     n_sinks_zero:  int   = 1          # constant-zero sink KV (no params, score=exp(0) always)
     n_sinks_train: int   = 1          # trainable sink KV (learned attraction + output)
+    attn_backend:  str   = "gather"   # "gather" (CPU/GPU) | "strided" (TPU-friendly)
+    n_phases:      int   = 1          # strided: attend to n_phases evenly spaced phases
+                                      # total slots = kv_window; each phase gets kv_window//n_phases
+                                      # n_phases>1 gives non-uniform coverage without gather or mask
+    mtp_k:         int   = 1          # multi-token prediction heads; 1 = standard AR
 
 
 @dataclass

@@ -95,6 +95,7 @@ def decode(bundle_dir: str, output_path: str, verify_path: str | None = None):
     frozen = model.init_frozen(mcfg.seed)
     device = torch.device("cpu")
     states = model.init_states(1, device)
+    k      = mcfg.mtp_k
 
     # Init RC state machine
     low, high, code, pos, buf = _rc_init(rc_stream)
@@ -105,32 +106,44 @@ def decode(bundle_dir: str, output_path: str, verify_path: str | None = None):
     t0 = time.perf_counter()
     with torch.no_grad():
         pbar = tqdm(total=T_valid, desc="decode", unit="tok")
-        for t in range(T_valid):
-            logits, states = model.step(frozen, adapters, cur_tok, states, t)
-            # logits: [1, oh, V]
+        for t in range(0, T_valid, k):
+            # step_mtp: process cur_tok, return k CDFs + state after 1 RNN step
+            logits_k, states = model.step_mtp(frozen, adapters, cur_tok, states, t)
+            # logits_k: [1, k, oh, V] — head j covers position t+j
 
-            syms_at_t = []
-            for h in range(oh):
-                cf  = quantize_cdf(logits[0, h].float().cpu().numpy())
-                sym, low, high, code, pos = _rc_decode_one(low, high, code, pos, buf, cf, V)
-                syms_at_t.append(sym)
-                decoded_syms.append(sym)
-
-            # Reconstruct the next input token from decoded symbols
-            if ib == 8 and ob < 8:
-                # Reassemble byte from multi-head sub-byte predictions
-                byte_val = 0
+            block_toks = []   # decoded tokens for this block (for state advance)
+            n_heads = min(k, T_valid - t)
+            for j in range(n_heads):
+                syms_at_j = []
                 for h in range(oh):
-                    byte_val |= (syms_at_t[h] & out_mask) << (h * ob)
-                byte_val &= 0xFF
-                cur_tok = torch.tensor(
-                    [int(bytes_to_tokens(np.array([byte_val], np.uint8), ib)[0])],
-                    dtype=torch.long)
-            else:
-                # oh=1, ib==ob: decoded symbol is directly the next token
-                cur_tok = torch.tensor([syms_at_t[0]], dtype=torch.long)
+                    cf  = quantize_cdf(logits_k[0, j, h].float().cpu().numpy())
+                    sym, low, high, code, pos = _rc_decode_one(
+                        low, high, code, pos, buf, cf, V)
+                    syms_at_j.append(sym)
+                    decoded_syms.append(sym)
 
-            pbar.update(1)
+                # Reconstruct input token from this position's decoded symbols
+                if ib == 8 and ob < 8:
+                    byte_val = 0
+                    for h in range(oh):
+                        byte_val |= (syms_at_j[h] & out_mask) << (h * ob)
+                    byte_val &= 0xFF
+                    tok_val = int(bytes_to_tokens(np.array([byte_val], np.uint8), ib)[0])
+                else:
+                    tok_val = syms_at_j[0]
+                block_toks.append(tok_val)
+
+            pbar.update(n_heads)
+
+            # Advance state through decoded tokens x_{t+1}..x_{t+k-1}.
+            # states already holds state after processing cur_tok (=x_t) from step_mtp.
+            # scan_states advances through the next k-1 decoded tokens.
+            if len(block_toks) > 1:
+                adv = torch.tensor([block_toks[:-1]], dtype=torch.long)
+                states = model.scan_states(frozen, adapters, adv, states, t + 1)
+
+            cur_tok = torch.tensor([block_toks[-1]], dtype=torch.long)
+
         pbar.close()
     t_dec = time.perf_counter() - t0
 

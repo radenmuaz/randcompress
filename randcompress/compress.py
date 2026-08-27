@@ -33,37 +33,51 @@ def encode(model, frozen, adapters, mcfg: ModelConfig, tcfg: TrainConfig,
     n_raw     = len(raw_bytes)
     device    = torch.device("cpu")
 
-    all_inputs, all_targets = make_chunks(raw_bytes, tcfg)
+    k = mcfg.mtp_k
+    all_inputs, all_targets = make_chunks(raw_bytes, tcfg, mtp_k=k)
     num_chunks, chunk_size  = all_inputs.shape[:2]
     T_total = num_chunks * chunk_size
 
     # ── Collect logits step-by-step ───────────────────────────────────────────
-    # precompute_weights=True (default): apply HiRA once → fast, more memory
-    # precompute_weights=False: recompute per step → slow, less memory
+    # MTP (k>1): at block start t, step_mtp outputs k CDFs for x_{t+1}..x_{t+k}.
+    #            State then advances through x_{t+1}..x_{t+k-1} via scan_states.
+    # k=1: identical to AR — step_mtp = step, no scan needed.
     t0     = time.perf_counter()
     states = model.init_states(1, device)
     logits_list: list[np.ndarray] = []
 
     if tcfg.precompute_weights:
         ew = model.precompute_eff_weights(frozen, adapters)
-        step_fn = lambda tok, st, t: model.step_eff(ew, tok, st, t)
+        step_mtp_fn   = lambda tok, st, t: model.step_mtp_eff(ew, tok, st, t)
+        scan_states_fn = lambda toks, st, t: model.scan_states_eff(ew, toks, st, t)
     else:
-        step_fn = lambda tok, st, t: model.step(frozen, adapters, tok, st, t)
+        step_mtp_fn   = lambda tok, st, t: model.step_mtp(frozen, adapters, tok, st, t)
+        scan_states_fn = lambda toks, st, t: model.scan_states(frozen, adapters, toks, st, t)
 
+    all_tokens = all_inputs.ravel()   # [T_total] flat token sequence
     pbar = tqdm(total=T_total, desc="collect logits", unit="tok")
     with torch.no_grad():
-        for ci in range(num_chunks):
-            for pos in range(chunk_size):
-                t_global = ci * chunk_size + pos
-                tok = torch.tensor([int(all_inputs[ci, pos])], dtype=torch.long)
-                logit, states = step_fn(tok, states, t_global)
-                logits_list.append(logit[0].float().cpu().numpy())  # [oh, V]
-                pbar.update(1)
+        for t_global in range(0, T_total, k):
+            tok = torch.tensor([int(all_tokens[t_global])], dtype=torch.long)
+            logits_k, states = step_mtp_fn(tok, states, t_global)
+            # logits_k: [1, k, oh, V] — head j predicts token at t_global+j+1
+            n_heads = min(k, T_total - t_global)
+            for j in range(n_heads):
+                logits_list.append(logits_k[0, j].float().cpu().numpy())  # [oh, V]
+            pbar.update(n_heads)
+            # advance state through x_{t+1}..x_{t+k-1} (teacher-forced)
+            adv_start = t_global + 1
+            adv_end   = min(t_global + k, T_total)
+            if adv_end > adv_start:
+                adv_toks = torch.tensor(
+                    [all_tokens[adv_start:adv_end].tolist()], dtype=torch.long)
+                states = scan_states_fn(adv_toks, states, adv_start)
     pbar.close()
     t_logits = time.perf_counter() - t0
 
-    logits_np = np.stack(logits_list)                                    # [T_total, oh, V]
-    tgts_np   = all_targets.reshape(-1, oh)[:, 0].astype(np.int32)      # [T_total]
+    logits_np = np.stack(logits_list)                                       # [T_total, oh, V]
+    # all_targets: [NC, S, k, oh] — use MTP head 0 (AR head) for valid mask and metrics
+    tgts_np   = all_targets[:, :, 0, 0].ravel().astype(np.int32)          # [T_total]
 
     # Filter valid (non-pad) positions
     valid    = tgts_np >= 0
@@ -80,13 +94,12 @@ def encode(model, frozen, adapters, mcfg: ModelConfig, tcfg: TrainConfig,
     acc     = (T_v - n_wrong) / max(T_v, 1)
 
     # ── Build symbol stream (multi-head aware) ────────────────────────────────
-    # For oh=1: symbols = vtgt_raw
-    # For oh>1, ib=8, ob<8: reconstruct byte then split per head
+    # Symbols are the actual file tokens (head 0, AR targets). oh sub-heads per position.
     if oh == 1:
         symbols = vtgt_raw
     else:
-        # all_targets: [num_chunks, S, oh] → [T_total, oh], then filter valid rows
-        all_tgts_flat = all_targets.reshape(-1, oh)  # [T_total, oh]
+        # all_targets: [NC, S, k, oh] — head j=0 gives AR targets; extract [T_total, oh]
+        all_tgts_flat = all_targets[:, :, 0, :].reshape(-1, oh)  # [T_total, oh]
         symbols = all_tgts_flat[valid].ravel().astype(np.int32)  # [T_v * oh]
 
     # ── Quantize CDFs ─────────────────────────────────────────────────────────

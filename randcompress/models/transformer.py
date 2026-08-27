@@ -86,6 +86,70 @@ def _gather_dilated(K: Tensor, V: Tensor,
     return K[:, idx], V[:, idx]
 
 
+# ── Strided dilated selection (TPU-friendly) ──────────────────────────────────
+
+def _strided_dilated(K: Tensor, V: Tensor,
+                     kv_window: int, dilation: int,
+                     t: int, n_phases: int = 1) -> tuple[Tensor, Tensor]:
+    """Attend to n_phases evenly-spaced dilation phases without gather.
+
+    Each phase selects every dilation-th position offset by phase*dilation//n_phases.
+    The selection is a contiguous view of a reshape — zero non-contiguous reads.
+    Handles T not divisible by dilation by zero-padding the front of the cache.
+
+    kv_window: total attention slots across all phases (0 = all available slots).
+    n_phases:  number of phases. Phase k attends to positions at offset
+               (t + k*dilation//n_phases) % dilation within each dilation block.
+    Returns K_sel, V_sel: [B, W_total, NH, DH] in chronological order.
+    """
+    B, T, NH, DH = K.shape
+    if T == 0 or dilation <= 1:
+        # No dilation: plain window
+        if kv_window > 0:
+            return K[:, -kv_window:], V[:, -kv_window:]
+        return K, V
+
+    # Pad front so T is divisible by dilation
+    pad = (-T) % dilation
+    if pad > 0:
+        zeros = torch.zeros(B, pad, NH, DH, dtype=K.dtype, device=K.device)
+        K = torch.cat([zeros, K], dim=1)
+        V = torch.cat([zeros, V], dim=1)
+    T_pad = K.shape[1]  # now T_pad % dilation == 0
+
+    # Reshape: [B, T_pad//dilation, dilation, NH, DH]
+    K_ph = K.reshape(B, T_pad // dilation, dilation, NH, DH)
+    V_ph = V.reshape(B, T_pad // dilation, dilation, NH, DH)
+
+    # Slots per phase
+    n_blocks   = T_pad // dilation
+    slots_each = (kv_window // n_phases) if kv_window > 0 else n_blocks
+
+    parts_k, parts_v = [], []
+    for pk in range(n_phases):
+        phase = (t + pk * dilation // n_phases) % dilation
+        Kp = K_ph[:, -slots_each:, phase, :]   # [B, slots_each, NH, DH] — contiguous slice
+        Vp = V_ph[:, -slots_each:, phase, :]
+        parts_k.append(Kp)
+        parts_v.append(Vp)
+
+    # Concatenate phases in chronological order
+    # Each phase slice is already "last slots_each blocks", combine and sort by block index
+    # Simple approach: just concatenate (order within attention is irrelevant for value)
+    K_sel = torch.cat(parts_k, dim=1)   # [B, n_phases*slots_each, NH, DH]
+    V_sel = torch.cat(parts_v, dim=1)
+    return K_sel, V_sel
+
+
+def _select_kv(K: Tensor, V: Tensor,
+               kv_window: int, dilation: int, t: int,
+               backend: str, n_phases: int) -> tuple[Tensor, Tensor]:
+    """Dispatch between gather and strided backends."""
+    if backend == "strided":
+        return _strided_dilated(K, V, kv_window, dilation, t, n_phases)
+    return _gather_dilated(K, V, kv_window, dilation)
+
+
 # ── Sink helpers ──────────────────────────────────────────────────────────────
 
 def _build_sinks(fw: dict, n_zero: int, n_train: int,
@@ -159,6 +223,7 @@ def _causal_attn_chunk(fw: dict, x: Tensor, NH: int, freqs: Tensor,
                        K_cache: Tensor, V_cache: Tensor,
                        kv_window: int, dilation: int,
                        n_zero: int, n_train: int,
+                       backend: str = "gather", n_phases: int = 1,
                        T_past_offset: int = 0) -> tuple[Tensor, Tensor, Tensor]:
     """Chunked causal attention with sinks + dilated window.
     Returns (out [B,S,d], K_cache_new, V_cache_new).
@@ -173,8 +238,10 @@ def _causal_attn_chunk(fw: dict, x: Tensor, NH: int, freqs: Tensor,
     Q = _apply_rope(Q, freqs, offset=T_past_offset)
     K = _apply_rope(K, freqs, offset=T_past_offset)
 
-    # Dilated window on past cache
-    K_sel, V_sel = _gather_dilated(K_cache, V_cache, kv_window, dilation)
+    # Past cache: select via chosen backend
+    # Use T_past_offset as the "current t" for phase alignment in strided mode
+    K_sel, V_sel = _select_kv(K_cache, V_cache, kv_window, dilation,
+                               T_past_offset, backend, n_phases)
 
     # Sinks
     sk, sv = _build_sinks(fw, n_zero, n_train, B, NH, DH, x.dtype, x.device)
@@ -204,7 +271,8 @@ def _causal_attn_chunk(fw: dict, x: Tensor, NH: int, freqs: Tensor,
 def _attn_step(fw: dict, x_t: Tensor, NH: int, freqs: Tensor,
                K_cache: Tensor, V_cache: Tensor, t: int,
                kv_window: int, dilation: int,
-               n_zero: int, n_train: int) -> tuple[Tensor, Tensor, Tensor]:
+               n_zero: int, n_train: int,
+               backend: str = "gather", n_phases: int = 1) -> tuple[Tensor, Tensor, Tensor]:
     """Single-step attention with KV cache + sinks + dilated window."""
     B, d = x_t.shape; DH = d // NH
 
@@ -219,8 +287,9 @@ def _attn_step(fw: dict, x_t: Tensor, NH: int, freqs: Tensor,
     K_new = torch.cat([K_cache, k.unsqueeze(1)], dim=1)   # [B, T+1, NH, DH]
     V_new = torch.cat([V_cache, v.unsqueeze(1)], dim=1)
 
-    # Dilated window on full updated cache
-    K_sel, V_sel = _gather_dilated(K_new, V_new, kv_window, dilation)
+    # Full updated cache: select via chosen backend
+    K_sel, V_sel = _select_kv(K_new, V_new, kv_window, dilation,
+                               t, backend, n_phases)
 
     # Sinks
     sk, sv = _build_sinks(fw, n_zero, n_train, B, NH, DH, x_t.dtype, x_t.device)
@@ -268,7 +337,8 @@ class CausalTransformer(RandCompressModel):
     def _attn_kwargs(self) -> dict:
         cfg = self.mcfg
         return dict(kv_window=cfg.kv_window, dilation=cfg.attn_dilation,
-                    n_zero=cfg.n_sinks_zero, n_train=cfg.n_sinks_train)
+                    n_zero=cfg.n_sinks_zero, n_train=cfg.n_sinks_train,
+                    backend=cfg.attn_backend, n_phases=cfg.n_phases)
 
     def init_frozen(self, seed: int) -> dict[str, Tensor]:
         rng = np.random.default_rng(seed)

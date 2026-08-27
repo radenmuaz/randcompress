@@ -6,7 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Neural compression via memorization: freeze a randomly-initialized model, then train only adapters (HiRA or LoRA) to overfit a single file. The adapter weights *are* the compressed representation. Decompression reconstructs the file autoregressively using range coding.
 
-**Active package**: `randcompress/` (PyTorch). Old JAX experiments are in `examples_old/`.
+**Active package**: `randcompress/` (PyTorch, frozen-base + HiRA/LoRA adapters). Old JAX experiments are in `examples_old/`.
+
+**Second active package**: `overfitter/` — no frozen base / no adapters, no random-seed reconstruction. The whole model (`SummTransformer`, a hierarchical-summarization transformer) is trained directly to overfit one file. See `## Package: overfitter/` below and `overfitter/README.md`.
 
 ## Running
 
@@ -164,3 +166,66 @@ Decompression: load bundle → reconstruct frozen from seed → AR decode with R
 - **`pad_token=0`** masked from loss — safe for Arabic UTF-8 (no 0x00 in dataset).
 - **PyTorch only**: no JAX, no optax. SinkGD is hand-written.
 - **`float32` default** — swap via `--dtype bfloat16` if needed.
+
+## Package: `overfitter/` (SummTransformer, full-model overfit)
+
+No frozen base, no HiRA/LoRA adapters, no seed-derived reconstruction — the whole model
+(`SummTransformer` in `overfitter/summformer.py`, a hierarchical-summarization transformer:
+windowed byte-level attention + a cascade of pooled-KV "summary" stages for long range) trains
+directly to overfit one file. Full details, architecture notes, and the bundle format are in
+`overfitter/README.md` — read that first for anything overfitter-related.
+
+### Running
+
+```bash
+uv run python -m overfitter.train \
+    --dataset datasets/juz1.txt --log_dir runs/overfitter/juz1 \
+    --Ks 16,16,16 --d_model 24 --n_layers 8 --n_heads 4 --n_kv_heads 4 \
+    --attn_window 64 --share_lm true --tbptt_chunk_size 512 --epochs 8
+uv run python -m overfitter.compress --ckpt runs/overfitter/juz1 --input datasets/juz1.txt --output runs/overfitter/juz1_compressed
+uv run python -m overfitter.decompress --bundle runs/overfitter/juz1_compressed --output /tmp/recovered.txt --verify datasets/juz1.txt
+```
+
+`train.py` writes `<log_dir>/train.log` with eager flush (mirrors `randcompress/train.py`'s own `_Tee`) — **`tail -f <log_dir>/train.log`** to watch a run live, including tqdm's progress bar. Don't rely on tailing a background shell's own captured stdout if it's piped through something like `| tail -N` — that buffers until the process exits; the log file is the thing that streams.
+
+### `Ks` gotchas (read before picking values)
+
+- `n_fuse = len(cfg.Ks)` — every element is a real pooling stage, **no trailing placeholder** (unlike this repo's other `Ks=(32,32,1)`-style convention elsewhere — overfitter's `Config.Ks` was deliberately changed to not need one).
+- **A stage whose cumulative product (`Ks[0]*Ks[1]*...`) approaches or exceeds the training file length never fires**, and its query backlog in `_make_incremental_stepper` grows unboundedly for the entire run — this caused a real MPS OOM (7GB+ on a ~340K-param model) during development. Rule of thumb: `Ks[0] ≈ sqrt(L / attn_window)` balances the byte-level pass (linear cost) against stage-0's self-attention (quadratic in block count).
+- **Check before training**: `uv run python -m overfitter.analyze --Ks ... --d_model ... --n_layers ... --attn_window ... --dataset <file> --chunk_size ... --epochs ...` prints KV-cache memory, per-epoch FLOPs, and explicitly warns if any stage is starved — no training run required.
+
+### Key implementation facts (see `overfitter/README.md` for more)
+
+- Stage-level summary self-attention is real incremental KV-caching (not recompute-from-scratch) — this was a real cubic-cost bug, fixed; verify any future change to `_make_incremental_stepper` against `model.check_kv_cache_consistency(...)`, which must stay `match_rate=1.0`.
+- `compress.py` prints both a theoretical `CE bpb` (from the model's raw softmax, cheap) and the confirmed `rc bpb` (from the actual range-coded stream, verified via a round-trip decode before printing) — the RC number is always the one that matters, CE is just a sanity check.
+- `share_lm=True` (tie every level's Block stack together) is the strongest lever for both size and quality at small scale — an ablation on `juz1.txt` found it alone beat off/off and off/on/on on both loss and accuracy; `share_fuse=True` alone hurt quality noticeably. Don't assume this generalizes without re-ablating for a new config regime.
+
+## Reference run: full quran-uthmani.txt (1,359,946 B) — old JAX xLSTM/msrnn
+
+`log_old/quran/` (`examples_old/old/randcompress_v4.2_quran.py`) is a **verified successful**
+whole-file train→compress→decode round trip on the full Quran file, no chunk/segment split —
+one continuous sequence scanned front-to-back, `max_iters=100` (100 full passes over the file),
+JAX `remat=True, remat_chunk=50000` (gradient checkpointing) for memory. Final result
+(`log_old/quran/ckpt_last/compression.json`, `decode_ok: true`, `T_valid=1359945` matches the
+full file):
+
+```
+CE=1.8620 bpb   rc=1.8155 bpb (308,631 B)   ratio=3.334x (407,959 B)   argmax_acc=56.7%
+```
+
+~20 min for the 100 training passes, ~10–16 min per full encode/decode eval (that step does a
+Python per-token loop). Beats raw `store` but not gzip (5.09x on the same file, see
+`compression_results/benchmark_results.json`) — a real but not dramatically strong ratio; useful
+as a baseline/sanity target, not a SOTA claim.
+
+**Why it could train on the whole file directly**: msrnn/xLSTM is a *linear RNN* — state
+recurrence is `O(L)`, so gradient checkpointing alone bounds memory. This does **not** carry
+over to attention-based models (e.g. `overfitter/summformer.py`): attention is `O(L²)`, and
+`torch`'s masked SDPA still materializes the full `L×L` score matrix even under a windowed mask
+(no true sliding-window kernel), so checkpointing doesn't save it — that needs real bounded
+attention (windowed KV cache, TBPTT-chunked training) instead. See `overfitter/README.md`.
+
+Current PyTorch codebase's own attempts at the full file, for comparison:
+- `runs/quran_compressed`/`quran_compressed2`: `ratio=1.49x, ce_bpb=6.5, argmax_acc=36%` — weak/undertrained.
+- `runs/quran_msrnn/train.log`: segment-curriculum trainer (1024-byte segments) never finished —
+  log stops partway through segment 1 of 1329.
