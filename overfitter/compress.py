@@ -1,138 +1,128 @@
-"""Encode a file with a trained SummTransformer -> range-coded bundle.
+"""Compress a file with a trained ByteFractalGen -> range-coded bundle.
 
-MTP block scheme (mtp_heads = k), matches PLAN_MTP.md exactly:
-  at block start, after processing byte x_t, the incremental stepper's hidden state
-  x_hidden yields k CDFs in one shot: head predicts x_{t+1}, extra_heads[i] predicts
-  x_{t+2+i}. Encode all k real bytes against those k CDFs, then advance the KV
-  caches through the k-1 in-between bytes (teacher forced, one batched stepper
-  call) to reach x_{t+k} as the next block's start. k=1 degenerates to plain AR.
+Chunks are fully independent (no cross-chunk state), so they're processed in GROUPS of
+batch_size via collect_logits()'s batched generate() -- the expensive neural forward passes
+batch across a group, while the cheap range-coding arithmetic still runs one symbol at a time,
+in the exact interleaved order (all rows' step-i before step-i+1) generate() naturally produces.
+decompress.py MUST use the identical batch_size (and thus the identical chunk grouping) to
+reproduce the same CDFs -- batched and differently-batched matmuls aren't bit-identical
+(floating-point non-associativity), which for range coding is as fatal as a real logit error.
+Padding bytes in the last (short) chunk are encoded too (deterministic, model learns to predict
+them) and simply trimmed back out on decode.
 """
 from __future__ import annotations
 
+import json
 import math
+import os
 import time
+from dataclasses import asdict
 
 import numpy as np
 import torch
 from tqdm import tqdm
 
-from .checkpoint import save_bundle
+from .checkpoint import load_model
 from .codec import quantize_cdf, rc_encode, rc_decode
-from .config import TrainConfig
-from .summformer import Config as ModelConfig
-from .summformer import SummTransformer
+from .tokenizer import load_bytes
+from .train import make_chunks
 
 
 @torch.no_grad()
-def encode(model: SummTransformer, mcfg: ModelConfig, tcfg: TrainConfig,
-          raw_bytes: np.ndarray, out_dir: str) -> None:
+def encode(model, raw_bytes: np.ndarray, out_dir: str, batch_size: int = 32) -> None:
     t_wall = time.perf_counter()
     model.eval()
     device = torch.device("cpu")
     model.to(device)
 
+    P0 = model.cfg.patch_len_list[0]
     n_raw = len(raw_bytes)
-    if n_raw < 2:
-        raise ValueError("file too short to compress (need >= 2 bytes)")
-    M = mcfg.mtp_heads
+    chunks = make_chunks(raw_bytes, P0)
+    n_chunks = chunks.shape[0]
+    ctx = torch.tensor(chunks.astype(np.int64), device=device)
 
-    byte_t = torch.tensor(raw_bytes.astype(np.int64), device=device).unsqueeze(0)  # [1, n_raw]
-    stepper, _ = model._make_incremental_stepper(1, device)
-
-    _, x_hidden = stepper(byte_t[:, :1], 0)   # prime with byte[0] (stored raw, not coded)
-    x_last = x_hidden[:, -1:, :]
-
-    symbols: list[int] = []
-    cdfs: list[np.ndarray] = []
-    ce_bits = 0.0   # theoretical entropy under the model's raw (pre-quantization) softmax --
-                     # a cheap sanity check against rc_bpb below, computed for free alongside
-                     # the CDFs since we already have the logits in hand.
-    pos = 0   # index of the last real byte already fed into the stepper
-
+    symbols_list, logits_list = [], []
     t0 = time.perf_counter()
-    pbar = tqdm(total=n_raw - 1, desc="collect logits", unit="B")
-    while pos < n_raw - 1:
-        n_pred = min(M, n_raw - 1 - pos)
-
-        head_logits = [model.head(x_last)[0, 0]]                       # predicts pos+1
-        for i in range(n_pred - 1):
-            head_logits.append(model.extra_heads[i](x_last)[0, 0])     # predicts pos+2+i
-
-        for j in range(n_pred):
-            sym = int(raw_bytes[pos + 1 + j])
-            symbols.append(sym)
-            logit = head_logits[j]
-            cdfs.append(quantize_cdf(logit.float().cpu().numpy()))
-            log_p = torch.log_softmax(logit.float(), dim=-1)[sym]
-            ce_bits += -log_p.item() / math.log(2)
-
-        chunk = byte_t[:, pos + 1: pos + 1 + n_pred]   # teacher-forced real bytes
-        _, x_hidden = stepper(chunk, pos + 1)
-        x_last = x_hidden[:, -1:, :]
-        pos += n_pred
-        pbar.update(n_pred)
-    pbar.close()
+    for start in tqdm(range(0, n_chunks, batch_size), desc="collect logits", unit="group"):
+        end = min(start + batch_size, n_chunks)
+        symbols, logits = model.collect_logits(ctx[start:end])   # [ (end-start)*P0 ], [ .., 256]
+        symbols_list.append(symbols)
+        logits_list.append(logits)
     t_logits = time.perf_counter() - t0
+
+    symbols_t = torch.cat(symbols_list)
+    logits_t = torch.cat(logits_list, dim=0)
+    symbols_np = symbols_t.cpu().numpy().astype(np.int32)   # full stream, padding bytes included
+
+    logp = torch.log_softmax(logits_t.float(), dim=-1)
+    ce_bits = -logp[torch.arange(len(symbols_t)), symbols_t].sum().item() / math.log(2)
+    n_wrong = int((logits_t.argmax(-1) != symbols_t).sum().item())
+    cdfs_np = np.stack([quantize_cdf(logits_t[j].cpu().numpy()) for j in
+                        tqdm(range(logits_t.shape[0]), desc="quantize CDFs", unit="B")]).astype(np.int32)
     ce_bpb = ce_bits / n_raw
 
-    symbols_np = np.array(symbols, dtype=np.int32)
-    cdfs_np    = np.stack(cdfs).astype(np.int32)
-
-    # ── RC encode ─────────────────────────────────────────────────────────────
     t0 = time.perf_counter()
     print("  encode...", end=" ", flush=True)
     rc_stream = rc_encode(symbols_np, cdfs_np)
-    rc_bytes  = len(rc_stream)
-    t_enc     = time.perf_counter() - t0
-    print(f"{rc_bytes}B  {t_enc:.2f}s  ({rc_bytes/max(t_enc,1e-9)/1e3:.1f} kB/s)")
+    rc_bytes = len(rc_stream)
+    t_enc = time.perf_counter() - t0
+    print(f"{rc_bytes}B  {t_enc:.2f}s")
 
-    # ── Verify round-trip ─────────────────────────────────────────────────────
     t0 = time.perf_counter()
     print("  verify...", end=" ", flush=True)
-    decoded_syms = rc_decode(rc_stream, cdfs_np)
-    ok           = bool(np.array_equal(decoded_syms, symbols_np))
-    t_dec        = time.perf_counter() - t0
+    decoded = rc_decode(rc_stream, cdfs_np)
+    ok = bool(np.array_equal(decoded, symbols_np))
+    t_dec = time.perf_counter() - t0
     print(f"{'OK' if ok else 'FAIL'}  {t_dec:.2f}s")
     if not ok:
         raise RuntimeError("RC round-trip verification failed")
 
-    # ── Save bundle ───────────────────────────────────────────────────────────
+    os.makedirs(out_dir, exist_ok=True)
+    torch.save(model.state_dict(), os.path.join(out_dir, "model.pt"))
+    with open(os.path.join(out_dir, "config.json"), "w") as f:
+        json.dump(asdict(model.cfg), f, indent=2)
+    with open(os.path.join(out_dir, "rc_stream.bin"), "wb") as f:
+        f.write(rc_stream)
     param_bytes = sum(p.numel() * p.element_size() for p in model.parameters())
-    save_bundle(out_dir, model, mcfg, tcfg, rc_stream,
-               n_raw_bytes=n_raw, seed_byte=int(raw_bytes[0]))
-
-    t_wall    = time.perf_counter() - t_wall
+    T_valid = len(symbols_np)
+    argmax_acc = (T_valid - n_wrong) / max(T_valid, 1)
     tot_bytes = param_bytes + rc_bytes
-    ratio     = n_raw / tot_bytes if tot_bytes > 0 else float("inf")
-    print(f"\n[compress]  {t_wall:.1f}s  (logits={t_logits:.1f}s  enc={t_enc:.2f}s  dec={t_dec:.2f}s)")
-    print(f"  CE={ce_bpb:.4f}bpb (theoretical)  "
-          f"rc={rc_bytes*8/n_raw:.4f}bpb ({rc_bytes}B, confirmed)  "
-          f"p+rc={ratio:.3f}x ({tot_bytes}B, params={param_bytes}B)")
-    print(f"Bundle: {out_dir}/")
+    ratio = n_raw / tot_bytes if tot_bytes > 0 else float("inf")
+    meta = dict(n_raw_bytes=n_raw, rc_bytes=rc_bytes, param_bytes=param_bytes,
+               total_bytes=tot_bytes, ratio=ratio,
+               T_valid=T_valid, n_wrong=n_wrong, argmax_acc=argmax_acc, ce_bpb=ce_bpb,
+               batch_size=batch_size)   # decompress.py MUST reuse this exact grouping
+    with open(os.path.join(out_dir, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
 
-    import json
-    with open(f"{out_dir}/compression.json", "w") as f:
-        json.dump(dict(
-            ce_bpb=ce_bpb, rc_bpb=rc_bytes * 8 / n_raw, rc_bytes=rc_bytes,
-            param_bytes=param_bytes, total_bytes=tot_bytes, ratio=ratio,
-            n_raw_bytes=n_raw,
-        ), f, indent=2)
+    t_wall = time.perf_counter() - t_wall
+    kbps = n_raw / max(t_wall, 1e-9) / 1e3
+    print(f"\n[compress]  {t_wall:.1f}s  ({kbps:.2f} kB/s)  (logits={t_logits:.1f}s  enc={t_enc:.2f}s  dec={t_dec:.2f}s)")
+    print(f"  argmax: {T_valid-n_wrong}/{T_valid} ({argmax_acc:.1%})  "
+          f"CE={ce_bpb:.4f}bpb  rc={rc_bytes*8/n_raw:.4f}bpb ({rc_bytes}B)")
+    print(f"  model size (params):     {param_bytes:>10,d} B")
+    print(f"  rc-coded residual:       {rc_bytes:>10,d} B")
+    print(f"  total bundle:            {tot_bytes:>10,d} B")
+    print(f"  original file:           {n_raw:>10,d} B")
+    verdict = "COMPRESSED" if ratio > 1.0 else "EXPANDED (bundle bigger than original)"
+    print(f"  ACTUAL compression ratio: {ratio:.4f}x  [{verdict}]")
+    print(f"Bundle: {out_dir}/")
 
 
 def main() -> None:
     import argparse
-    from .checkpoint import load_model
-    from .tokenizer import load_bytes
-
-    p = argparse.ArgumentParser(description="overfitter compress")
-    p.add_argument("--ckpt", required=True, help="dir with model.pt + config.json from train.py")
-    p.add_argument("--input", required=True, help="file to compress")
-    p.add_argument("--output", required=True, help="output bundle dir")
+    p = argparse.ArgumentParser()
+    p.add_argument("--ckpt", required=True)
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", required=True)
+    p.add_argument("--batch_size", type=int, default=32,
+                   help="chunks processed per batched neural forward call -- decompress.py "
+                        "reuses this from meta.json automatically")
     args = p.parse_args()
 
-    model, mcfg, tcfg = load_model(args.ckpt)
+    model = load_model(args.ckpt)
     raw_bytes = load_bytes(args.input)
-    encode(model, mcfg, tcfg, raw_bytes, args.output)
+    encode(model, raw_bytes, args.output, batch_size=args.batch_size)
 
 
 if __name__ == "__main__":

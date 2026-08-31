@@ -1,9 +1,6 @@
-"""Simple overfit training: the whole file as one causal sequence, plain AdamW.
-
-No curriculum/TBPTT, no frozen-base + adapter split, no per-segment state carrying --
-SummTransformer already handles long context itself (windowed byte-level attention +
-a hierarchical KV-summarization cascade, see Ks/attn_window/fuse_window in Config), so
-there's nothing to chunk here: every step is a full recompute over the whole sequence.
+"""Overfit a ByteFractalGen to one file. Each patch_len_list[0]-byte chunk is fully independent
+(root_cond is a fixed constant, no state carried across chunks), so training is just: iterate
+chunks, forward, backward, AdamW step.
 """
 from __future__ import annotations
 
@@ -16,14 +13,12 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from .config import TrainConfig
-from .summformer import Config as ModelConfig
-from .summformer import SummTransformer, lr_at
+from .model import ByteFractalGen, FractalConfig
+from .tokenizer import load_bytes
 
 
 class _Tee:
-    """stdout/stderr + file, eager flush -- matches randcompress/train.py's own _Tee, so
-    `tail -f <log_dir>/train.log` shows tqdm's progress updates live, not just on exit."""
+    """stdout/stderr + file, eager flush -- tail -f <log_dir>/train.log to watch a run live."""
     def __init__(self, *files):
         self.files = files
 
@@ -41,170 +36,145 @@ class _Tee:
         return getattr(self.files[0], "encoding", "utf-8")
 
 
-def train_overfit(model: SummTransformer, tcfg: TrainConfig, raw_bytes: np.ndarray,
-                  device: torch.device) -> SummTransformer:
+def make_chunks(raw_bytes: np.ndarray, patch_len: int) -> np.ndarray:
+    n = len(raw_bytes)
+    n_chunks = math.ceil(n / patch_len)
+    padded = np.zeros(n_chunks * patch_len, dtype=np.uint8)
+    padded[:n] = raw_bytes
+    return padded.reshape(n_chunks, patch_len)
+
+
+def train(model: ByteFractalGen, chunks: np.ndarray, device: torch.device, steps: int,
+         lr: float, warmup_steps: int, grad_clip: float, log_every: int, n_raw: int) -> None:
     model.to(device)
     model.train()
-    ctx = torch.tensor(raw_bytes.astype(np.int64), device=device).unsqueeze(0)  # [1, L]
-
-    opt = torch.optim.AdamW(model.parameters(), lr=tcfg.lr, betas=(0.9, 0.95),
-                            weight_decay=tcfg.weight_decay)
+    ctx = torch.tensor(chunks.astype(np.int64), device=device)   # [n_chunks, P0]
+    n_chunks, P0 = ctx.shape
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.95))
+    param_bytes = sum(pp.numel() * pp.element_size() for pp in model.parameters())
 
     t0 = time.perf_counter()
-    pbar = tqdm(range(1, tcfg.steps + 1), desc="overfit", dynamic_ncols=True)
+    epoch_ce_nats = 0.0   # accumulated straight from the training loss already computed each
+                           # step -- an estimate of what rc_encode would produce, with no extra
+                           # forward passes and no actual range coding run mid-training.
+    epoch_steps = 0
+    epoch = 1
+    pbar = tqdm(range(1, steps + 1), desc="fractalgen", dynamic_ncols=True)
     for step in pbar:
-        lr = lr_at(step, tcfg.warmup_steps, tcfg.lr)
+        lr_t = lr * min(1.0, step / max(1, warmup_steps))
         for g in opt.param_groups:
-            g["lr"] = lr
+            g["lr"] = lr_t
 
-        loss, metrics = model(ctx)
-        opt.zero_grad()
+        idx = (step - 1) % n_chunks
+        chunk = ctx[idx: idx + 1]
+        loss, metrics = model(chunk)
+        epoch_ce_nats += loss.item() * P0   # loss is mean nats/byte over this chunk's P0 bytes
+        epoch_steps += 1
+        opt.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.grad_clip)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         opt.step()
 
-        if step % tcfg.check_every == 0 or step == tcfg.steps:
-            acc = metrics["byte_acc"].item()
-            bpb = metrics["bpb"].item()
-            pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.2%}", bpb=f"{bpb:.3f}")
-            if acc >= 1.0:
-                pbar.close()
-                print(f"[overfit] 100% byte accuracy reached at step {step} "
-                      f"({time.perf_counter() - t0:.1f}s)")
-                return model
+        acc = metrics["byte_acc"].item()
+        bpb = metrics["bpb"].item()
+        pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.2%}", bpb=f"{bpb:.3f}")
+
+        if step % log_every == 0 or step == steps:
+            print(f"[step {step}/{steps}]  bpb={bpb:.4f}  acc={acc:.2%}  loss={loss.item():.4f}")
+
+        if step % n_chunks == 0 or step == steps:
+            n_bytes_seen = epoch_steps * P0
+            est_ce_bits = epoch_ce_nats / math.log(2)
+            est_bpb = est_ce_bits / n_bytes_seen
+            est_rc_bytes = est_ce_bits / 8 * (n_raw / n_bytes_seen)   # scale partial epoch to full file
+            est_total = param_bytes + est_rc_bytes
+            est_ratio = n_raw / est_total if est_total > 0 else float("inf")
+            print(f"[epoch ~{epoch}]  CE~{est_bpb:.4f}bpb (theoretical)  "
+                  f"est size ~{est_rc_bytes:.0f}B (rc) + {param_bytes}B (params) "
+                  f"= {est_total:.0f}B  est ratio ~{est_ratio:.4f}x")
+            epoch_ce_nats = 0.0
+            epoch_steps = 0
+            epoch += 1
 
     pbar.close()
-    print(f"[overfit] stopped at max steps={tcfg.steps} ({time.perf_counter() - t0:.1f}s) "
-          f"-- did not reach 100% accuracy")
-    return model
-
-
-def train_overfit_tbptt(model: SummTransformer, tcfg: TrainConfig, raw_bytes: np.ndarray,
-                        device: torch.device) -> SummTransformer:
-    """Stream the file through the incremental KV-cache stepper in chunks, RNN-style: state
-    (byte-level KV cache + hierarchical summary history) persists across chunks within an
-    epoch, backprop is truncated at each chunk boundary (detach_state -- TBPTT depth 1),
-    and state resets to None at each epoch boundary (mirrors randcompress/train.py's
-    curriculum trainer: "State resets to zeros at each epoch boundary").
-
-    Unlike train_overfit(), this never materializes a dense L x L attention matrix -- the
-    byte-level attention cost is bounded by cfg.attn_window (see Attn.forward_incremental's
-    cache pruning), and the hierarchical summary stages' cost is bounded by keeping
-    cfg.Ks[0] large enough that the number of pooled blocks stays small (that summary
-    self-attention recomputes from scratch on every new block, so its cost is cubic in the
-    number of blocks seen -- see the comment in summformer.py's _make_incremental_stepper).
-    """
-    model.to(device)
-    model.train()
-    ctx = torch.tensor(raw_bytes.astype(np.int64), device=device).unsqueeze(0)  # [1, L]
-    L = ctx.shape[1]
-    C = tcfg.tbptt_chunk_size
-    n_chunks = math.ceil((L - 1) / C)
-
-    opt = torch.optim.AdamW(model.parameters(), lr=tcfg.lr, betas=(0.9, 0.95),
-                            weight_decay=tcfg.weight_decay)
-
-    global_step = 0
-    total_steps = n_chunks * tcfg.epochs
-    t0 = time.perf_counter()
-    for epoch in range(1, tcfg.epochs + 1):
-        stepper, detach_state = model._make_incremental_stepper(1, device)
-        pos = 0
-        pbar = tqdm(range(n_chunks), desc=f"epoch {epoch}/{tcfg.epochs}", dynamic_ncols=True)
-        for _ in pbar:
-            global_step += 1
-            end = min(pos + C, L - 1)
-            inp = ctx[:, pos:end]        # bytes pos..end-1
-
-            lr = lr_at(global_step, tcfg.warmup_steps, tcfg.lr)
-            for g in opt.param_groups:
-                g["lr"] = lr
-
-            logits, _ = stepper(inp, pos)          # [1, Tq, V] -- Tq may exceed inp's length:
-            # when a fuse stage hasn't accumulated enough pooled blocks yet, byte-level queries
-            # "backlog" (x_in_backlog in _make_incremental_stepper) until it fires, then all
-            # backlogged positions are returned together in one call. logits[:, i, :] always
-            # predicts the byte at absolute position (pos + Tn - Tq + i + 1), so targets must be
-            # sliced from ctx using the actual returned length, not the input chunk length.
-            Tq = logits.shape[1]
-            tgt = ctx[:, end - Tq + 1: end + 1]
-            loss = torch.nn.functional.cross_entropy(
-                logits.reshape(-1, logits.shape[-1]), tgt.reshape(-1))
-            opt.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), tcfg.grad_clip)
-            opt.step()
-            detach_state()
-
-            # MPS's caching allocator fragments badly under many small varying-shape allocations
-            # (exactly this loop's pattern: growing/detached KV caches every step) and can OOM
-            # well before actual live tensor memory is anywhere near the device limit. Periodic
-            # empty_cache() returns unused cached blocks to the pool; cheap relative to a step.
-            if device.type == "mps" and global_step % 50 == 0:
-                torch.mps.empty_cache()
-
-            if global_step % tcfg.check_every == 0 or global_step == total_steps:
-                acc = (logits.argmax(-1) == tgt).float().mean().item()
-                bpb = loss.item() / math.log(2)
-                pbar.set_postfix(loss=f"{loss.item():.4f}", acc=f"{acc:.2%}", bpb=f"{bpb:.3f}")
-
-            pos = end
-
-        pbar.close()
-
-    print(f"[overfit-tbptt] {tcfg.epochs} epochs x {n_chunks} chunks/epoch "
-          f"({total_steps} steps total, chunk={C}B)  {time.perf_counter() - t0:.1f}s")
-    return model
+    dt = time.perf_counter() - t0
+    print(f"[fractalgen train] {steps} steps over {n_chunks} chunks  {dt:.1f}s  "
+          f"({steps/dt:.1f} steps/s, {steps*P0/dt/1e3:.1f} kB/s effective)")
 
 
 def main() -> None:
-    from .config import parse_configs
-    from .tokenizer import load_bytes
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--dataset", required=True)
+    p.add_argument("--log_dir", required=True)
+    p.add_argument("--patch_len_list", default="1024,128,16,1")
+    p.add_argument("--d_model", type=int, default=64, help="broadcast uniformly to every level")
+    p.add_argument("--n_layers", type=int, default=4, help="broadcast uniformly to every level")
+    p.add_argument("--n_heads", type=int, default=4, help="broadcast uniformly to every level")
+    p.add_argument("--mlp_mult", type=int, default=2, help="broadcast uniformly to every level")
+    p.add_argument("--byte_embed_dim", type=int, default=256)
+    p.add_argument("--share_trunk", type=lambda x: x.lower() != "false", default=False)
+    p.add_argument("--steps", type=int, default=3000)
+    p.add_argument("--lr", type=float, default=3e-3)
+    p.add_argument("--warmup_steps", type=int, default=50)
+    p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--log_every", type=str, default="100",
+                   help="int (e.g. 100) = print current bpb/acc/loss every N steps; float "
+                        "(e.g. 0.5) = every that fraction of an epoch (one epoch = n_chunks "
+                        "steps), rounded to steps. tqdm postfix always updates every step "
+                        "regardless (cheap, no extra forward pass).")
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--device", type=str, default="")
+    args = p.parse_args()
 
-    mcfg, tcfg = parse_configs()
-    torch.manual_seed(tcfg.seed)
-    device = torch.device(tcfg.device) if tcfg.device else torch.device(
+    torch.manual_seed(args.seed)
+    device = torch.device(args.device) if args.device else torch.device(
         "mps" if torch.backends.mps.is_available() else
         ("cuda" if torch.cuda.is_available() else "cpu"))
 
-    os.makedirs(tcfg.log_dir, exist_ok=True)
-    log_file = open(os.path.join(tcfg.log_dir, "train.log"), "a")
+    os.makedirs(args.log_dir, exist_ok=True)
+    log_file = open(os.path.join(args.log_dir, "train.log"), "a")
     sys.stdout = _Tee(sys.stdout, log_file)
-    sys.stderr = _Tee(sys.stderr, log_file)   # tqdm writes its bar to stderr by default
-    print(f"logging to {os.path.join(tcfg.log_dir, 'train.log')} -- tail -f it")
+    sys.stderr = _Tee(sys.stderr, log_file)
+    print(f"logging to {os.path.join(args.log_dir, 'train.log')} -- tail -f it")
 
-    raw_bytes = load_bytes(tcfg.dataset)
-    print(f"dataset={tcfg.dataset}  n_bytes={len(raw_bytes)}  device={device}")
+    patch_len_list = tuple(int(x) for x in args.patch_len_list.split(","))
+    raw_bytes = load_bytes(args.dataset)
+    print(f"dataset={args.dataset}  n_bytes={len(raw_bytes)}  patch_len_list={patch_len_list}  device={device}")
 
-    model = SummTransformer(mcfg).to(device)
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"Ks={mcfg.Ks}  d_model={mcfg.d_model}  n_layers={mcfg.n_layers}  "
-          f"mtp_heads={mcfg.mtp_heads}  params={n_params/1e6:.3f}M")
+    n_levels = len(patch_len_list) - 1
+    cfg = FractalConfig(
+        patch_len_list=patch_len_list,
+        d_model_list=(args.d_model,) * n_levels,
+        n_layers_list=(args.n_layers,) * n_levels,
+        n_heads_list=(args.n_heads,) * n_levels,
+        mlp_mult_list=(args.mlp_mult,) * n_levels,
+        byte_embed_dim=args.byte_embed_dim,
+        share_trunk=args.share_trunk,
+    )
+    model = ByteFractalGen(cfg)
+    n_params = sum(pp.numel() for pp in model.parameters())
+    print(f"params={n_params:,}  seq_lens={model.seq_lens}")
 
-    if tcfg.tbptt_chunk_size > 0:
-        train_overfit_tbptt(model, tcfg, raw_bytes, device)
-    else:
-        train_overfit(model, tcfg, raw_bytes, device)
+    chunks = make_chunks(raw_bytes, patch_len_list[0])
+    n_chunks = chunks.shape[0]
+    log_every = (max(1, round(float(args.log_every) * n_chunks))
+                 if "." in args.log_every else int(args.log_every))
+    print(f"log_every={args.log_every} -> {log_every} steps "
+          f"({'epoch fraction' if '.' in args.log_every else 'raw steps'})")
+    if log_every <= 2:
+        print(f"WARNING: log_every={log_every} is very frequent (prints nearly every step) "
+              f"-- pass a float like 0.1 for 'every 10% of an epoch' if this wasn't intended")
 
-    # Sanity check: the incremental KV-cache path (used by compress/decompress, and by
-    # train_overfit_tbptt) must be bit-exact with full recompute -- this is what the
-    # readout-vs-head fix in _make_incremental_stepper was for. Reusing raw_bytes as
-    # "val_data" is fine here since this only samples prompts from it, no generalization
-    # is being measured. Skipped for very long files where generate_no_cache's O(L^2)
-    # full recompute would itself be infeasible.
-    if len(raw_bytes) <= 20000:
-        data_t = torch.tensor(raw_bytes.astype(np.int64), device=device)
-        result = model.check_kv_cache_consistency(data_t, str(device))
-        print(f"check_kv_cache_consistency: match_rate={result['match_rate']:.3f} "
-              f"(n_checks={result['n_checks']})")
-        if result["match_rate"] < 1.0:
-            print("WARNING: incremental stepper diverges from full recompute -- "
-                  "compress/decompress will still round-trip losslessly, but predictions "
-                  "used for range coding won't match what the model was trained on.")
+    train(model, chunks, device, args.steps, args.lr, args.warmup_steps, args.grad_clip,
+         log_every, len(raw_bytes))
 
     from .checkpoint import save_model
-    save_model(tcfg.log_dir, model, mcfg, tcfg)
-    print(f"Saved model to {tcfg.log_dir}/")
+    save_model(args.log_dir, model)
+    with open(os.path.join(args.log_dir, "meta.json"), "w") as f:
+        import json
+        json.dump({"n_raw_bytes": len(raw_bytes)}, f)
+    print(f"Saved model to {args.log_dir}/")
 
 
 if __name__ == "__main__":

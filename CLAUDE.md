@@ -8,7 +8,9 @@ Neural compression via memorization: freeze a randomly-initialized model, then t
 
 **Active package**: `randcompress/` (PyTorch, frozen-base + HiRA/LoRA adapters). Old JAX experiments are in `examples_old/`.
 
-**Second active package**: `overfitter/` — no frozen base / no adapters, no random-seed reconstruction. The whole model (`SummTransformer`, a hierarchical-summarization transformer) is trained directly to overfit one file. See `## Package: overfitter/` below and `overfitter/README.md`.
+**Second active package**: `overfitter/` — no frozen base / no adapters, no random-seed reconstruction. The whole model is trained directly to overfit one file. **`overfitter/` is now ByteFractalGen (FractalAR)**, a byte-level port of [FractalGen](https://arxiv.org/html/2502.17437v2) — a recursive generator invoked on progressively smaller sub-patches, giving `O(L)` total attention instead of `O(L²)`. See `## Package: overfitter/` below and `overfitter/README.md`.
+
+**Superseded (KIV, moot)**: the original `overfitter/` design — `SummTransformer`, a hierarchical-summarization transformer (windowed byte-level attention + pooled-KV "summary" stages) — has been archived to `overfitter_v1/` and is no longer maintained or developed. The `## Package: overfitter/` and "Reference run" sections below still describe `SummTransformer`/`overfitter_v1` details (Ks gotchas, share_lm ablations, etc.) — kept for historical reference only, not applicable to the current `overfitter/` (FractalAR) package.
 
 ## Running
 
@@ -39,6 +41,8 @@ datasets/juz1.txt               # default (~44 KB)
 datasets/surat_al-fatihah.txt   # tiny (~562 B), fast iteration
 datasets/quran-uthmani.txt      # full quran (~1.4 MB)
 ```
+
+**`logs/datasets/`** — larger/external datasets, git-ignored (not checked in, unlike `datasets/` above). Currently holds `enwik8` (100,000,000 B, gunzipped from the committed-nowhere `enwik8.gz`). `logs/` in general is the git-ignored, in-repo location for both experiment logs (`logs/overfitter/...`, see below) and these larger datasets — use it instead of `/tmp` so results/data persist across sessions and `tail -f` works normally, but never `git add` anything under it.
 
 No test suite.
 
@@ -192,13 +196,17 @@ uv run python -m overfitter.decompress --bundle runs/overfitter/juz1_compressed 
 
 - `n_fuse = len(cfg.Ks)` — every element is a real pooling stage, **no trailing placeholder** (unlike this repo's other `Ks=(32,32,1)`-style convention elsewhere — overfitter's `Config.Ks` was deliberately changed to not need one).
 - **A stage whose cumulative product (`Ks[0]*Ks[1]*...`) approaches or exceeds the training file length never fires**, and its query backlog in `_make_incremental_stepper` grows unboundedly for the entire run — this caused a real MPS OOM (7GB+ on a ~340K-param model) during development. Rule of thumb: `Ks[0] ≈ sqrt(L / attn_window)` balances the byte-level pass (linear cost) against stage-0's self-attention (quadratic in block count).
-- **Check before training**: `uv run python -m overfitter.analyze --Ks ... --d_model ... --n_layers ... --attn_window ... --dataset <file> --chunk_size ... --epochs ...` prints KV-cache memory, per-epoch FLOPs, and explicitly warns if any stage is starved — no training run required.
+- **Check before training**: `uv run python -m overfitter.analyze --Ks ... --d_model ... --n_layers ... --attn_window ... --dataset <file> --chunk_size ... --epochs ...` prints KV-cache memory, per-epoch FLOPs, and explicitly warns if any stage is starved *or* backlog-spikes (see next point) — no training run required.
+- **Deep `Ks` (many stages) vs `tbptt_chunk_size` — a second, distinct pathology from starvation**: even a stage that eventually fires can still crash the run if its `cum_K` exceeds `tbptt_chunk_size`. Queries "backlog" (`x_in_backlog` in `_make_incremental_stepper`) for up to `~cum_K` positions while waiting for that stage to fire, then the *entire* backlog gets pushed through cross-attention and the refinement pass's byte-level attention **in one call** — and `attn_window` only bounds the *persistent* cache between calls, not that single call's own `Tn × (Tn+window)` attention matrix. Real repro: `Ks=2` × 14 stages (deepest `cum_K=16,384`), `tbptt_chunk_size=512`, `attn_window=4` → MPS OOM at ~7.5GB from one `[1,4,16384,16389]` score tensor. Fix: keep every stage's `cum_K ≤ tbptt_chunk_size` (or grow `chunk_size`) — `analyze.py` now checks and warns about this specifically (separate from the starvation warning).
 
 ### Key implementation facts (see `overfitter/README.md` for more)
 
 - Stage-level summary self-attention is real incremental KV-caching (not recompute-from-scratch) — this was a real cubic-cost bug, fixed; verify any future change to `_make_incremental_stepper` against `model.check_kv_cache_consistency(...)`, which must stay `match_rate=1.0`.
 - `compress.py` prints both a theoretical `CE bpb` (from the model's raw softmax, cheap) and the confirmed `rc bpb` (from the actual range-coded stream, verified via a round-trip decode before printing) — the RC number is always the one that matters, CE is just a sanity check.
 - `share_lm=True` (tie every level's Block stack together) is the strongest lever for both size and quality at small scale — an ablation on `juz1.txt` found it alone beat off/off and off/on/on on both loss and accuracy; `share_fuse=True` alone hurt quality noticeably. Don't assume this generalizes without re-ablating for a new config regime.
+- Ablatable knobs beyond `share_lm`/`share_fuse`: `pos_scheme` (`rope`|`none`, NoPE), `mlp_type` (`swiglu`|`mlp`|`none`), `use_bias`, `norm_type` (`rmsnorm`|`layernorm`), `qk_norm`, and `optimizer` (`adamw`|`sinkgd_lm`|`sinkgd_all`, see below) — added specifically to explore "fast overfitting" architecture variants (generalization is *not* a goal here, see the brainstorm note this section is a summary of).
+- **`optimizer` (`TrainConfig`, default `sinkgd_lm`)**: SinkGD (`randcompress/train.py`'s hand-written Sinkhorn-normalized GD, ported to `overfitter/train.py`) for attention/MLP matrix weights; AdamW carved out for `embed`/`head`/`extra_heads` since Sinkhorn row/col normalization assumes matrix structure a per-symbol embedding/readout table doesn't have as naturally (byte frequencies are Zipfian, not balanced). `sinkgd_all` matches what `randcompress/train.py` actually does today (SinkGD uniformly, no embed/head special-casing) — useful as an explicit ablation arm, not assumed better or worse a priori. `adamw` is the uniform baseline.
+- **Experiment workflow: one job at a time, not parallel background batches.** Earlier ablations in this project ran 4 configs concurrently in one shell loop — fine for quick small-file checks, but for anything running long enough to matter (full `juz1.txt`-scale, `Ks`-deep configs) run them sequentially, one at a time, waiting for each to finish before starting the next. Keeps MPS memory pressure predictable and keeps each run's log unambiguous to `tail -f`.
 
 ## Reference run: full quran-uthmani.txt (1,359,946 B) — old JAX xLSTM/msrnn
 
