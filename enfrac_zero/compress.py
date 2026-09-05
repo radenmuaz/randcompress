@@ -110,7 +110,14 @@ def main() -> None:
                         "file passed to train.py's --config works)")
     p.add_argument("--batch_size", type=int, default=None,
                    help="Defaults to --config's compress.batch_size, else 32.")
+    p.add_argument("--device", type=str, default="cpu", choices=["cpu", "tpu", "gpu"],
+                   help="jax backend for the collect_logits()/generate() recursion. Defaults to "
+                        "cpu -- see enfrac/compress.py's --device help for why (host-dispatch-"
+                        "latency-bound, not FLOP-bound). Must be set before any other jax call, "
+                        "so this flag is read before --ckpt is loaded.")
     args = p.parse_args()
+
+    jax.config.update("jax_platform_name", args.device)
 
     batch_size = args.batch_size
     if batch_size is None and args.config:

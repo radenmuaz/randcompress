@@ -121,7 +121,17 @@ def main() -> None:
                    help="chunks processed per batched neural forward call -- decompress.py "
                         "reuses this from meta.json automatically. Defaults to --config's "
                         "compress.batch_size, else 32.")
+    p.add_argument("--device", type=str, default="cpu", choices=["cpu", "tpu", "gpu"],
+                   help="jax backend for the collect_logits()/generate() recursion. Defaults to "
+                        "cpu: that recursion is host-dispatch-latency-bound, not FLOP-bound (see "
+                        "model.py's determinism-contract docstring), so routing every step "
+                        "through an accelerator's host<->device round trip is pure overhead here "
+                        "-- running it on the host's own CPU (which on a TPU VM host can mean "
+                        "dozens to hundreds of cores) skips that round trip entirely. Must be set "
+                        "before any other jax call, so this flag is read before --ckpt is loaded.")
     args = p.parse_args()
+
+    jax.config.update("jax_platform_name", args.device)
 
     batch_size = args.batch_size
     if batch_size is None and args.config:

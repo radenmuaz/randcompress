@@ -7,6 +7,7 @@ import json
 import os
 import time
 
+import jax
 import numpy as np
 from tqdm import tqdm
 
@@ -127,7 +128,13 @@ def main() -> None:
     p.add_argument("--bundle", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--verify", default=None)
+    p.add_argument("--device", type=str, default="cpu", choices=["cpu", "tpu", "gpu"],
+                   help="jax backend for the generate() recursion. Defaults to cpu -- see "
+                        "enfrac/compress.py's --device help for why.")
     args = p.parse_args()
+
+    jax.config.update("jax_platform_name", args.device)
+
     decode(args.bundle, args.output, args.verify)
 
 

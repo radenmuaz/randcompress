@@ -15,6 +15,7 @@ import json
 import os
 import time
 
+import jax
 import numpy as np
 from tqdm import tqdm
 
@@ -135,7 +136,16 @@ def main() -> None:
     p.add_argument("--bundle", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--verify", default=None)
+    p.add_argument("--device", type=str, default="cpu", choices=["cpu", "tpu", "gpu"],
+                   help="jax backend for the generate() recursion. Defaults to cpu -- see "
+                        "compress.py's --device help for why (host-dispatch-latency-bound, not "
+                        "FLOP-bound). Must match compress.py's choice isn't required for "
+                        "correctness (only batch_size must match), but cpu is the sane default "
+                        "on a TPU VM host too.")
     args = p.parse_args()
+
+    jax.config.update("jax_platform_name", args.device)
+
     decode(args.bundle, args.output, args.verify)
 
 
