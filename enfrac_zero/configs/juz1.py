@@ -1,7 +1,7 @@
 """juz1.txt (~44KB) sanity/pipeline config -- still overparameterized, not tuned for a real
-compression ratio (see enfrac_baseline/configs/quran_uthmani.py for that flavor of config).
+compression ratio (see enfrac_zero/configs/quran_uthmani.py for that flavor of config).
 
-  uv run python -m enfrac_baseline.train --config enfrac_baseline/configs/juz1.py --log_dir logs/enfrac_baseline/juz1
+  uv run python -m enfrac_zero.train --config enfrac_zero/configs/juz1.py --log_dir logs/enfrac_zero/juz1
 
 See enfrac/configs/juz1.py for the HiRA counterpart. `seed` spelled out explicitly (see
 fatihah.py's docstring for why) -- same value as ModelConfig's default.

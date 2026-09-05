@@ -3,7 +3,7 @@ compression ratio (see enfrac/configs/quran_uthmani.py for that flavor of config
 
   uv run python -m enfrac.train --config enfrac/configs/juz1.py --log_dir logs/enfrac/juz1
 
-See enfrac_baseline/configs/juz1.py for the no-HiRA counterpart. use_hira/hira_r/seed spelled
+See enfrac_zero/configs/juz1.py for the no-HiRA counterpart. use_hira/hira_r/seed spelled
 out explicitly (see fatihah.py's docstring for why) -- same values as ModelConfig's defaults.
 """
 

@@ -6,7 +6,7 @@ construction (one Trunk regardless of n_levels) and gradient partitioning cheap.
 
   uv run python -m enfrac.train --config enfrac/configs/quran_uthmani.py --log_dir logs/enfrac/quran_uthmani
 
-See enfrac_baseline/configs/quran_uthmani.py for the no-HiRA counterpart. use_hira/hira_r/seed
+See enfrac_zero/configs/quran_uthmani.py for the no-HiRA counterpart. use_hira/hira_r/seed
 spelled out explicitly (see fatihah.py's docstring for why) -- same values as ModelConfig's
 defaults.
 

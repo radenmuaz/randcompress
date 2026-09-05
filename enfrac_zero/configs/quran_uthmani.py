@@ -1,11 +1,11 @@
 """Full quran-uthmani.txt (~1.36MB) config -- deliberately small/fast model (sanity-scale, like
 overfitter/README.md's "sanity checks" section, not its longer "real run" one): proves the
 pipeline handles the full file end to end within a reasonable session, not a tuned compression
-ratio (it happens to actually compress at this scale -- see logs/enfrac_baseline/quran_uthmani_compressed/meta.json
+ratio (it happens to actually compress at this scale -- see logs/enfrac_zero/quran_uthmani_compressed/meta.json
 from the last run -- but that wasn't optimized for). share_trunk=True keeps param count down and
 keeps model.py construction (one Trunk regardless of n_levels) cheap.
 
-  uv run python -m enfrac_baseline.train --config enfrac_baseline/configs/quran_uthmani.py --log_dir logs/enfrac_baseline/quran_uthmani
+  uv run python -m enfrac_zero.train --config enfrac_zero/configs/quran_uthmani.py --log_dir logs/enfrac_zero/quran_uthmani
 
 See enfrac/configs/quran_uthmani.py for the HiRA counterpart. `seed` spelled out explicitly (see
 fatihah.py's docstring for why) -- same value as ModelConfig's default.

@@ -3,8 +3,8 @@ lossless round trip), not real compression: params vastly exceed the file.
 
   uv run python -m enfrac.train --config enfrac/configs/fatihah.py --log_dir logs/enfrac/fatihah
 
-See enfrac_baseline/configs/fatihah.py for the no-HiRA counterpart (same architecture dims,
-no use_hira/hira_r since enfrac_baseline.model.ModelConfig doesn't have those fields).
+See enfrac_zero/configs/fatihah.py for the no-HiRA counterpart (same architecture dims,
+no use_hira/hira_r since enfrac_zero.model.ModelConfig doesn't have those fields).
 
 use_hira/hira_r/seed are spelled out explicitly here rather than left to ModelConfig's
 defaults (use_hira=True, hira_r=4, seed=0 -- same values, but explicit so the config file is

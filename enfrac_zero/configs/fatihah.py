@@ -1,7 +1,7 @@
 """Tiny sanity config (562B file) -- proves the pipeline (train -> compress -> decompress,
 lossless round trip), not real compression: params vastly exceed the file.
 
-  uv run python -m enfrac_baseline.train --config enfrac_baseline/configs/fatihah.py --log_dir logs/enfrac_baseline/fatihah
+  uv run python -m enfrac_zero.train --config enfrac_zero/configs/fatihah.py --log_dir logs/enfrac_zero/fatihah
 
 See enfrac/configs/fatihah.py for the HiRA counterpart (same architecture dims, plus
 use_hira/hira_r since enfrac.model.ModelConfig has those fields and this one doesn't -- the
