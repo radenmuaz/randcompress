@@ -10,7 +10,14 @@ readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "Raden Muaz Munim"}]
 requires-python = ">=3.10"
-dependencies = ["torch", "numpy", "tqdm"]
+dependencies = [
+    "torch",
+    "numpy",
+    "tqdm",
+    "jax>=0.6.2",
+    "equinox>=0.13.8",
+    "optax>=0.2.8",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -29,4 +36,4 @@ dev = ["zstandard", "lz4", "pytest"]
 Repository = "https://github.com/yourusername/randcompress"
 
 [tool.setuptools]
-packages = ["randcompress", "randcompress.models"]
+packages = ["overfitter", "overfitter_peft", "overfitter_v1", "enfrac", "enfrac_baseline"]
