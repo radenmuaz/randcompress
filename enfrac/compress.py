@@ -31,7 +31,7 @@ from .tokenizer import load_bytes
 from .train import make_chunks
 
 
-def encode(model, raw_bytes: np.ndarray, out_dir: str, batch_size: int = 32) -> None:
+def encode(model, raw_bytes: np.ndarray, out_dir: str, batch_size: int = 32, device: str = "cpu") -> None:
     t_wall = time.perf_counter()
 
     P0 = model.cfg.patch_len_list[0]
@@ -90,7 +90,11 @@ def encode(model, raw_bytes: np.ndarray, out_dir: str, batch_size: int = 32) -> 
     meta = dict(n_raw_bytes=n_raw, rc_bytes=rc_bytes, param_bytes=param_bytes,
                total_bytes=tot_bytes, ratio=ratio,
                T_valid=T_valid, n_wrong=n_wrong, argmax_acc=argmax_acc, ce_bpb=ce_bpb,
-               batch_size=batch_size)   # decompress.py MUST reuse this exact grouping
+               batch_size=batch_size,   # decompress.py MUST reuse this exact grouping
+               device=device)   # decompress.py MUST reuse this exact backend -- see its
+                                  # module docstring: TPU/GPU/CPU matmuls aren't bit-identical
+                                  # to each other any more than differently-batched ones are,
+                                  # so a backend mismatch desyncs the range coder just as fatally
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
@@ -143,7 +147,7 @@ def main() -> None:
 
     model = load_model(args.ckpt)
     raw_bytes = load_bytes(args.input)
-    encode(model, raw_bytes, args.output, batch_size=batch_size)
+    encode(model, raw_bytes, args.output, batch_size=batch_size, device=args.device)
 
 
 if __name__ == "__main__":

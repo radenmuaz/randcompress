@@ -52,11 +52,16 @@ def _rc_decode_one(low: int, high: int, code: int, pos: int, buf: np.ndarray, cf
 
 
 def load_bundle(bundle_dir: str):
+    # Read meta.json's `device` BEFORE constructing the model -- see enfrac/decompress.py's
+    # load_bundle() for the full rationale (backend mismatch desyncs the range coder). No CLI
+    # override exposed here on purpose, mirroring batch_size.
+    with open(os.path.join(bundle_dir, "meta.json")) as f:
+        meta = json.load(f)
+    jax.config.update("jax_platform_name", meta.get("device", "cpu"))
+
     model = load_model(bundle_dir)
     with open(os.path.join(bundle_dir, "rc_stream.bin"), "rb") as f:
         rc_stream = f.read()
-    with open(os.path.join(bundle_dir, "meta.json")) as f:
-        meta = json.load(f)
     return model, rc_stream, meta
 
 
@@ -128,13 +133,7 @@ def main() -> None:
     p.add_argument("--bundle", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--verify", default=None)
-    p.add_argument("--device", type=str, default="cpu", choices=["cpu", "tpu", "gpu"],
-                   help="jax backend for the generate() recursion. Defaults to cpu -- see "
-                        "enfrac/compress.py's --device help for why.")
     args = p.parse_args()
-
-    jax.config.update("jax_platform_name", args.device)
-
     decode(args.bundle, args.output, args.verify)
 
 

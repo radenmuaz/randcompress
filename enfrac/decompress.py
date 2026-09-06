@@ -60,11 +60,19 @@ def _rc_decode_one(low: int, high: int, code: int, pos: int, buf: np.ndarray, cf
 
 
 def load_bundle(bundle_dir: str):
+    # Read meta.json's `device` BEFORE constructing the model -- jax_platform_name must be set
+    # before the first jax call (model construction creates arrays), and compress.py's chosen
+    # backend MUST be reused exactly: TPU/GPU/CPU matmuls aren't bit-identical to each other any
+    # more than differently-batched ones are (see module docstring), so a backend mismatch
+    # desyncs the range coder just as fatally as a batch_size mismatch would. No CLI override is
+    # exposed here on purpose, mirroring batch_size -- this is not a knob to hand-tune.
+    with open(os.path.join(bundle_dir, "meta.json")) as f:
+        meta = json.load(f)
+    jax.config.update("jax_platform_name", meta.get("device", "cpu"))
+
     model = load_model(bundle_dir)
     with open(os.path.join(bundle_dir, "rc_stream.bin"), "rb") as f:
         rc_stream = f.read()
-    with open(os.path.join(bundle_dir, "meta.json")) as f:
-        meta = json.load(f)
     return model, rc_stream, meta
 
 
@@ -136,16 +144,7 @@ def main() -> None:
     p.add_argument("--bundle", required=True)
     p.add_argument("--output", required=True)
     p.add_argument("--verify", default=None)
-    p.add_argument("--device", type=str, default="cpu", choices=["cpu", "tpu", "gpu"],
-                   help="jax backend for the generate() recursion. Defaults to cpu -- see "
-                        "compress.py's --device help for why (host-dispatch-latency-bound, not "
-                        "FLOP-bound). Must match compress.py's choice isn't required for "
-                        "correctness (only batch_size must match), but cpu is the sane default "
-                        "on a TPU VM host too.")
     args = p.parse_args()
-
-    jax.config.update("jax_platform_name", args.device)
-
     decode(args.bundle, args.output, args.verify)
 
 

@@ -36,4 +36,4 @@ dev = ["zstandard", "lz4", "pytest"]
 Repository = "https://github.com/yourusername/randcompress"
 
 [tool.setuptools]
-packages = ["overfitter", "overfitter_peft", "overfitter_v1", "enfrac", "enfrac_zero"]
+packages = ["enfrac", "enfrac_zero"]
