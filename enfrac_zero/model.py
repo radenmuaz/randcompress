@@ -77,7 +77,9 @@ from dataclasses import dataclass
 import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 
+from enfrac.codec import quantize_cdf
 from enfrac.model import (
     ROPE_PRESETS,
     FrozenEmbedding,
@@ -172,12 +174,16 @@ class Attn(eqx.Module):
         passing a python int here would make jit re-trace/recompile at every step)."""
         B, T, D = x.shape   # T == 1
         H, hd = self.n_heads, self.head_dim
+        t = t.astype(jnp.int32)   # normalize regardless of caller/x64 mode -- dynamic_update_slice
+                                    # requires ALL its index args to share one dtype, and bare
+                                    # python 0 literals promote to int64 under jax_enable_x64
+        zero = jnp.zeros((), dtype=t.dtype)
         q = self.wq(x).reshape(B, T, H, hd).transpose(0, 2, 1, 3)
         k_t = self.wk(x).reshape(B, T, H, hd).transpose(0, 2, 1, 3)
         v_t = self.wv(x).reshape(B, T, H, hd).transpose(0, 2, 1, 3)
         q, k_t = apply_rope(q, cos_t, sin_t), apply_rope(k_t, cos_t, sin_t)
-        k_cache = jax.lax.dynamic_update_slice(k_cache, k_t, (0, 0, t, 0))
-        v_cache = jax.lax.dynamic_update_slice(v_cache, v_t, (0, 0, t, 0))
+        k_cache = jax.lax.dynamic_update_slice(k_cache, k_t, (zero, zero, t, zero))
+        v_cache = jax.lax.dynamic_update_slice(v_cache, v_t, (zero, zero, t, zero))
         max_len = k_cache.shape[2]
         valid = jnp.arange(max_len) <= t                              # [max_len] -- causal mask
         scores = jnp.einsum("bhtd,bhsd->bhts", q, k_cache) / math.sqrt(hd)   # [1,H,1,max_len]
@@ -234,6 +240,32 @@ def _remat_group_size(spec: str, total: int) -> int:
     """'0.5' -> fraction of total (rounded, >=1); '512' -> exact count, capped at total."""
     n = max(1, round(float(spec) * total)) if "." in spec else int(spec)
     return min(max(1, n), total)
+
+
+@eqx.filter_jit
+def _trunk_forward_jit(trunk: "Trunk", x: jax.Array, rope_base: float) -> jax.Array:
+    """Module-level jit wrapper for Trunk.__call__, used by _gen_children's recompute-from-scratch
+    loop (levels 1+). The shapes there are BOUNDED (T=1..seq_len, seq_len is small and fixed --
+    currently 8 everywhere), so jax.jit's shape-keyed compilation cache means each distinct T
+    compiles ONCE (the first time it's seen, across the whole process) and every subsequent call
+    with that same T -- of which there are millions over a real file -- just executes the cached
+    executable instead of re-tracing/dispatching from scratch. Measured empirically: ~30x faster
+    per call than the bare eager `trunk(x, rope_base)` at juz1-scale (d_model=48), even accounting
+    for the varying T=1..8 pattern _gen_children actually produces (8 distinct cache entries, not
+    1). This mirrors what generate()'s level-0 step_fn already does for the SAME reason -- the
+    fix that was missing at levels 1+ (see _gen_children's docstring: adding a KV-cache there was
+    tried and reverted as a regression, because the ALGORITHM wasn't the bottleneck, the eager
+    DISPATCH overhead was; jit-caching the existing recompute-from-scratch shapes fixes that
+    directly, matching how the reference PyTorch FractalGen implementation's own smallest/deepest
+    generator (PixelLoss) also just recomputes a tiny sequence from scratch every step -- it
+    doesn't use a KV-cache there either, it's just running on a framework/runtime where per-call
+    dispatch is cheap by default (PyTorch eager + CUDA async kernel launch); this is JAX's way of
+    getting the same property without switching frameworks: NOT bit-identical to plain eager
+    (~1e-6 magnitude difference, same as any jit-vs-eager comparison in this codebase), but
+    self-consistent -- both encode (collect_logits_fp64/collect_logits) and decode (generate())
+    call _gen_children, so they see the SAME jit-wrapped computation, keeping range-coding
+    correctness intact."""
+    return trunk(x, rope_base)
 
 
 class Trunk(eqx.Module):
@@ -495,42 +527,46 @@ class ByteFractalGen(eqx.Module):
 
     def _gen_children(self, level: int, cond: jax.Array, symbol_fn) -> list[list[int]]:
         """LOCAL recursion for levels 1+: generate this level's seq_len sub-patches given the
-        incoming (parent) condition, recursing into level+1 for each. Uses the SAME Trunk.step
-        KV-cache mechanism as level 0 (see generate()) -- O(seq_len) per level instead of the old
-        O(seq_len^2) recompute-from-scratch, AND critically the same per-position math that
-        collect_logits()'s fast scan path (_level_logits_fast) uses, so encode and decode stay
-        bit-exact. Still a Python loop (not scan) because symbol_fn is a real host callback here
-        (decode doesn't know the next byte until the range coder produces it) -- that dependency
-        genuinely can't be traced through jax.lax.scan. See collect_logits()'s docstring."""
+        incoming (parent) condition, recursing into level+1 for each. Deliberately NOT using
+        Trunk.step's KV-cache here (unlike level 0, see generate()) -- measured empirically (both
+        locally and on real TPU runs) to be a WASH-TO-REGRESSION at this scale, not a win: unlike
+        level 0 (where n_timesteps can be hundreds-to-thousands, so avoiding O(T^3) recompute
+        matters enormously), seq_len here is small and FIXED (currently 8 everywhere) -- a
+        KV-cache step still pays for attention over the full preallocated max_len every call
+        (masked, not shrunk), so total cost stays the same O(seq_len^2) order as plain
+        recompute-from-scratch, while adding real per-step overhead (dynamic_update_slice,
+        masking) that isn't offset by any actual FLOP savings. Simple recompute (concatenate the
+        real, actually-short-so-far sequence and rerun the trunk) is at least as fast and simpler.
+        Bounded, small attention -- no remat/KV-cache machinery needed here, only level 0 spans a
+        long, growing sequence."""
         B = cond.shape[0]
         seq_len = self.seq_lens[level]
         child_len = self.cfg.patch_len_list[level]
-        trunk = self.trunk_at(level)
-        rope_base = self.rope_base
         cond_l = self.cond_proj[level](cond)                  # [B, D]
-        kv_cache = trunk.init_kv_cache(seq_len, batch=B)
-        x_t = cond_l[:, None, :]                                # [B, 1, D] -- position-0 input
         out = [[] for _ in range(B)]
+        seq_in = [cond_l[:, None, :]]                          # [B, 1, D]
         if child_len == 1:
             for i in range(seq_len):
-                h_t, kv_cache = trunk.step(x_t, jnp.asarray(i, dtype=jnp.int32), rope_base, kv_cache)
-                logits = self.head(h_t[:, -1, :])                # [B, 256]
+                x = jnp.concatenate(seq_in, axis=1)
+                h = _trunk_forward_jit(self.trunk_at(level), x, self.rope_base)
+                logits = self.head(h[:, -1, :])                 # [B, 256]
                 syms = symbol_fn(logits)                        # list[int], len B
                 for b in range(B):
                     out[b].append(syms[b])
                 if i < seq_len - 1:
                     sym_t = jnp.array(syms, dtype=jnp.int32)[:, None]   # [B, 1]
-                    x_t = self.embed_patch(level, sym_t)[:, None, :]     # [B, 1, D]
+                    seq_in.append(self.embed_patch(level, sym_t)[:, None, :])
         else:
             for i in range(seq_len):
-                h_t, kv_cache = trunk.step(x_t, jnp.asarray(i, dtype=jnp.int32), rope_base, kv_cache)
-                cond_i = h_t[:, -1, :]                            # [B, D] CONTINUOUS, passed to child unchanged
+                x = jnp.concatenate(seq_in, axis=1)
+                h = _trunk_forward_jit(self.trunk_at(level), x, self.rope_base)
+                cond_i = h[:, -1, :]                            # [B, D] CONTINUOUS, passed to child unchanged
                 child_bytes = self._gen_children(level + 1, cond_i, symbol_fn)   # list of B lists, len child_len
                 for b in range(B):
                     out[b].extend(child_bytes[b])
                 if i < seq_len - 1:
                     child_t = jnp.array(child_bytes, dtype=jnp.int32)   # [B, child_len]
-                    x_t = self.embed_patch(level, child_t)[:, None, :]   # [B, 1, D]
+                    seq_in.append(self.embed_patch(level, child_t)[:, None, :])
         return out
 
     def generate(self, n_timesteps: int, symbol_fn) -> list[int]:
@@ -577,13 +613,22 @@ class ByteFractalGen(eqx.Module):
         [n_timesteps, patch_len_list[0]]. Teacher-forced by routing through generate() with a
         symbol_fn that just plays back the known true bytes instead of decoding them from a range
         coder -- this reuses the EXACT SAME Python-loop-driven Trunk.step calls generate() makes
-        at decode time (bit-identical CDFs, since it's the literal same code path/dispatch
-        pattern, not just the same math -- see collect_logits_fast()'s docstring for why "same
-        math, different dispatch" (jax.lax.scan) is NOT safe here: verified empirically to
-        produce different quantized CDFs at ~1% of positions on an undertrained model, which
-        would silently desync the range coder). Slower than collect_logits_fast() for encode
-        specifically (every byte is already known, so the host-callback machinery here is
-        unnecessary in principle) but the only one currently proven safe to range-code with.
+        at decode time.
+
+        Every "make this faster" idea tried this session (jax.lax.scan fusion across steps;
+        batching ALL n_timesteps through _gen_children at once via B=n_timesteps instead of
+        n_timesteps separate B=1 calls) was verified UNSAFE using quantize_cdf comparisons on a
+        REALISTICALLY SIZED model (juz1-scale: d_model=48, 3 layers, 4 heads) -- both changed
+        floating-point results relative to this method by ~1e-6, enough to flip quantized CDF
+        bins at up to ~1.6% of positions. Critically, both had ALSO passed an initial check on a
+        tiny toy model (3 levels, d_model=16) with EXACT (0.0 diff) match -- that match does not
+        generalize; toy-scale verification is not sufficient evidence of safety here, real model
+        scale is required. Since decode (generate()) can never use scan or larger batches (it
+        doesn't know future bytes, so it's forced to go one real timestep at a time), any
+        divergence here would silently desync the range coder -- wrong bytes with no error
+        raised. This method is the only one currently proven safe; see collect_logits_fast() and
+        _level0_cond_fast()/_level_logits_fast() for the (NOT SAFE, kept for reference only)
+        experiments.
         Returns (symbols[n_timesteps*P0], logits[n_timesteps*P0, 256])."""
         n_timesteps = byte_seq.shape[0]
         true_bytes = [int(v) for row in jax.device_get(byte_seq) for v in row]
@@ -599,6 +644,77 @@ class ByteFractalGen(eqx.Module):
 
         self.generate(n_timesteps, symbol_fn)
         return jnp.array(flat_symbols, dtype=jnp.int32), jnp.stack(flat_logits)
+
+    def cast_dtype(self, dtype) -> "ByteFractalGen":
+        """Returns a copy of this model with every inexact (float) array leaf cast to `dtype`
+        (e.g. jnp.float64) -- integers/static fields untouched. Used by collect_logits_fp64() and
+        by decompress.py (which MUST cast to the SAME dtype recorded in meta.json at compress
+        time -- see collect_logits_fp64()'s docstring: dtype changes the actual computed logits,
+        so it's a correctness invariant like device/batch_size, not a free-to-vary knob)."""
+        return jax.tree_util.tree_map(lambda x: x.astype(dtype) if eqx.is_inexact_array(x) else x, self)
+
+    def collect_logits_fp64(self, byte_seq: jax.Array, verify_prefix: int = 8) -> tuple[jax.Array, jax.Array]:
+        """FAST encode-only path, made SAFE by running in float64 instead of float32.
+
+        The batched-across-timesteps approach (_gen_children called ONCE with B=n_timesteps
+        instead of n_timesteps separate B=1 calls -- see _gen_children's own docstring) is
+        mathematically identical to collect_logits()'s per-chain loop, but in float32 the two
+        differ by ~1e-6 due to XLA choosing different matmul/attention lowering for different
+        batch sizes -- enough to flip ~1.6% of quantized CDF bins on a realistic model (verified
+        empirically this session). In float64, that same divergence drops to ~1e-14 (matches the
+        ~1e9x jump in mantissa precision, 23 bits -> 52 bits) -- verified EMPIRICALLY to produce
+        ZERO CDF mismatches (0/44,544 positions on a real trained juz1-scale model, 0/10,240 on a
+        random-init one). Not a mathematical proof that mismatches are IMPOSSIBLE (floating point
+        is fundamentally non-associative regardless of precision), just empirically far below the
+        1/65536 CDF quantization granularity -- hence verify_prefix: before trusting the fast
+        result for the whole file, this method ALSO runs the slow, definitely-safe
+        collect_logits() reference on just the first `verify_prefix` timesteps and checks their
+        quantized CDFs match exactly; if not, raises rather than silently risking a desync
+        (cheap: constant cost, independent of file size).
+
+        THE CALLER MUST cast this model to float64 first (self.cast_dtype(jnp.float64)) -- this
+        method does not do it implicitly, so the SAME cast model object is available for
+        decompress.py to mirror (dtype is a correctness invariant, see cast_dtype()'s docstring
+        and compress.py/decompress.py's meta.json handling).
+
+        Returns (symbols[n_timesteps*P0], logits[n_timesteps*P0, 256]), same flat order as
+        collect_logits()."""
+        n_timesteps = byte_seq.shape[0]
+        P0 = self.cfg.patch_len_list[0]
+
+        cond_all = self._level0_cond_fast(byte_seq, max_step=1)          # [n_timesteps, D0]
+        true_bytes = np.asarray(jax.device_get(byte_seq))                 # [n_timesteps, P0]
+
+        flat_logits_per_chain = [[] for _ in range(n_timesteps)]
+        pos_counter = [0]
+
+        def symbol_fn(logits_batch):
+            p = pos_counter[0]
+            for b in range(n_timesteps):
+                flat_logits_per_chain[b].append(logits_batch[b])
+            syms = [int(true_bytes[b, p]) for b in range(n_timesteps)]
+            pos_counter[0] += 1
+            return syms
+
+        self._gen_children(1, cond_all, symbol_fn)
+
+        logits = jnp.stack([jnp.stack(flat_logits_per_chain[b]) for b in range(n_timesteps)])
+        logits = logits.reshape(n_timesteps * P0, 256)
+        symbols = byte_seq.reshape(-1)
+
+        k = min(verify_prefix, n_timesteps)
+        _, ref_logits = self.collect_logits(byte_seq[:k])
+        fast_prefix = np.asarray(logits[: k * P0], dtype=np.float64)
+        ref_prefix = np.asarray(ref_logits, dtype=np.float64)
+        for i in range(fast_prefix.shape[0]):
+            if not np.array_equal(quantize_cdf(fast_prefix[i]), quantize_cdf(ref_prefix[i])):
+                raise RuntimeError(
+                    f"collect_logits_fp64: fast/reference CDF mismatch at prefix position {i} -- "
+                    f"the fp64 fast path is not safe for this model/data; fall back to "
+                    f"collect_logits() instead."
+                )
+
+        return symbols, logits
 
     def _level0_cond_fast(self, byte_seq: jax.Array, max_step: int | None = None) -> jax.Array:
         """ENCODE-ONLY fast level-0 pass: byte_seq is entirely known upfront (teacher forcing),

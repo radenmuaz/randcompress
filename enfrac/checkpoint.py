@@ -11,6 +11,8 @@ import os
 from dataclasses import asdict
 
 import equinox as eqx
+import jax
+import jax.numpy as jnp
 
 from .model import ByteFractalGen, ModelConfig, trainable_filter
 
@@ -26,13 +28,28 @@ def save_model(ckpt_dir: str, model: ByteFractalGen) -> None:
 _TUPLE_FIELDS = ("patch_len_list", "d_model_list", "n_layers_list", "n_heads_list", "mlp_mult_list")
 
 
-def load_model(ckpt_dir: str) -> ByteFractalGen:
+def load_model(ckpt_dir: str, dtype=None) -> ByteFractalGen:
+    """dtype: if given (e.g. jnp.float64), the loaded model is cast to it via cast_dtype() after
+    loading -- see model.py's collect_logits_fp64() docstring for why dtype is a correctness
+    invariant like device/batch_size, not a free knob (compress/decompress must agree).
+    Checkpoints are always SAVED in float32 (the dtype training ran in) regardless of this
+    argument -- the deserialization skeleton is force-cast to float32 before loading so this
+    works correctly even when the caller has jax_enable_x64 on (jax.random's default float dtype
+    follows x64, which would otherwise make the skeleton's TRAINABLE leaves disagree with what's
+    actually on disk; the frozen W0/A/byte_embed leaves are separately protected by explicit
+    dtype=float32 forcing at their own construction sites in model.py, since -- unlike trainable
+    leaves -- they're never overwritten by deserialization)."""
     with open(os.path.join(ckpt_dir, "config.json")) as f:
         raw = json.load(f)
     for k in _TUPLE_FIELDS:
         raw[k] = tuple(raw[k])
     cfg = ModelConfig(**raw)
     skeleton = ByteFractalGen(cfg)
+    skeleton = jax.tree_util.tree_map(
+        lambda x: x.astype(jnp.float32) if eqx.is_inexact_array(x) else x, skeleton)
     trainable_skeleton, static = eqx.partition(skeleton, trainable_filter(skeleton))
     trainable = eqx.tree_deserialise_leaves(os.path.join(ckpt_dir, "model.eqx"), trainable_skeleton)
-    return eqx.combine(trainable, static)
+    model = eqx.combine(trainable, static)
+    if dtype is not None:
+        model = model.cast_dtype(dtype)
+    return model

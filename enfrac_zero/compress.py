@@ -5,6 +5,17 @@ collect_logits() is called ONCE over the entire level-0 timestep sequence -- the
 "batch_size" concept, no chunk grouping, nothing left to disagree about between compress and
 decompress. `device` still must match (see decompress.py's module docstring) -- TPU/GPU/CPU
 backends compute matmuls differently, which would desync the range coder.
+
+dtype="float64" (default) uses model.collect_logits_fp64() -- a much faster encode path (batches
+ALL level-0 timesteps through the local recursion at once instead of one at a time) that's only
+numerically safe in float64: verified empirically this session that the same batching in float32
+flips ~1.6-2.3% of quantized CDF bins relative to the reference (real matmul/attention lowering
+differs by batch size in XLA), while in float64 that drops to 0/44,544+ mismatches across both a
+random-init and a real trained model. dtype is therefore a correctness invariant exactly like
+device/batch_size (see decompress.py) -- it changes the actual computed logits, so
+compress/decompress MUST agree; recorded in meta.json, read back automatically, no decode-side
+override. dtype="float32" falls back to the slower but simpler-history collect_logits() path
+(no fp64, no batching) if ever needed.
 """
 from __future__ import annotations
 
@@ -26,7 +37,7 @@ from .checkpoint import load_model, save_model
 from .model import trainable_filter
 
 
-def encode(model, raw_bytes: np.ndarray, out_dir: str, device: str = "cpu") -> None:
+def encode(model, raw_bytes: np.ndarray, out_dir: str, device: str = "cpu", dtype: str = "float64") -> None:
     t_wall = time.perf_counter()
 
     P0 = model.cfg.patch_len_list[0]
@@ -35,14 +46,25 @@ def encode(model, raw_bytes: np.ndarray, out_dir: str, device: str = "cpu") -> N
     ctx = jnp.asarray(chunks.astype(np.int32))
 
     t0 = time.perf_counter()
-    print("  collect logits (level 0 attends across the whole sequence)...", flush=True)
-    # Not jit-wrapped: collect_logits() -> generate() calls a symbol_fn from python-level
-    # control flow (see decompress.py's symbol_fn comment for why that must stay eager).
-    symbols_t, logits_t = model.collect_logits(ctx)
+    if dtype == "float64":
+        print("  collect logits (fp64 fast path, batched across all timesteps)...", flush=True)
+        # `model` stays float32 throughout (that's what gets saved to the bundle below --
+        # checkpoints are always float32, see checkpoint.py's load_model docstring); cast a
+        # WORKING COPY to float64 just for this computation.
+        symbols_t, logits_t = model.cast_dtype(jnp.float64).collect_logits_fp64(ctx)
+    else:
+        print("  collect logits (level 0 attends across the whole sequence)...", flush=True)
+        # Not jit-wrapped: collect_logits() -> generate() calls a symbol_fn from python-level
+        # control flow (see decompress.py's symbol_fn comment for why that must stay eager).
+        symbols_t, logits_t = model.collect_logits(ctx)
     t_logits = time.perf_counter() - t0
 
     symbols_np = np.asarray(symbols_t, dtype=np.int32)
-    logits_np = np.asarray(logits_t, dtype=np.float32)
+    # IMPORTANT: keep logits_t's own dtype here (float64 when dtype="float64") -- downcasting to
+    # float32 before quantize_cdf would throw away exactly the precision the fp64 forward pass
+    # was computed for, reintroducing the same magnitude of rounding error we're avoiding (see
+    # collect_logits_fp64()'s docstring / this file's module docstring for why that matters).
+    logits_np = np.asarray(logits_t, dtype=np.float64 if dtype == "float64" else np.float32)
 
     logp = jax.nn.log_softmax(logits_t.astype(jnp.float32), axis=-1)
     ce_bits = float(-jnp.take_along_axis(logp, symbols_t[:, None], axis=-1).sum()) / math.log(2)
@@ -80,7 +102,8 @@ def encode(model, raw_bytes: np.ndarray, out_dir: str, device: str = "cpu") -> N
     meta = dict(n_raw_bytes=n_raw, rc_bytes=rc_bytes, param_bytes=param_bytes,
                total_bytes=tot_bytes, ratio=ratio,
                T_valid=T_valid, n_wrong=n_wrong, argmax_acc=argmax_acc, ce_bpb=ce_bpb,
-               device=device)   # decompress.py MUST reuse this exact backend -- see its docstring
+               device=device,   # decompress.py MUST reuse this exact backend -- see its docstring
+               dtype=dtype)     # decompress.py MUST reuse this exact dtype -- see module docstring
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
@@ -108,13 +131,20 @@ def main() -> None:
                    help="jax backend for the collect_logits() recursion. Defaults to cpu -- see "
                         "enfrac/compress.py's --device help for why. Must be set before any "
                         "other jax call, so this flag is read before --ckpt is loaded.")
+    p.add_argument("--dtype", type=str, default="float64", choices=["float64", "float32"],
+                   help="compute dtype for collect_logits -- float64 (default) uses the fast "
+                        "collect_logits_fp64() path (only numerically safe in float64, see "
+                        "module docstring); float32 falls back to the slower collect_logits(). "
+                        "Must be set before any other jax call (enables jax_enable_x64).")
     args = p.parse_args()
 
     jax.config.update("jax_platform_name", args.device)
+    if args.dtype == "float64":
+        jax.config.update("jax_enable_x64", True)
 
-    model = load_model(args.ckpt)
+    model = load_model(args.ckpt)   # always float32 on disk -- see checkpoint.py's load_model
     raw_bytes = load_bytes(args.input)
-    encode(model, raw_bytes, args.output, device=args.device)
+    encode(model, raw_bytes, args.output, device=args.device, dtype=args.dtype)
 
 
 if __name__ == "__main__":

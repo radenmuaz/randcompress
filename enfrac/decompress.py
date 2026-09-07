@@ -2,7 +2,10 @@
 whole file's timesteps (see model.py's module docstring) -- decoding is autoregressive at level 0
 by necessity (future bytes genuinely unknown), one call to generate() covering all n_timesteps.
 `device` must match compress.py's choice (TPU/GPU/CPU matmuls aren't bit-identical to each other,
-see load_bundle() below).
+see load_bundle() below); `dtype` must ALSO match (see compress.py's module docstring) -- float32
+vs float64 arithmetic produces different logits, which would desync the range coder just as
+fatally as a device/batch_size mismatch. Both are read from meta.json automatically, no CLI
+override.
 """
 from __future__ import annotations
 
@@ -11,6 +14,7 @@ import os
 import time
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 
 from .codec import quantize_cdf, RCDecoder
@@ -18,17 +22,21 @@ from .checkpoint import load_model
 
 
 def load_bundle(bundle_dir: str):
-    # Read meta.json's `device` BEFORE constructing the model -- jax_platform_name must be set
-    # before the first jax call (model construction creates arrays), and compress.py's chosen
-    # backend MUST be reused exactly: TPU/GPU/CPU matmuls aren't bit-identical to each other any
-    # more than differently-batched ones are (see module docstring), so a backend mismatch
-    # desyncs the range coder just as fatally as a batch_size mismatch would. No CLI override is
-    # exposed here on purpose, mirroring batch_size -- this is not a knob to hand-tune.
+    # Read meta.json's `device`/`dtype` BEFORE constructing the model -- jax_platform_name/
+    # jax_enable_x64 must be set before the first jax call (model construction creates arrays),
+    # and compress.py's chosen backend/dtype MUST be reused exactly: TPU/GPU/CPU matmuls aren't
+    # bit-identical to each other any more than float32 vs float64 arithmetic is (see module
+    # docstring), so a mismatch desyncs the range coder just as fatally as a batch_size mismatch
+    # would. No CLI override is exposed here on purpose, mirroring batch_size -- not a knob to
+    # hand-tune.
     with open(os.path.join(bundle_dir, "meta.json")) as f:
         meta = json.load(f)
     jax.config.update("jax_platform_name", meta.get("device", "cpu"))
+    dtype_str = meta.get("dtype", "float32")
+    if dtype_str == "float64":
+        jax.config.update("jax_enable_x64", True)
 
-    model = load_model(bundle_dir)
+    model = load_model(bundle_dir, dtype=jnp.float64 if dtype_str == "float64" else None)
     with open(os.path.join(bundle_dir, "rc_stream.bin"), "rb") as f:
         rc_stream = f.read()
     return model, rc_stream, meta
@@ -47,6 +55,7 @@ def decode(bundle_dir: str, output_path: str, verify_path: str | None = None) ->
           f"n_timesteps={n_timesteps}")
 
     decoder = RCDecoder(rc_stream)
+    logits_np_dtype = np.float64 if meta.get("dtype", "float32") == "float64" else np.float32
 
     def symbol_fn(logits_batch) -> list:
         # NOT jit-compatible on purpose: generate() calls this from python-level control flow
@@ -55,7 +64,10 @@ def decode(bundle_dir: str, output_path: str, verify_path: str | None = None) ->
         # with abstract tracers instead of actually decoding, silently corrupting the RC state
         # machine. The state itself now lives in C (rc_codec.c's rc_decode_step), not
         # reimplemented in Python -- see codec.py's RCDecoder docstring.
-        cf = quantize_cdf(np.asarray(logits_batch[0], dtype=np.float32))
+        # IMPORTANT: preserve logits_batch's own dtype (float64 when meta["dtype"]=="float64")
+        # here -- downcasting to float32 would compute a DIFFERENT CDF than compress.py did,
+        # desyncing the range coder (see compress.py's module docstring).
+        cf = quantize_cdf(np.asarray(logits_batch[0], dtype=logits_np_dtype))
         sym = decoder.decode_one(cf)
         return [sym]
 
