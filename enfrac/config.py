@@ -18,15 +18,37 @@ from dataclasses import dataclass
 
 @dataclass
 class TrainConfig:
+    """Level 0 is a real causal AR transformer whose sequence IS the file's level-0 timesteps --
+    a "level-0 timestep" means one PATCH of patch_len_list[0] bytes (fixed across the whole
+    sequence), NOT one byte. E.g. quran-uthmani.txt at patch_len_list[0]=1024 has 1329 level-0
+    timesteps (ceil(1,359,946 / 1024)), each one a 1024-byte patch -- not 1,359,946 single-byte
+    timesteps. Training is teacher-forced and FULLY PARALLEL across those (patch-granularity)
+    timesteps -- one causally-masked attention computation, like training any GPT-style
+    transformer on a long sequence. No recurrence, no per-step state carry, no stop_gradient
+    anywhere.
+
+    remat_time / remat_depth control memory via jax.checkpoint (remat), NOT approximation --
+    remat recomputes forward activations during backward instead of storing them, so gradients
+    stay exact regardless of how finely either axis is split (unlike TBPTT-style stop_gradient
+    truncation, which this deliberately does NOT use). Both are strings, parsed like log_every:
+    a float ("0.5") is a FRACTION of that axis per remat group, an int ("512") is an EXACT count
+    -- level-0 timesteps (patches, not bytes) for remat_time, transformer layers for remat_depth
+    -- "1.0" (default, both axes) means one remat group spanning the whole axis. remat_time
+    chunking works by accumulating a running (real, non-detached) KV cache across time-groups --
+    each group's queries attend against the full accumulated K/V, exactly reproducing one-shot
+    full attention, just computed (and checkpointed) in pieces for memory. remat_depth
+    independently checkpoints groups of transformer layers within a Trunk.
+
+    n_epochs: full passes over the whole file (each a single full-sequence forward+backward)."""
     dataset: str = "datasets/juz1.txt"
     log_dir: str = "logs/enfrac/run"
-    steps: int = 3000
-    lr: float = 3e-3
-    warmup_steps: int = 50
+    lr: float = 1e-3                  # fixed, no warmup schedule -- see class docstring
     grad_clip: float = 1.0
-    log_every: str = "100"
+    remat_time: str = "1.0"           # fraction OR exact count of level-0 timesteps (patches,
+                                        # not bytes) per remat group
+    remat_depth: str = "1.0"          # fraction OR exact count of transformer layers per remat group
+    n_epochs: int = 5                 # full passes over the whole file
     seed: int = 0
-    per_device_batch: int = 1   # chunks per device per step; multiplied by jax.local_device_count()
 
 
 def load_config_file(path: str):

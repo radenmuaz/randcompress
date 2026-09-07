@@ -6,6 +6,16 @@
  * API:
  *   rc_encode(cdfs, symbols, n_sym, V, out_buf, out_cap) -> bytes written, or (size_t)-1 on overflow
  *   rc_decode(in_buf, in_len, cdfs, n_sym, V, out_syms) -> 0
+ *     -- both of the above require the FULL cdfs array upfront; only usable when every symbol's
+ *     CDF is already known (e.g. compress.py's post-encode verification decode).
+ *   rc_decode_init(in_buf, in_len, low_io, high_io, code_io, pos_io) -> void
+ *   rc_decode_step(in_buf, in_len, pos_io, low_io, high_io, code_io, cf, V) -> sym
+ *     -- incremental one-symbol-at-a-time decode: the caller supplies each symbol's CDF only
+ *     when it's ready to decode that symbol (e.g. after computing it from a model call that
+ *     depends on the PREVIOUSLY decoded symbol -- genuinely sequential, can't be batched). This
+ *     is the real per-symbol arithmetic rc_decode()'s loop body uses, factored out so it can be
+ *     driven one call at a time from outside C instead of being reimplemented in the caller's
+ *     own language.
  *
  * CDF layout: cdfs[t*(V+1) .. t*(V+1)+V] = cumulative freqs for position t.
  * cdfs[t][0] = 0, cdfs[t][V] = M = 65536.  All values int32_t >= 0.
@@ -113,4 +123,65 @@ int rc_decode(const uint8_t *in_buf, size_t in_len,
         }
     }
     return 0;
+}
+
+/* ── Incremental (one-symbol-at-a-time) decoder ───────────────────────────
+ * For real decompression, where each symbol's CDF depends on a model call that itself depends
+ * on the previously decoded symbol -- the caller can't hand over a full cdfs array upfront the
+ * way rc_decode() needs. rc_decode_init() sets up (low, high, code, pos) exactly like rc_decode's
+ * preamble; rc_decode_step() is rc_decode's per-symbol loop body, called once per symbol with
+ * that symbol's own cf[] (stride V+1, cf[0]=0, cf[V]=65536) and the state threaded through via
+ * pointers (mirrors rc_decode()'s own local low/high/code/pos, just persisted across calls
+ * instead of looping internally).
+ */
+
+void rc_decode_init(const uint8_t *in_buf, size_t in_len,
+                     uint64_t *low_io, uint64_t *high_io, uint64_t *code_io, size_t *pos_io)
+{
+    uint64_t code = 0;
+    size_t   pos  = 0;
+    for (int i = 0; i < 8; ++i)
+        code = (code << 8) | (pos < in_len ? in_buf[pos++] : 0);
+    *low_io  = 0;
+    *high_io = UINT64_MAX;
+    *code_io = code;
+    *pos_io  = pos;
+}
+
+int32_t rc_decode_step(const uint8_t *in_buf, size_t in_len, size_t *pos_io,
+                        uint64_t *low_io, uint64_t *high_io, uint64_t *code_io,
+                        const int32_t *cf, int32_t V)
+{
+    uint64_t low  = *low_io;
+    uint64_t high = *high_io;
+    uint64_t code = *code_io;
+    size_t   pos  = *pos_io;
+    u128     range = (u128)high - (u128)low + 1;
+
+    int32_t lo = 0, hi = V - 1;
+    while (lo < hi) {
+        int32_t mid = (lo + hi + 1) / 2;
+        if (low + scale(range, (uint64_t)(uint32_t)cf[mid]) <= code)
+            lo = mid;
+        else
+            hi = mid - 1;
+    }
+    int32_t sym = lo;
+
+    uint64_t cum_lo = (uint64_t)(uint32_t)cf[sym];
+    uint64_t cum_hi = (uint64_t)(uint32_t)cf[sym + 1];
+    high = low + scale(range, cum_hi) - 1;
+    low  = low + scale(range, cum_lo);
+
+    while ((low >> 56) == (high >> 56)) {
+        low  <<= 8;
+        high  = (high << 8) | 0xFFULL;
+        code  = (code << 8) | (pos < in_len ? in_buf[pos++] : 0);
+    }
+
+    *low_io  = low;
+    *high_io = high;
+    *code_io = code;
+    *pos_io  = pos;
+    return sym;
 }

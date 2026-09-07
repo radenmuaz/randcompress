@@ -1,5 +1,8 @@
-"""Decompress a range-coded baseline ByteFractalGen bundle -> original file. Identical scheme to
-enfrac/decompress.py (see its module docstring) -- only the checkpoint import differs.
+"""Decompress a range-coded baseline ByteFractalGen bundle -> original file. Level 0 attends
+across the whole file's timesteps (see model.py's module docstring) -- decoding is autoregressive
+at level 0 by necessity (future bytes genuinely unknown), one call to generate() covering all
+n_timesteps. `device` must match compress.py's choice (TPU/GPU/CPU matmuls aren't bit-identical
+to each other, see load_bundle() below).
 """
 from __future__ import annotations
 
@@ -11,44 +14,8 @@ import jax
 import numpy as np
 from tqdm import tqdm
 
-from enfrac.codec import quantize_cdf, RC_M
+from enfrac.codec import quantize_cdf, RCDecoder
 from .checkpoint import load_model
-
-
-def _rc_init(stream: bytes):
-    buf = np.frombuffer(stream, dtype=np.uint8)
-    code = 0
-    pos = 0
-    for _ in range(8):
-        code = (code << 8) | (int(buf[pos]) if pos < len(buf) else 0)
-        pos += 1
-    low = 0
-    high = (1 << 64) - 1
-    return low, high, code, pos, buf
-
-
-def _rc_decode_one(low: int, high: int, code: int, pos: int, buf: np.ndarray, cf: np.ndarray, V: int):
-    M = RC_M
-    rng = high - low + 1
-    lo_s, hi_s = 0, V - 1
-    while lo_s < hi_s:
-        mid = (lo_s + hi_s + 1) // 2
-        if low + rng * int(cf[mid]) // M <= code:
-            lo_s = mid
-        else:
-            hi_s = mid - 1
-    sym = lo_s
-    cum_lo = int(cf[sym])
-    cum_hi = int(cf[sym + 1])
-    high = low + rng * cum_hi // M - 1
-    low = low + rng * cum_lo // M
-    while (low >> 56) == (high >> 56):
-        low = (low << 8) & 0xFFFFFFFFFFFFFFFF
-        high = ((high << 8) | 0xFF) & 0xFFFFFFFFFFFFFFFF
-        b = int(buf[pos]) if pos < len(buf) else 0
-        code = ((code << 8) | b) & 0xFFFFFFFFFFFFFFFF
-        pos += 1
-    return sym, low, high, code, pos
 
 
 def load_bundle(bundle_dir: str):
@@ -71,38 +38,27 @@ def decode(bundle_dir: str, output_path: str, verify_path: str | None = None) ->
 
     n_raw = meta["n_raw_bytes"]
     P0 = model.cfg.patch_len_list[0]
-    n_chunks = -(-n_raw // P0)
-    batch_size = meta.get("batch_size", 1)
-    V = 256
+    n_timesteps = -(-n_raw // P0)   # ceil -- level-0 timesteps, each P0 bytes
 
     print(f"Bundle: {bundle_dir}")
     print(f"  n_raw={n_raw}  patch_len_list={model.cfg.patch_len_list}  rc_bytes={meta['rc_bytes']}  "
-          f"batch_size={batch_size}")
+          f"n_timesteps={n_timesteps}")
 
-    low, high, code, pos, buf = _rc_init(rc_stream)
+    decoder = RCDecoder(rc_stream)
 
-    def make_symbol_fn(Bg: int):
-        def symbol_fn(logits_batch) -> list:
-            nonlocal low, high, code, pos
-            logits_np = np.asarray(logits_batch, dtype=np.float32)
-            syms = []
-            for b in range(Bg):
-                cf = quantize_cdf(logits_np[b])
-                sym, low, high, code, pos = _rc_decode_one(low, high, code, pos, buf, cf, V)
-                syms.append(sym)
-            return syms
-        return symbol_fn
+    def symbol_fn(logits_batch) -> list:
+        # NOT jit-compatible on purpose: generate() calls this from python-level control flow
+        # with real host-side state (the RCDecoder's low/high/code/pos) that needs CONCRETE
+        # values every call -- wrapping the outer generate() call in jit would trace this once
+        # with abstract tracers instead of actually decoding, silently corrupting the RC state
+        # machine. The state itself now lives in C (rc_codec.c's rc_decode_step), not
+        # reimplemented in Python -- see enfrac/codec.py's RCDecoder docstring.
+        cf = quantize_cdf(np.asarray(logits_batch[0], dtype=np.float32))
+        sym = decoder.decode_one(cf)
+        return [sym]
 
-    all_bytes = []
     t0 = time.perf_counter()
-    with tqdm(total=n_chunks, desc="decode", unit="chunk") as pbar:
-        for start in range(0, n_chunks, batch_size):
-            end = min(start + batch_size, n_chunks)
-            Bg = end - start
-            chunks_bytes = model.generate(make_symbol_fn(Bg), batch_size=Bg)
-            for cb in chunks_bytes:
-                all_bytes.extend(cb)
-            pbar.update(Bg)
+    all_bytes = model.generate(n_timesteps, symbol_fn)
     t_dec = time.perf_counter() - t0
 
     raw_out = bytes(all_bytes[:n_raw])

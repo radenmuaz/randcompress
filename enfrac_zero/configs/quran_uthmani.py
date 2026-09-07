@@ -1,39 +1,31 @@
-"""Full quran-uthmani.txt (~1.36MB) config -- deliberately small/fast model (sanity-scale, like
-overfitter/README.md's "sanity checks" section, not its longer "real run" one): proves the
-pipeline handles the full file end to end within a reasonable session, not a tuned compression
-ratio (it happens to actually compress at this scale -- see logs/enfrac_zero/quran_uthmani_compressed/meta.json
-from the last run -- but that wasn't optimized for). share_trunk=True keeps param count down and
-keeps model.py construction (one Trunk regardless of n_levels) cheap.
+"""quran-uthmani.txt (~1.4MB) -- the real-compression demo config (see README/CLAUDE.md).
 
   uv run python -m enfrac_zero.train --config enfrac_zero/configs/quran_uthmani.py --log_dir logs/enfrac_zero/quran_uthmani
 
-See enfrac/configs/quran_uthmani.py for the HiRA counterpart. `seed` spelled out explicitly (see
-fatihah.py's docstring for why) -- same value as ModelConfig's default.
-
-compress.py/decompress.py's per-byte python recursion (generate()/collect_logits(), see
-enfrac/model.py's determinism-contract docstring for why it can't be batched away -- the same
-bit-exactness discipline applies here even though this model has no frozen base to reconstruct)
-means wall time scales with n_raw_bytes / batch_size regardless of patch_len_list --
-batch_size=128 here to keep that under a few minutes on CPU.
+See enfrac/configs/quran_uthmani.py for the HiRA counterpart. patch_len_list=(4096,512,64,8,1)
+-> n_levels=5, level-0 n_timesteps = ceil(1,359,946/4096) = 333 (uniform seq_len=8 at every level
+transition) -- chosen specifically to keep level-0's own attention sequence well under ~1-2k
+timesteps (see the enwik8 config's docstring for the general sizing approach at bigger scale).
 """
 
 model = dict(
-    patch_len_list=(64, 16, 4, 1),
-    d_model_list=(32, 32, 32),
-    n_layers_list=(2, 2, 2),
-    n_heads_list=(4, 4, 4),
-    mlp_mult_list=(2, 2, 2),
-    byte_embed_dim=64,
-    share_trunk=True,
+    patch_len_list=(4096, 512, 64, 8, 1),
+    d_model_list=(64, 64, 64, 64, 64),
+    n_layers_list=(4, 4, 4, 4, 4),
+    n_heads_list=(4, 4, 4, 4, 4),
+    mlp_mult_list=(2, 2, 2, 2, 2),
+    byte_embed_dim=128,
+    patch_in_scheme="mean_pool",
     seed=0,
 )
 
 train = dict(
     dataset="quran_data/quran-uthmani.txt",
-    steps=6000,
+    log_dir="logs/enfrac_zero/quran_uthmani",
     lr=3e-3,
-    warmup_steps=200,
-    log_every="1000",
+    grad_clip=1.0,
+    remat_time="1.0",
+    remat_depth="1.0",
+    n_epochs=20,
+    seed=0,
 )
-
-compress = dict(batch_size=128)

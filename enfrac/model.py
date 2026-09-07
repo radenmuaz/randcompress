@@ -1,5 +1,5 @@
 """enfrac (JAX/Equinox port of overfitter_peft): byte-level FractalAR
-(arxiv.org/html/2502.17437v2), same recursive architecture as enfrac/baseline/model.py, but every
+(arxiv.org/html/2502.17437v2), same recursive architecture as enfrac_zero/model.py, but every
 Linear defaults to a HiRA-adapted frozen-base layer instead of a plain trainable linear -- see
 randcompress's (archived, see archive/randcompress/models/hira.py) original HiRA design this is
 ported from (W = W0 + W0*(B@A), only B trainable, W0/A regenerated deterministically from
@@ -10,7 +10,7 @@ baseline's "small model, everything trained directly" tradeoff for "arbitrarily 
 base, tiny trainable adapter" -- d_model/mlp_mult/byte_embed_dim become nearly free to grow
 (O(d) compute, O(r) storage per layer) instead of directly taxing the compressed bundle size.
 use_hira=True is the default (set use_hira=False on ModelConfig to fall back to plain linears,
-matching enfrac/baseline/'s architecture exactly, modulo the JAX/Equinox backend).
+matching enfrac_zero/'s architecture exactly, modulo the JAX/Equinox backend).
 
 IMPORTANT determinism contract: HiraLinear's frozen (W0, A) are drawn from a single KeySeq (a
 jax.random.PRNGKey threaded via jax.random.split, mirroring PyTorch's torch.Generator) passed
@@ -32,6 +32,22 @@ point matmuls aren't perfectly associative, so a batched recompute and a step-by
 of the "same" math can disagree in the last bit, which is enough to desync range coding.
 forward()/__call__() (the fast batched path) is fine for training loss -- never for the CDFs
 that get range-coded.
+
+LEVEL 0 IS A REAL, FULL-SEQUENCE CAUSAL AR TRANSFORMER, INDEXING CONVENTION, AND THE TWO
+patch_in SCHEMES: identical to enfrac_zero/model.py's module docstring (n_levels =
+len(patch_len_list); patch_len_list[l] is level l's OWN patch size for every level including 0;
+level 0 has no parent -- root_cond is fed directly, no cond_proj[0]; cfg.patch_in_scheme is
+"mean_pool" (default, params/compute independent of patch_len) or "linear" (exact but scales
+with patch_len -- only tractable for small patches). Read that docstring for the full rationale;
+it is not duplicated here except where HiRA changes something.
+
+An EARLIER version of this file carried a single fixed-size state vector (cond_out -> next
+chunk's cond_in) between per-chunk calls -- that was an RNN-style bottleneck and was WRONG (see
+enfrac_zero/model.py's docstring for why). There is no chunk carry anymore: level 0's sequence
+IS the whole file's level-0 timesteps, attended in one causally-masked, fully parallel pass
+(remat_time/remat_depth control jax.checkpoint granularity only, exact gradients either way).
+This applies identically whether use_hira is True or False -- the recursion structure is shared;
+only the Linear type differs.
 """
 from __future__ import annotations
 
@@ -135,6 +151,36 @@ def make_linear(d_in: int, d_out: int, cfg: "ModelConfig", keyseq: KeySeq):
     return PlainLinear(d_in, d_out, keyseq)
 
 
+class PatchInLinear(eqx.Module):
+    """"linear" patch_in scheme -- see module docstring. proj: make_linear(patch_len*Ebyte -> D).
+    Params/compute scale with patch_len; only use for small patch_len."""
+    proj: eqx.Module
+    patch_len: int = eqx.field(static=True)
+    byte_embed_dim: int = eqx.field(static=True)
+
+    def __init__(self, patch_len: int, byte_embed_dim: int, d_out: int, cfg: "ModelConfig", keyseq: KeySeq):
+        self.patch_len = patch_len
+        self.byte_embed_dim = byte_embed_dim
+        self.proj = make_linear(patch_len * byte_embed_dim, d_out, cfg, keyseq)
+
+    def __call__(self, emb: jax.Array) -> jax.Array:
+        flat = emb.reshape(*emb.shape[:-2], self.patch_len * self.byte_embed_dim)
+        return self.proj(flat)
+
+
+class PatchInMeanPool(eqx.Module):
+    """"mean_pool" patch_in scheme (default) -- see module docstring. Mean-pools byte embeddings
+    across the patch_len axis, then make_linear(Ebyte -> D), independent of patch_len."""
+    proj: eqx.Module
+
+    def __init__(self, byte_embed_dim: int, d_out: int, cfg: "ModelConfig", keyseq: KeySeq):
+        self.proj = make_linear(byte_embed_dim, d_out, cfg, keyseq)
+
+    def __call__(self, emb: jax.Array) -> jax.Array:
+        pooled = emb.mean(axis=-2)
+        return self.proj(pooled)
+
+
 class RMSNorm(eqx.Module):
     weight: jax.Array
     eps: float = eqx.field(static=True)
@@ -174,6 +220,28 @@ class Attn(eqx.Module):
         y = sdpa(q, k, v, mask)
         return self.out(y.transpose(0, 2, 1, 3).reshape(B, T, D))
 
+    def step(self, x: jax.Array, cos_t: jax.Array, sin_t: jax.Array, t: jax.Array,
+              k_cache: jax.Array, v_cache: jax.Array):
+        """One-token incremental step for a FIXED-SIZE, preallocated KV cache -- see
+        enfrac_zero/model.py's Attn.step docstring (identical logic, HiRA-agnostic: wq/wk/wv/out
+        are whichever Linear cfg.use_hira selects, called the same way either way)."""
+        B, T, D = x.shape   # T == 1
+        H, hd = self.n_heads, self.head_dim
+        q = self.wq(x).reshape(B, T, H, hd).transpose(0, 2, 1, 3)
+        k_t = self.wk(x).reshape(B, T, H, hd).transpose(0, 2, 1, 3)
+        v_t = self.wv(x).reshape(B, T, H, hd).transpose(0, 2, 1, 3)
+        q, k_t = apply_rope(q, cos_t, sin_t), apply_rope(k_t, cos_t, sin_t)
+        k_cache = jax.lax.dynamic_update_slice(k_cache, k_t, (0, 0, t, 0))
+        v_cache = jax.lax.dynamic_update_slice(v_cache, v_t, (0, 0, t, 0))
+        max_len = k_cache.shape[2]
+        valid = jnp.arange(max_len) <= t                              # [max_len] -- causal mask
+        scores = jnp.einsum("bhtd,bhsd->bhts", q, k_cache) / math.sqrt(hd)   # [1,H,1,max_len]
+        scores = jnp.where(valid[None, None, None, :], scores, jnp.finfo(scores.dtype).min)
+        attn = jax.nn.softmax(scores, axis=-1)
+        y = jnp.einsum("bhts,bhsd->bhtd", attn, v_cache)
+        out = self.out(y.transpose(0, 2, 1, 3).reshape(B, T, D))
+        return out, k_cache, v_cache
+
 
 class SwiGLU(eqx.Module):
     gate: eqx.Module
@@ -207,6 +275,19 @@ class Block(eqx.Module):
         x = x + self.mlp(self.ln2(x))
         return x
 
+    def step(self, x: jax.Array, cos_t: jax.Array, sin_t: jax.Array, t: jax.Array,
+              k_cache: jax.Array, v_cache: jax.Array):
+        attn_out, k_cache, v_cache = self.attn.step(self.ln1(x), cos_t, sin_t, t, k_cache, v_cache)
+        x = x + attn_out
+        x = x + self.mlp(self.ln2(x))
+        return x, k_cache, v_cache
+
+
+def _remat_group_size(spec: str, total: int) -> int:
+    """'0.5' -> fraction of total (rounded, >=1); '512' -> exact count, capped at total."""
+    n = max(1, round(float(spec) * total)) if "." in spec else int(spec)
+    return min(max(1, n), total)
+
 
 class Trunk(eqx.Module):
     """One level's transformer: a Block stack + final norm. Instantiated once per level by
@@ -230,17 +311,70 @@ class Trunk(eqx.Module):
             x = blk(x, cos, sin, mask)
         return self.ln_f(x)
 
+    def init_kv_cache(self, max_len: int, batch: int = 1):
+        """Preallocated, FIXED-SIZE (max_len = that level's seq_len, or n_timesteps for level 0)
+        zero KV cache, one (k, v) pair per block -- see enfrac_zero/model.py's
+        Trunk.init_kv_cache docstring (identical, HiRA-agnostic). `batch` is the number of
+        independent parallel local sequences sharing this cache's shape -- 1 for level 0, or Bcur
+        (all parents at that level) for levels 1+."""
+        return [
+            (jnp.zeros((batch, blk.attn.n_heads, max_len, blk.attn.head_dim)),
+             jnp.zeros((batch, blk.attn.n_heads, max_len, blk.attn.head_dim)))
+            for blk in self.blocks
+        ]
+
+    def step(self, x: jax.Array, t: jax.Array, rope_base: float, kv_cache: list):
+        """Real incremental KV-cache decoding for ONE new level-0 timestep -- see
+        enfrac_zero/model.py's Trunk.step docstring for the full rationale (O(t) per step,
+        O(n_timesteps^2) total, vs the old O(n_timesteps^3) recompute-from-scratch). t must be a
+        traced jnp scalar (not a python int) so the caller's single jit trace is reused."""
+        cos_t, sin_t = rope_cos_sin_for_positions(jnp.asarray(t)[None], self.head_dim, rope_base)
+        new_cache = []
+        for blk, (k_c, v_c) in zip(self.blocks, kv_cache):
+            x, k_c, v_c = blk.step(x, cos_t, sin_t, t, k_c, v_c)
+            new_cache.append((k_c, v_c))
+        return self.ln_f(x), new_cache
+
+    def forward_remat(self, x: jax.Array, rope_base: float, remat_time: str, remat_depth: str) -> jax.Array:
+        """Level 0's full-sequence forward -- IDENTICAL math to __call__ (real causal attention
+        over the whole sequence, no truncation, no detach), just computed under jax.checkpoint
+        for memory. See enfrac_zero/model.py's Trunk.forward_remat -- identical logic, HiRA-
+        agnostic (operates only on the Block list)."""
+        T = x.shape[1]
+        pos = jnp.arange(T)
+        cos, sin = rope_cos_sin_for_positions(pos, self.head_dim, rope_base)
+        mask = causal_mask(T)
+        depth_group = _remat_group_size(remat_depth, len(self.blocks))
+        time_group = _remat_group_size(remat_time, T)
+
+        def run_all_layers(x):
+            for start in range(0, len(self.blocks), depth_group):
+                group = self.blocks[start:start + depth_group]
+                def run_group(x, group=group):
+                    for blk in group:
+                        x = blk(x, cos, sin, mask)
+                    return x
+                x = jax.checkpoint(run_group)(x) if depth_group < len(self.blocks) else run_group(x)
+            return x
+
+        x = jax.checkpoint(run_all_layers)(x) if time_group < T else run_all_layers(x)
+        return self.ln_f(x)
+
 
 @dataclass(frozen=True)
 class ModelConfig:
-    patch_len_list: tuple = (1024, 128, 16, 1)   # last element must be 1 (byte-atomic)
-    d_model_list: tuple = (64, 64, 64)           # length = n_levels = len(patch_len_list)-1
-    n_layers_list: tuple = (4, 4, 4)
-    n_heads_list: tuple = (4, 4, 4)
-    mlp_mult_list: tuple = (2, 2, 2)
+    patch_len_list: tuple = (1024, 128, 16, 1)   # patch_len_list[l] = level l's OWN patch size
+                                                    # (all levels, including 0); last elem must be 1
+    d_model_list: tuple = (64, 64, 64, 64)        # length = n_levels = len(patch_len_list)
+    n_layers_list: tuple = (4, 4, 4, 4)
+    n_heads_list: tuple = (4, 4, 4, 4)
+    mlp_mult_list: tuple = (2, 2, 2, 2)
     byte_embed_dim: int = 256                     # decoupled from any level's d_model
     rope_preset: str = "qwen3"
     share_trunk: bool = False                     # opt-in alias; requires matching dims
+    patch_in_scheme: str = "mean_pool"             # "mean_pool" (default) or "linear" -- see
+                                                    # module docstring; applied uniformly to every
+                                                    # level (patch_len==1 levels are unaffected)
     use_hira: bool = True                          # main-package default; False = plain linear
     hira_r: int = 4                                 # HiRA rank -- only used when use_hira=True
     seed: int = 0                                    # drives frozen W0/A -- must match at load time
@@ -282,9 +416,12 @@ class ByteFractalGen(eqx.Module):
         assert cfg.patch_len_list[-1] == 1, "last patch_len must be 1 (byte-atomic terminal level)"
         for a, b in zip(cfg.patch_len_list, cfg.patch_len_list[1:]):
             assert a % b == 0, f"patch_len_list must divide evenly level to level, got {a} -> {b}"
+        assert cfg.patch_in_scheme in ("mean_pool", "linear"), \
+            f"patch_in_scheme must be 'mean_pool' or 'linear', got {cfg.patch_in_scheme!r}"
         self.cfg = cfg
-        self.n_levels = len(cfg.patch_len_list) - 1
-        self.seq_lens = tuple(cfg.patch_len_list[l] // cfg.patch_len_list[l + 1] for l in range(self.n_levels))
+        self.n_levels = len(cfg.patch_len_list)
+        self.seq_lens = (0,) + tuple(
+            cfg.patch_len_list[l - 1] // cfg.patch_len_list[l] for l in range(1, self.n_levels))
         for name, lst in [("d_model_list", cfg.d_model_list), ("n_layers_list", cfg.n_layers_list),
                           ("n_heads_list", cfg.n_heads_list), ("mlp_mult_list", cfg.mlp_mult_list)]:
             assert len(lst) == self.n_levels, f"{name} must have length n_levels={self.n_levels}, got {len(lst)}"
@@ -327,18 +464,26 @@ class ByteFractalGen(eqx.Module):
                 for l in range(self.n_levels)
             ]
 
-        # patch_in[l]: flatten this level's child bytes (via the shared byte_embed) and project
-        # into level l's own working dimension. Uniform formula for intermediate AND terminal
-        # levels (child_len=1 there, just a per-token projection, not really a "patch").
-        self.patch_in = [
-            make_linear(cfg.patch_len_list[l + 1] * cfg.byte_embed_dim, cfg.d_model_list[l], cfg, keyseq)
-            for l in range(self.n_levels)
-        ]
-        # cond_proj[l]: adapt the incoming condition (root_cond for l=0, else parent's d_model)
-        # into level l's own working dimension. Always a real learned adapter.
-        self.cond_proj = [
-            make_linear(cfg.d_model_list[0] if l == 0 else cfg.d_model_list[l - 1], cfg.d_model_list[l], cfg, keyseq)
-            for l in range(self.n_levels)
+        # patch_in[l] embeds level l's OWN patch_len_list[l] bytes -> d_model_list[l]. Every
+        # level uses the same construction, uniformly -- see module docstring for the two schemes.
+        # FIXED order (l=0..n_levels-1), part of the determinism contract.
+        self.patch_in = []
+        for l in range(self.n_levels):
+            P = cfg.patch_len_list[l]
+            d_out = cfg.d_model_list[l]
+            if P == 1:
+                self.patch_in.append(make_linear(cfg.byte_embed_dim, d_out, cfg, keyseq))
+            elif cfg.patch_in_scheme == "linear":
+                self.patch_in.append(PatchInLinear(P, cfg.byte_embed_dim, d_out, cfg, keyseq))
+            else:
+                self.patch_in.append(PatchInMeanPool(cfg.byte_embed_dim, d_out, cfg, keyseq))
+
+        # cond_proj[l]: projects the PARENT's d_model_list[l-1] -> this level's d_model_list[l],
+        # for l>=1 only -- level 0 has no parent (root_cond fed directly, unprojected). FIXED
+        # order (l=1..n_levels-1), part of the determinism contract.
+        self.cond_proj = [None] + [
+            make_linear(cfg.d_model_list[l - 1], cfg.d_model_list[l], cfg, keyseq)
+            for l in range(1, self.n_levels)
         ]
 
         self.head = make_linear(cfg.d_model_list[-1], 256, cfg, keyseq)   # terminal level only
@@ -347,27 +492,52 @@ class ByteFractalGen(eqx.Module):
     def trunk_at(self, level: int) -> "Trunk":
         return self.trunks[0] if self.cfg.share_trunk else self.trunks[level]
 
-    def __call__(self, byte_chunk: jax.Array) -> tuple[jax.Array, dict]:
-        """byte_chunk: [B, patch_len_list[0]] int32. Fast batched path -- training loss only,
-        never for range-coding CDFs (see collect_logits)."""
-        B = byte_chunk.shape[0]
-        cond = jnp.broadcast_to(self.root_cond, (B, self.root_cond.shape[-1]))
-        cur_bytes = byte_chunk
+    def embed_patch(self, level: int, byte_patch: jax.Array) -> jax.Array:
+        """byte_patch: [..., patch_len_list[level]] int32 -> [..., d_model_list[level]]. The one
+        place patch_in[level] is ever called from -- keeps __call__/generate/_gen_children using
+        the exact same embedding math (needed for collect_logits()/generate() bit-exactness)."""
+        P = self.cfg.patch_len_list[level]
+        if P == 1:
+            emb = self.byte_embed(byte_patch[..., 0])          # [..., Ebyte]
+        else:
+            emb = self.byte_embed(byte_patch)                   # [..., P, Ebyte]
+        return self.patch_in[level](emb)
+
+    def __call__(self, byte_seq: jax.Array, remat_time: str = "1.0", remat_depth: str = "1.0"
+                 ) -> tuple[jax.Array, dict]:
+        """byte_seq: [n_timesteps, patch_len_list[0]] int32 -- the WHOLE training window's
+        level-0 sequence (n_timesteps = that many patch_len_list[0]-byte patches -- see
+        config.py's TrainConfig docstring). Level 0 is a real causal AR transformer over ALL
+        n_timesteps at once -- teacher-forced, fully parallel, one causally-masked attention
+        computation (see module docstring: no recurrence, no state carry). remat_time/remat_depth
+        control jax.checkpoint granularity for level 0's forward only -- exact gradients either
+        way, just a memory/recompute tradeoff. Levels 1+ recurse exactly as before: LOCAL
+        attention within one parent patch's own children, batched independently across all
+        n_timesteps parents."""
+        n_timesteps = byte_seq.shape[0]
+
         total_ce_nats = jnp.zeros(())
         total_positions = 0
         total_correct = jnp.zeros(())
 
-        for l in range(self.n_levels):
+        # -- Level 0: full-sequence causal attention, teacher-forced, root_cond fed unprojected --
+        proj0 = self.embed_patch(0, byte_seq)                                        # [n_timesteps, D0]
+        shifted0 = jnp.concatenate([self.root_cond, proj0[:-1]], axis=0)[None, :, :]  # [1, n_timesteps, D0]
+        h0 = self.trunk_at(0).forward_remat(shifted0, self.rope_base, remat_time, remat_depth)
+        cond = h0[0]                                                                   # [n_timesteps, D0]
+
+        cur_bytes = byte_seq   # [n_timesteps, P0] -- level-0 timesteps' own bytes, recursed into levels 1+
+
+        # -- Levels 1+: LOCAL to one parent patch's children, batched over n_timesteps parents --
+        for l in range(1, self.n_levels):
             seq_len = self.seq_lens[l]
-            child_len = self.cfg.patch_len_list[l + 1]
+            child_len = self.cfg.patch_len_list[l]
             cur_bytes = cur_bytes.reshape(-1, seq_len, child_len)
             Bcur = cur_bytes.shape[0]
             D = self.cfg.d_model_list[l]
 
             cond_l = self.cond_proj[l](cond)
-            patch_bytes_emb = self.byte_embed(cur_bytes)                        # [Bcur, seq_len, child_len, Ebyte]
-            flat = patch_bytes_emb.reshape(Bcur, seq_len, child_len * self.cfg.byte_embed_dim)
-            proj = self.patch_in[l](flat)                                       # [Bcur, seq_len, D]
+            proj = self.embed_patch(l, cur_bytes)                                  # [Bcur, seq_len, D]
 
             if child_len == 1:
                 shifted = jnp.concatenate([cond_l[:, None, :], proj[:, :-1]], axis=1)
@@ -393,70 +563,96 @@ class ByteFractalGen(eqx.Module):
         }
         return mean_loss, metrics
 
-    def generate(self, symbol_fn, batch_size: int = 1) -> list[list[int]]:
-        """Generate batch_size independent patch_len_list[0]-byte chunks IN PARALLEL. See
-        overfitter_peft/model.py's docstring -- ported verbatim, only the tensor backend differs.
+    def _gen_children(self, level: int, cond: jax.Array, symbol_fn) -> list[list[int]]:
+        """LOCAL recursion for levels 1+: generate this level's seq_len sub-patches given the
+        incoming (parent) condition, recursing into level+1 for each. Uses the SAME Trunk.step
+        KV-cache mechanism as level 0 (see generate()) -- O(seq_len) per level instead of the old
+        O(seq_len^2) recompute-from-scratch. Still a Python loop (not scan) because symbol_fn is
+        a real host callback here (decode doesn't know the next byte until the range coder
+        produces it) -- that dependency genuinely can't be traced through jax.lax.scan."""
+        B = cond.shape[0]
+        seq_len = self.seq_lens[level]
+        child_len = self.cfg.patch_len_list[level]
+        trunk = self.trunk_at(level)
+        rope_base = self.rope_base
+        cond_l = self.cond_proj[level](cond)                  # [B, D]
+        kv_cache = trunk.init_kv_cache(seq_len, batch=B)
+        x_t = cond_l[:, None, :]                                # [B, 1, D] -- position-0 input
+        out = [[] for _ in range(B)]
+        if child_len == 1:
+            for i in range(seq_len):
+                h_t, kv_cache = trunk.step(x_t, jnp.asarray(i, dtype=jnp.int32), rope_base, kv_cache)
+                logits = self.head(h_t[:, -1, :])                # [B, 256]
+                syms = symbol_fn(logits)                        # list[int], len B
+                for b in range(B):
+                    out[b].append(syms[b])
+                if i < seq_len - 1:
+                    sym_t = jnp.array(syms, dtype=jnp.int32)[:, None]   # [B, 1]
+                    x_t = self.embed_patch(level, sym_t)[:, None, :]     # [B, 1, D]
+        else:
+            for i in range(seq_len):
+                h_t, kv_cache = trunk.step(x_t, jnp.asarray(i, dtype=jnp.int32), rope_base, kv_cache)
+                cond_i = h_t[:, -1, :]                            # [B, D] CONTINUOUS, passed to child unchanged
+                child_bytes = self._gen_children(level + 1, cond_i, symbol_fn)   # list of B lists, len child_len
+                for b in range(B):
+                    out[b].extend(child_bytes[b])
+                if i < seq_len - 1:
+                    child_t = jnp.array(child_bytes, dtype=jnp.int32)   # [B, child_len]
+                    x_t = self.embed_patch(level, child_t)[:, None, :]   # [B, 1, D]
+        return out
 
-        symbol_fn(logits[batch_size, 256]) -> list[int] of length batch_size."""
+    def generate(self, n_timesteps: int, symbol_fn) -> list[int]:
+        """Generate n_timesteps level-0 patches (patch_len_list[0] bytes each) autoregressively
+        -- level 0's causal attention genuinely spans every already-decoded timestep (see module
+        docstring), not a fixed-size carried state.
 
-        def gen_patch(level: int, cond: jax.Array) -> list[list[int]]:
-            B = cond.shape[0]
-            seq_len = self.seq_lens[level]
-            child_len = self.cfg.patch_len_list[level + 1]
-            cond_l = self.cond_proj[level](cond)                  # [B, D]
-            out = [[] for _ in range(B)]
-            seq_in = [cond_l[:, None, :]]                          # [B, 1, D]
-            if child_len == 1:
-                for i in range(seq_len):
-                    x = jnp.concatenate(seq_in, axis=1)
-                    h = self.trunk_at(level)(x, self.rope_base)
-                    logits = self.head(h[:, -1, :])                 # [B, 256]
-                    syms = symbol_fn(logits)                        # list[int], len B
-                    for b in range(B):
-                        out[b].append(syms[b])
-                    if i < seq_len - 1:
-                        sym_t = jnp.array(syms, dtype=jnp.int32)[:, None]   # [B, 1]
-                        emb = self.byte_embed(sym_t)                 # [B, 1, Ebyte]
-                        seq_in.append(self.patch_in[level](emb))
-                return out
-            else:
-                for i in range(seq_len):
-                    x = jnp.concatenate(seq_in, axis=1)
-                    h = self.trunk_at(level)(x, self.rope_base)
-                    cond_i = h[:, -1, :]                            # [B, D] CONTINUOUS, passed to child unchanged
-                    child_bytes = gen_patch(level + 1, cond_i)      # list of B lists, len child_len
-                    for b in range(B):
-                        out[b].extend(child_bytes[b])
-                    if i < seq_len - 1:
-                        child_t = jnp.array(child_bytes, dtype=jnp.int32)   # [B, child_len]
-                        child_emb = self.byte_embed(child_t).reshape(B, 1, child_len * self.cfg.byte_embed_dim)
-                        seq_in.append(self.patch_in[level](child_emb))
-                return out
+        REAL KV-CACHE: see enfrac_zero/model.py's generate() docstring -- identical approach
+        (Trunk.step with a preallocated fixed-size cache, JIT-compiled once and reused for every
+        t), HiRA-agnostic.
 
-        root = jnp.broadcast_to(self.root_cond, (batch_size, self.root_cond.shape[-1]))
-        return gen_patch(0, root)
+        Returns the flat list of all decoded bytes (n_timesteps * patch_len_list[0], the last
+        timestep possibly containing padding -- trimmed by the caller via n_raw_bytes)."""
+        trunk0 = self.trunk_at(0)
+        kv_cache = trunk0.init_kv_cache(n_timesteps)
+        rope_base = self.rope_base
 
-    def collect_logits(self, byte_chunks: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """byte_chunks: [B, P0]. Teacher-forced, routed through the SAME batched step-by-step
-        generate() decompress.py uses (bit-exactness -- see module docstring). Returns FLAT
-        (symbols[B*P0], logits[B*P0, 256]) in the exact INTERLEAVED order generate()'s internal
-        symbol_fn calls happen in."""
-        B = byte_chunks.shape[0]
-        true_bytes = [[int(v) for v in row] for row in jax.device_get(byte_chunks)]
+        @eqx.filter_jit
+        def step_fn(x_t, t_arr, kv_cache):
+            return trunk0.step(x_t, t_arr, rope_base, kv_cache)
+
+        x_t = self.root_cond[None, :, :]      # [1, 1, D0]
+        all_bytes: list[int] = []
+
+        for t in range(n_timesteps):
+            h_t, kv_cache = step_fn(x_t, jnp.asarray(t, dtype=jnp.int32), kv_cache)
+            cond_t = h_t[:, -1, :]            # [1, D0] -- condition for THIS timestep's children
+
+            child_bytes = self._gen_children(1, cond_t, symbol_fn)   # list of 1 list, len P0
+            patch_bytes = child_bytes[0]
+            all_bytes.extend(patch_bytes)
+
+            if t < n_timesteps - 1:
+                proj_next = self.embed_patch(0, jnp.asarray(patch_bytes, dtype=jnp.int32)[None, :])   # [1, D0]
+                x_t = proj_next[:, None, :]   # [1, 1, D0]
+        return all_bytes
+
+    def collect_logits(self, byte_seq: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """byte_seq: [n_timesteps, patch_len_list[0]]. Teacher-forced, routed through the SAME
+        step-by-step generate() decompress.py uses (bit-exactness -- see module docstring).
+        Returns (symbols[n_timesteps*P0], logits[n_timesteps*P0, 256])."""
+        n_timesteps = byte_seq.shape[0]
+        true_bytes = [int(v) for row in jax.device_get(byte_seq) for v in row]
         flat_symbols, flat_logits = [], []
-        counters = [0] * B
+        counter = [0]
 
         def symbol_fn(logits_batch):
-            syms = []
-            for b in range(B):
-                flat_logits.append(logits_batch[b])
-                sym = true_bytes[b][counters[b]]
-                flat_symbols.append(sym)
-                syms.append(sym)
-                counters[b] += 1
-            return syms
+            flat_logits.append(logits_batch[0])
+            sym = true_bytes[counter[0]]
+            flat_symbols.append(sym)
+            counter[0] += 1
+            return [sym]
 
-        self.generate(symbol_fn, batch_size=B)
+        self.generate(n_timesteps, symbol_fn)
         return jnp.array(flat_symbols, dtype=jnp.int32), jnp.stack(flat_logits)
 
 

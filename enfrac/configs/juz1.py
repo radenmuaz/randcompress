@@ -3,28 +3,30 @@ compression ratio (see enfrac/configs/quran_uthmani.py for that flavor of config
 
   uv run python -m enfrac.train --config enfrac/configs/juz1.py --log_dir logs/enfrac/juz1
 
-See enfrac_zero/configs/juz1.py for the no-HiRA counterpart. use_hira/hira_r/seed spelled
-out explicitly (see fatihah.py's docstring for why) -- same values as ModelConfig's defaults.
+See enfrac_zero/configs/juz1.py for the no-HiRA baseline counterpart. patch_len_list=(512,64,8,1)
+-> n_levels=4, level-0 n_timesteps = ceil(44443/512) = 87.
 """
 
 model = dict(
-    patch_len_list=(64, 16, 4, 1),
-    d_model_list=(48, 48, 48),
-    n_layers_list=(3, 3, 3),
-    n_heads_list=(4, 4, 4),
-    mlp_mult_list=(2, 2, 2),
+    patch_len_list=(512, 64, 8, 1),
+    d_model_list=(48, 48, 48, 48),
+    n_layers_list=(3, 3, 3, 3),
+    n_heads_list=(4, 4, 4, 4),
+    mlp_mult_list=(2, 2, 2, 2),
     byte_embed_dim=128,
+    patch_in_scheme="mean_pool",
     use_hira=True,
-    hira_r=4,
+    hira_r=8,
     seed=0,
 )
 
 train = dict(
     dataset="quran_data/juz1.txt",
-    steps=4000,
+    log_dir="logs/enfrac/juz1",
     lr=3e-3,
-    warmup_steps=100,
-    log_every="500",
+    grad_clip=1.0,
+    remat_time="1.0",
+    remat_depth="1.0",
+    n_epochs=400,
+    seed=0,
 )
-
-compress = dict(batch_size=32)

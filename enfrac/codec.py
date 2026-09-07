@@ -5,7 +5,14 @@ JAX port doesn't change this at all vs. overfitter_peft/codec.py -- "compress/de
 Compiles rc_codec.c once per process (cached in /tmp). Provides:
   quantize_cdf(logits_1d, M) -> (V+1,) int32  cumulative freq array
   rc_encode(symbols, cdfs)   -> bytes
-  rc_decode(stream, cdfs)    -> (T,) int32
+  rc_decode(stream, cdfs)    -> (T,) int32   -- both of the above need every CDF known upfront
+  RCDecoder(stream)          -- incremental one-symbol-at-a-time decoder for real decompression,
+                                 where the next CDF depends on a model call that itself depends on
+                                 the symbol just decoded (genuinely sequential). Moves the actual
+                                 range-coder bit arithmetic (binary search, scale/renorm, byte
+                                 shifting) into C via rc_decode_init/rc_decode_step, instead of
+                                 reimplementing it as hand-rolled Python (which decompress.py used
+                                 to do in its own _rc_decode_one).
 """
 import ctypes
 import hashlib
@@ -70,6 +77,21 @@ def _get_rc_clib() -> ctypes.CDLL:
         c_uint8_p, ctypes.c_size_t,
         c_int32_p, ctypes.c_size_t, ctypes.c_int32,
         c_int32_p,
+    ]
+
+    c_uint64_p = ctypes.POINTER(ctypes.c_uint64)
+    c_size_t_p = ctypes.POINTER(ctypes.c_size_t)
+
+    lib.rc_decode_init.restype  = None
+    lib.rc_decode_init.argtypes = [
+        c_uint8_p, ctypes.c_size_t,
+        c_uint64_p, c_uint64_p, c_uint64_p, c_size_t_p,
+    ]
+    lib.rc_decode_step.restype  = ctypes.c_int32
+    lib.rc_decode_step.argtypes = [
+        c_uint8_p, ctypes.c_size_t, c_size_t_p,
+        c_uint64_p, c_uint64_p, c_uint64_p,
+        c_int32_p, ctypes.c_int32,
     ]
 
     _lib_cache = lib
@@ -151,3 +173,41 @@ def rc_decode(stream: bytes, cdfs: np.ndarray) -> np.ndarray:
     if ret != 0:
         raise RuntimeError(f"rc_decode failed with code {ret}")
     return out_sym
+
+
+class RCDecoder:
+    """Incremental range-coder decoder: one decode_one(cf) call per symbol, each returning that
+    symbol's decoded value. Use this for real decompression instead of rc_decode() -- rc_decode()
+    needs every symbol's CDF upfront, but real decode can't provide that (each CDF comes from a
+    model call that depends on the PREVIOUSLY decoded symbol, so symbols must be decoded one at a
+    time, in order). This class holds the (low, high, code, pos) state between calls and drives
+    rc_codec.c's rc_decode_init/rc_decode_step -- the actual bit arithmetic (binary search over
+    the CDF, scale/renormalize, byte-shifting) runs in C, not reimplemented in Python."""
+
+    def __init__(self, stream: bytes):
+        self._lib = _get_rc_clib()
+        self._buf = np.frombuffer(stream, dtype=np.uint8)
+        self._buf_p = self._buf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint8))
+        self._buf_len = ctypes.c_size_t(len(self._buf))
+        self._low = ctypes.c_uint64(0)
+        self._high = ctypes.c_uint64(0)
+        self._code = ctypes.c_uint64(0)
+        self._pos = ctypes.c_size_t(0)
+        self._lib.rc_decode_init(
+            self._buf_p, self._buf_len,
+            ctypes.byref(self._low), ctypes.byref(self._high),
+            ctypes.byref(self._code), ctypes.byref(self._pos),
+        )
+
+    def decode_one(self, cf: np.ndarray) -> int:
+        """cf: (V+1,) int32 cumulative-freq array (e.g. from quantize_cdf). Returns the decoded
+        symbol (int, 0..V-1)."""
+        cf_c = np.ascontiguousarray(cf, dtype=np.int32)
+        V = cf_c.shape[0] - 1
+        sym = self._lib.rc_decode_step(
+            self._buf_p, self._buf_len, ctypes.byref(self._pos),
+            ctypes.byref(self._low), ctypes.byref(self._high), ctypes.byref(self._code),
+            cf_c.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            ctypes.c_int32(V),
+        )
+        return int(sym)

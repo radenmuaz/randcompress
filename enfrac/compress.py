@@ -1,14 +1,11 @@
 """Compress a file with a trained ByteFractalGen -> range-coded bundle.
 
-Chunks are fully independent (no cross-chunk state), so they're processed in GROUPS of
-batch_size via collect_logits()'s batched generate() -- the expensive neural forward passes
-batch across a group, while the cheap range-coding arithmetic still runs one symbol at a time,
-in the exact interleaved order (all rows' step-i before step-i+1) generate() naturally produces.
-decompress.py MUST use the identical batch_size (and thus the identical chunk grouping) to
-reproduce the same CDFs -- batched and differently-batched matmuls aren't bit-identical
-(floating-point non-associativity), which for range coding is as fatal as a real logit error.
-Padding bytes in the last (short) chunk are encoded too (deterministic, model learns to predict
-them) and simply trimmed back out on decode.
+Level 0 attends across the WHOLE file's timesteps (see model.py's module docstring), so
+collect_logits() is called ONCE over the entire level-0 timestep sequence -- there's no
+"batch_size" concept, no chunk grouping, no per-chunk state carry, nothing left to disagree about
+between compress and decompress. `device` still must match (see decompress.py's module
+docstring) -- TPU/GPU/CPU backends compute matmuls differently, which would desync the range
+coder.
 """
 from __future__ import annotations
 
@@ -16,7 +13,6 @@ import json
 import math
 import os
 import time
-from dataclasses import asdict
 
 import equinox as eqx
 import jax
@@ -31,26 +27,21 @@ from .tokenizer import load_bytes
 from .train import make_chunks
 
 
-def encode(model, raw_bytes: np.ndarray, out_dir: str, batch_size: int = 32, device: str = "cpu") -> None:
+def encode(model, raw_bytes: np.ndarray, out_dir: str, device: str = "cpu") -> None:
     t_wall = time.perf_counter()
 
     P0 = model.cfg.patch_len_list[0]
     n_raw = len(raw_bytes)
-    chunks = make_chunks(raw_bytes, P0)
-    n_chunks = chunks.shape[0]
+    chunks = make_chunks(raw_bytes, P0)   # [n_timesteps, P0] -- see make_chunks()'s docstring
     ctx = jnp.asarray(chunks.astype(np.int32))
 
-    symbols_list, logits_list = [], []
     t0 = time.perf_counter()
-    for start in tqdm(range(0, n_chunks, batch_size), desc="collect logits", unit="group"):
-        end = min(start + batch_size, n_chunks)
-        symbols, logits = model.collect_logits(ctx[start:end])   # [ (end-start)*P0 ], [ .., 256]
-        symbols_list.append(symbols)
-        logits_list.append(logits)
+    print("  collect logits (level 0 attends across the whole sequence)...", flush=True)
+    # Not jit-wrapped: collect_logits() -> generate() calls a symbol_fn from python-level
+    # control flow (see decompress.py's symbol_fn comment for why that must stay eager).
+    symbols_t, logits_t = model.collect_logits(ctx)
     t_logits = time.perf_counter() - t0
 
-    symbols_t = jnp.concatenate(symbols_list)
-    logits_t = jnp.concatenate(logits_list, axis=0)
     symbols_np = np.asarray(symbols_t, dtype=np.int32)   # full stream, padding bytes included
     logits_np = np.asarray(logits_t, dtype=np.float32)
 
@@ -90,11 +81,8 @@ def encode(model, raw_bytes: np.ndarray, out_dir: str, batch_size: int = 32, dev
     meta = dict(n_raw_bytes=n_raw, rc_bytes=rc_bytes, param_bytes=param_bytes,
                total_bytes=tot_bytes, ratio=ratio,
                T_valid=T_valid, n_wrong=n_wrong, argmax_acc=argmax_acc, ce_bpb=ce_bpb,
-               batch_size=batch_size,   # decompress.py MUST reuse this exact grouping
                device=device)   # decompress.py MUST reuse this exact backend -- see its
                                   # module docstring: TPU/GPU/CPU matmuls aren't bit-identical
-                                  # to each other any more than differently-batched ones are,
-                                  # so a backend mismatch desyncs the range coder just as fatally
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
@@ -118,36 +106,19 @@ def main() -> None:
     p.add_argument("--ckpt", required=True)
     p.add_argument("--input", required=True)
     p.add_argument("--output", required=True)
-    p.add_argument("--config", type=str, default=None,
-                   help="python file with a `compress = dict(batch_size=...)` section (same "
-                        "file passed to train.py's --config works)")
-    p.add_argument("--batch_size", type=int, default=None,
-                   help="chunks processed per batched neural forward call -- decompress.py "
-                        "reuses this from meta.json automatically. Defaults to --config's "
-                        "compress.batch_size, else 32.")
     p.add_argument("--device", type=str, default="cpu", choices=["cpu", "tpu", "gpu"],
-                   help="jax backend for the collect_logits()/generate() recursion. Defaults to "
-                        "cpu: that recursion is host-dispatch-latency-bound, not FLOP-bound (see "
-                        "model.py's determinism-contract docstring), so routing every step "
-                        "through an accelerator's host<->device round trip is pure overhead here "
-                        "-- running it on the host's own CPU (which on a TPU VM host can mean "
-                        "dozens to hundreds of cores) skips that round trip entirely. Must be set "
-                        "before any other jax call, so this flag is read before --ckpt is loaded.")
+                   help="jax backend for the collect_logits() recursion. Defaults to cpu: that "
+                        "recursion is host-dispatch-latency-bound, not FLOP-bound, so routing "
+                        "every step through an accelerator's host<->device round trip is pure "
+                        "overhead here. Must be set before any other jax call, so this flag is "
+                        "read before --ckpt is loaded.")
     args = p.parse_args()
 
     jax.config.update("jax_platform_name", args.device)
 
-    batch_size = args.batch_size
-    if batch_size is None and args.config:
-        from .config import load_config_file
-        mod = load_config_file(args.config)
-        batch_size = getattr(mod, "compress", {}).get("batch_size")
-    if batch_size is None:
-        batch_size = 32
-
     model = load_model(args.ckpt)
     raw_bytes = load_bytes(args.input)
-    encode(model, raw_bytes, args.output, batch_size=batch_size, device=args.device)
+    encode(model, raw_bytes, args.output, device=args.device)
 
 
 if __name__ == "__main__":

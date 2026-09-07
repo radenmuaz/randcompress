@@ -1,7 +1,8 @@
-"""Overfit a baseline (no-HiRA) ByteFractalGen to one file. The training loop itself (chunking,
-the eqx.filter_jit step, AdamW+warmup, epoch-boundary theoretical-bpb logging) is generic w.r.t.
-which ByteFractalGen variant it drives, so it's reused as-is from enfrac.train -- only the model
-class, its ModelConfig (no use_hira/hira_r), and the CLI differ here.
+"""Overfit a baseline (no-HiRA) ByteFractalGen to one file. The training loop itself (full
+parallel teacher-forced forward+backward over the whole level-0 timestep sequence each epoch,
+remat_time/remat_depth for memory -- see enfrac/train.py's and enfrac/model.py's module
+docstrings) is generic w.r.t. which ByteFractalGen variant it drives, so it's reused as-is from
+enfrac.train -- only the model class, its ModelConfig (no use_hira/hira_r), and the CLI differ.
 """
 from __future__ import annotations
 
@@ -11,7 +12,7 @@ import os
 import sys
 
 from enfrac.config import TrainConfig, build_config, parse_configs
-from enfrac.train import _Tee, make_chunks, train
+from enfrac.train import _Tee, make_chunks, timesteps_per_level, train
 from enfrac.tokenizer import load_bytes
 from .model import ByteFractalGen, ModelConfig
 
@@ -28,7 +29,7 @@ def main() -> None:
     tcfg = build_config(TrainConfig, args.config, ("train", "train_config"), train_overrides)
 
     patch_len_list = getattr(args, "patch_len_list", None) or ModelConfig.patch_len_list
-    n_levels = len(patch_len_list) - 1
+    n_levels = len(patch_len_list)
     broadcast = {}
     if args.d_model is not None:
         broadcast["d_model_list"] = (args.d_model,) * n_levels
@@ -64,23 +65,18 @@ def main() -> None:
     print(f"params={n_params:,} (trainable={n_trainable:,})  seed={mcfg.seed}  seq_lens={model.seq_lens}")
 
     chunks = make_chunks(raw_bytes, mcfg.patch_len_list[0])
-    n_chunks = chunks.shape[0]
-    log_every = (max(1, round(float(tcfg.log_every) * n_chunks))
-                 if "." in tcfg.log_every else int(tcfg.log_every))
-    print(f"log_every={tcfg.log_every} -> {log_every} steps "
-          f"({'epoch fraction' if '.' in tcfg.log_every else 'raw steps'})")
-    if log_every <= 2:
-        print(f"WARNING: log_every={log_every} is very frequent (prints nearly every step) "
-              f"-- pass a float like 0.1 for 'every 10% of an epoch' if this wasn't intended")
 
-    model = train(model, chunks, tcfg.steps, tcfg.lr, tcfg.warmup_steps, tcfg.grad_clip,
-                  log_every, len(raw_bytes), filter_spec=trainable_filter(model),
-                  per_device_batch=tcfg.per_device_batch)
+    tsteps = timesteps_per_level(model, chunks.shape[0])
+    print("timesteps per level (total patches of that level's size, whole file): " +
+          "  ".join(f"level{l}={t:,}" for l, t in enumerate(tsteps)))
+
+    model = train(model, chunks, tcfg.lr, tcfg.grad_clip, tcfg.remat_time, tcfg.remat_depth,
+                  tcfg.n_epochs, len(raw_bytes), filter_spec=trainable_filter(model))
 
     from .checkpoint import save_model
     save_model(tcfg.log_dir, model)
     with open(os.path.join(tcfg.log_dir, "meta.json"), "w") as f:
-        json.dump({"n_raw_bytes": len(raw_bytes)}, f)
+        json.dump({"n_raw_bytes": len(raw_bytes), "timesteps_per_level": tsteps}, f)
     print(f"Saved model to {tcfg.log_dir}/")
 
 
