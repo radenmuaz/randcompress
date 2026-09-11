@@ -46,18 +46,22 @@ uv run python -m enfrac_zero.train --config enfrac_zero/configs/fatihah.py --log
 
 Sample configs (`enfrac/configs/*.py`, `enfrac_zero/configs/*.py`): `fatihah` (562B, sanity
 check), `juz1` (~44KB, sanity check), `quran_uthmani` (~1.4MB, real compression demo), `enwik8`
-(100MB, TPU-scale — see its docstring for sizing/epoch-count reasoning). A config file is a
-plain `.py` module with `model`/`train`/`compress` dicts; `--config file.py --field value`
-layers CLI overrides on top. See `enfrac/README.md`'s "Config system" section.
+(100MB, TPU-scale — see its docstring for sizing/epoch-count reasoning), `enwik9` (1GB, TPU-scale,
+one level deeper than `enwik8` — see its docstring for sizing). A config file is a plain `.py`
+module with `model`/`train`/`compress` dicts; `--config file.py --field value` layers CLI
+overrides on top. See `enfrac/README.md`'s "Config system" section.
 
-## Multi-device / TPU
+## Single-device training / TPU
 
-`enfrac.train.train()` auto-detects `jax.local_device_count()` and switches to a `jax.pmap`'d
-data-parallel step when more than one device is visible — no flag needed. `compress.py`/
-`decompress.py` default to `--device cpu` instead (host-dispatch-latency-bound, not FLOP-bound;
-a TPU host's own many-core CPU is the better fit). See `enfrac/README.md`'s "Multi-device"
-section for the full rationale and verification, and `TPU.md`/`TPU_WORKFLOW.md` for
-provisioning/SSH/rsync commands.
+`enfrac.train.train()` is a single `eqx.filter_jit` call — **no `jax.pmap`/multi-device sharding**
+currently (an earlier version of this doc described an auto-detecting pmap path; that code no
+longer exists — verified by grep). On a multi-chip host only one device is used, the rest sit
+idle. `compress.py`/`decompress.py` default to `--device cpu` instead (host-dispatch-latency-
+bound, not FLOP-bound; a TPU host's own many-core CPU is the better fit). See `enfrac/README.md`'s
+"Single-device training" and CLAUDE.md's "Training-time memory chunking at real corpus scale"
+sections for the full detail (including three real OOM bugs found/fixed getting `enwik9`-scale
+training to actually run on one TPU chip), and `TPU.md`/`TPU_WORKFLOW.md` for provisioning/SSH/
+rsync commands.
 
 **Two hard-won correctness rules, both enforced in code (not just documented):**
 - `batch_size` and `--device` **must** match between compress and decompress — both are saved

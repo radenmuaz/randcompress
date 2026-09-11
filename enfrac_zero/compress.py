@@ -32,88 +32,134 @@ from tqdm import tqdm
 
 from enfrac.codec import quantize_cdf, rc_encode, rc_decode
 from enfrac.tokenizer import load_bytes
-from enfrac.train import make_chunks
+from enfrac.train import make_file_chunks, resolve_file_chunk_bytes
 from .checkpoint import load_model, save_model
 from .model import trainable_filter
 
 
-def encode(model, raw_bytes: np.ndarray, out_dir: str, device: str = "cpu", dtype: str = "float64") -> None:
+def encode(model, raw_bytes: np.ndarray, out_dir: str, device: str = "cpu", dtype: str = "float64",
+           file_chunk_bytes: int | None = None, file_chunk_count: int | None = None,
+           warn_padding: bool = False, chunk_batch_size: int = 1) -> None:
+    """file_chunk_bytes/file_chunk_count: MUST match whatever the checkpoint was actually
+    TRAINED with (see train.py's TrainConfig docstring) -- level 0's own sequence length is now
+    baked into training (chunk_n_timesteps), so compressing with a different chunking than
+    training used feeds level 0 out-of-distribution sequence lengths. Both None (the default)
+    resolves to "one chunk = the whole file", matching a model trained without file chunking.
+    Each of the n_file_chunks independent, weight-shared chunks (see
+    ByteFractalGen.__call__'s docstring) gets its OWN range-coded stream regardless of batching
+    below -- batching only ever speeds up the LOGITS computation, never merges chunks' streams.
+
+    chunk_batch_size (default 1, clamped to [1, n_file_chunks]): how many chunks' logits are
+    computed together per collect_logits call. 1 = today's behavior EXACTLY (per-chunk
+    collect_logits_fp64(), the fp64 fast path). >1 SWITCHES to collect_logits_batched() (always
+    float32, no fp64 needed -- see its docstring for why this is safe despite NOT being the fp64
+    path: it's the same generate()-based reference computation collect_logits() already uses at
+    batch_size=1, just with a bigger independent-chunk batch axis; batch_size is a correctness
+    invariant of the same kind as device/dtype -- decompress.py MUST reuse the exact same
+    chunk_batch_size, enforced via meta.json, same pattern, no decode-side override). This is
+    the dominant real-world speedup: the slow part of compress was never actually the fp64 fast
+    path itself, it was collect_logits_fp64's built-in verify_prefix step re-invoking the slow
+    generate()-based reference every single chunk (see collect_logits_fp64's docstring) --
+    batching collapses that per-chunk dispatch cost by roughly the batch factor."""
     t_wall = time.perf_counter()
 
     P0 = model.cfg.patch_len_list[0]
     n_raw = len(raw_bytes)
-    chunks = make_chunks(raw_bytes, P0)   # [n_timesteps, P0] -- see make_chunks()'s docstring
-    ctx = jnp.asarray(chunks.astype(np.int32))
+    resolved_chunk_bytes = resolve_file_chunk_bytes(n_raw, P0, file_chunk_bytes, file_chunk_count)
+    chunks = make_file_chunks(raw_bytes, P0, resolved_chunk_bytes,
+                               warn=warn_padding)
+    n_file_chunks, chunk_n_timesteps, _ = chunks.shape
+    chunk_batch_size = max(1, min(chunk_batch_size, n_file_chunks))
+    print(f"  file_chunk_bytes={resolved_chunk_bytes:,}  n_file_chunks={n_file_chunks}  "
+          f"chunk_n_timesteps={chunk_n_timesteps}  chunk_batch_size={chunk_batch_size}", flush=True)
+
+    model64 = model.cast_dtype(jnp.float64) if dtype == "float64" and chunk_batch_size == 1 else None
 
     t0 = time.perf_counter()
-    if dtype == "float64":
-        print("  collect logits (fp64 fast path, batched across all timesteps)...", flush=True)
-        # `model` stays float32 throughout (that's what gets saved to the bundle below --
-        # checkpoints are always float32, see checkpoint.py's load_model docstring); cast a
-        # WORKING COPY to float64 just for this computation.
-        symbols_t, logits_t = model.cast_dtype(jnp.float64).collect_logits_fp64(ctx)
-    else:
-        print("  collect logits (level 0 attends across the whole sequence)...", flush=True)
-        # Not jit-wrapped: collect_logits() -> generate() calls a symbol_fn from python-level
-        # control flow (see decompress.py's symbol_fn comment for why that must stay eager).
-        symbols_t, logits_t = model.collect_logits(ctx)
+    streams: list[bytes] = []
+    stream_lengths: list[int] = []
+    total_ce_nats = 0.0
+    total_wrong = 0
+    total_positions = 0
+    desc = f"collect logits + rc-encode ({chunk_batch_size}/batch)"
+    for start in tqdm(range(0, n_file_chunks, chunk_batch_size), desc=desc, unit="batch"):
+        end = min(start + chunk_batch_size, n_file_chunks)
+        B = end - start
+
+        if chunk_batch_size == 1:
+            ctx = jnp.asarray(chunks[start].astype(np.int32))   # [chunk_n_timesteps, P0]
+            if dtype == "float64":
+                symbols_t, logits_t = model64.collect_logits_fp64(ctx)
+            else:
+                symbols_t, logits_t = model.collect_logits(ctx)
+            symbols_batch = symbols_t[None, :]                   # [1, T*P0]
+            logits_batch = logits_t[None, :, :]                  # [1, T*P0, 256]
+        else:
+            ctx = jnp.asarray(chunks[start:end].astype(np.int32))   # [B, chunk_n_timesteps, P0]
+            symbols_batch, logits_batch = model.collect_logits_batched(ctx)   # [B,T*P0], [B,T*P0,256]
+
+        for i in range(B):
+            symbols_t = symbols_batch[i]
+            logits_t = logits_batch[i]
+            symbols_np = np.asarray(symbols_t, dtype=np.int32)
+            # IMPORTANT: keep logits_t's own dtype here (float64 when dtype="float64" AND
+            # chunk_batch_size==1) -- downcasting to float32 before quantize_cdf would throw away
+            # exactly the precision the fp64 forward pass was computed for (see module docstring).
+            logits_np = np.asarray(logits_t, dtype=np.float64 if (dtype == "float64" and chunk_batch_size == 1) else np.float32)
+
+            logp = jax.nn.log_softmax(logits_t.astype(jnp.float32), axis=-1)
+            total_ce_nats += float(-jnp.take_along_axis(logp, symbols_t[:, None], axis=-1).sum())
+            total_wrong += int((logits_t.argmax(-1) != symbols_t).sum())
+            total_positions += len(symbols_np)
+
+            cdfs_np = np.stack([quantize_cdf(logits_np[j]) for j in range(logits_np.shape[0])]).astype(np.int32)
+            rc_stream_c = rc_encode(symbols_np, cdfs_np)
+
+            decoded = rc_decode(rc_stream_c, cdfs_np)
+            if not np.array_equal(decoded, symbols_np):
+                raise RuntimeError(f"RC round-trip verification failed on chunk {start + i}/{n_file_chunks - 1}")
+
+            streams.append(rc_stream_c)
+            stream_lengths.append(len(rc_stream_c))
     t_logits = time.perf_counter() - t0
 
-    symbols_np = np.asarray(symbols_t, dtype=np.int32)
-    # IMPORTANT: keep logits_t's own dtype here (float64 when dtype="float64") -- downcasting to
-    # float32 before quantize_cdf would throw away exactly the precision the fp64 forward pass
-    # was computed for, reintroducing the same magnitude of rounding error we're avoiding (see
-    # collect_logits_fp64()'s docstring / this file's module docstring for why that matters).
-    logits_np = np.asarray(logits_t, dtype=np.float64 if dtype == "float64" else np.float32)
-
-    logp = jax.nn.log_softmax(logits_t.astype(jnp.float32), axis=-1)
-    ce_bits = float(-jnp.take_along_axis(logp, symbols_t[:, None], axis=-1).sum()) / math.log(2)
-    n_wrong = int((logits_t.argmax(-1) != symbols_t).sum())
-    cdfs_np = np.stack([quantize_cdf(logits_np[j]) for j in
-                        tqdm(range(logits_np.shape[0]), desc="quantize CDFs", unit="B")]).astype(np.int32)
-    ce_bpb = ce_bits / n_raw
-
-    t0 = time.perf_counter()
-    print("  encode...", end=" ", flush=True)
-    rc_stream = rc_encode(symbols_np, cdfs_np)
-    rc_bytes = len(rc_stream)
-    t_enc = time.perf_counter() - t0
-    print(f"{rc_bytes}B  {t_enc:.2f}s")
-
-    t0 = time.perf_counter()
-    print("  verify...", end=" ", flush=True)
-    decoded = rc_decode(rc_stream, cdfs_np)
-    ok = bool(np.array_equal(decoded, symbols_np))
-    t_dec = time.perf_counter() - t0
-    print(f"{'OK' if ok else 'FAIL'}  {t_dec:.2f}s")
-    if not ok:
-        raise RuntimeError("RC round-trip verification failed")
+    rc_blob = b"".join(streams)
+    rc_bytes = len(rc_blob)
+    ce_bpb = (total_ce_nats / math.log(2)) / n_raw
 
     save_model(out_dir, model)
-    with open(os.path.join(out_dir, "rc_stream.bin"), "wb") as f:
-        f.write(rc_stream)
+    with open(os.path.join(out_dir, "rc_streams.bin"), "wb") as f:
+        f.write(rc_blob)
 
     trainable, _ = eqx.partition(model, trainable_filter(model))
     param_bytes = sum(x.size * x.dtype.itemsize for x in jax.tree_util.tree_leaves(trainable))
-    T_valid = len(symbols_np)
-    argmax_acc = (T_valid - n_wrong) / max(T_valid, 1)
+    argmax_acc = (total_positions - total_wrong) / max(total_positions, 1)
     tot_bytes = param_bytes + rc_bytes
     ratio = n_raw / tot_bytes if tot_bytes > 0 else float("inf")
     meta = dict(n_raw_bytes=n_raw, rc_bytes=rc_bytes, param_bytes=param_bytes,
                total_bytes=tot_bytes, ratio=ratio,
-               T_valid=T_valid, n_wrong=n_wrong, argmax_acc=argmax_acc, ce_bpb=ce_bpb,
+               T_valid=total_positions, n_wrong=total_wrong, argmax_acc=argmax_acc, ce_bpb=ce_bpb,
                device=device,   # decompress.py MUST reuse this exact backend -- see its docstring
-               dtype=dtype)     # decompress.py MUST reuse this exact dtype -- see module docstring
+               dtype=dtype,     # decompress.py MUST reuse this exact dtype -- see module docstring
+               file_chunk_bytes=resolved_chunk_bytes,   # decompress.py MUST reuse this exact
+               n_file_chunks=n_file_chunks,              # chunking -- read back automatically,
+               chunk_n_timesteps=chunk_n_timesteps,       # same pattern as device/batch_size/dtype
+               chunk_batch_size=chunk_batch_size,          # decompress.py MUST reuse this exact
+                                                             # batch size -- see collect_logits_batched()
+                                                             # docstring for why (same invariant kind)
+               stream_lengths=stream_lengths)             # -- byte offsets of each chunk's own
+                                                            # stream within rc_streams.bin
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
     t_wall = time.perf_counter() - t_wall
     kbps = n_raw / max(t_wall, 1e-9) / 1e3
-    print(f"\n[compress]  {t_wall:.1f}s  ({kbps:.2f} kB/s)  (logits={t_logits:.1f}s  enc={t_enc:.2f}s  dec={t_dec:.2f}s)")
-    print(f"  argmax: {T_valid-n_wrong}/{T_valid} ({argmax_acc:.1%})  "
+    print(f"\n[compress]  {t_wall:.1f}s  ({kbps:.2f} kB/s)  (logits+encode={t_logits:.1f}s, "
+          f"{n_file_chunks} chunks)")
+    print(f"  argmax: {total_positions-total_wrong}/{total_positions} ({argmax_acc:.1%})  "
           f"CE={ce_bpb:.4f}bpb  rc={rc_bytes*8/n_raw:.4f}bpb ({rc_bytes}B)")
     print(f"  model size (params):     {param_bytes:>10,d} B")
-    print(f"  rc-coded residual:       {rc_bytes:>10,d} B")
+    print(f"  rc-coded residual:       {rc_bytes:>10,d} B  ({n_file_chunks} streams)")
     print(f"  total bundle:            {tot_bytes:>10,d} B")
     print(f"  original file:           {n_raw:>10,d} B")
     verdict = "COMPRESSED" if ratio > 1.0 else "EXPANDED (bundle bigger than original)"
@@ -136,6 +182,20 @@ def main() -> None:
                         "collect_logits_fp64() path (only numerically safe in float64, see "
                         "module docstring); float32 falls back to the slower collect_logits(). "
                         "Must be set before any other jax call (enables jax_enable_x64).")
+    p.add_argument("--file_chunk_bytes", type=int, default=None,
+                   help="MUST match what the checkpoint was trained with -- by default this is "
+                        "auto-read from <ckpt>/meta.json (written by train.py), no need to pass "
+                        "it explicitly. Only set this to override that (rarely correct -- see "
+                        "encode()'s docstring for why a mismatch feeds level 0 out-of-distribution "
+                        "sequence lengths).")
+    p.add_argument("--chunk_batch_size", type=int, default=1,
+                   help="how many file chunks' logits to compute together per call -- 1 (default) "
+                        "= today's behavior exactly (per-chunk, fp64 fast path); up to "
+                        "n_file_chunks (max, batches ALL chunks in one call) uses "
+                        "collect_logits_batched() instead, the real fix for compress being slow "
+                        "with many small chunks (see encode()'s docstring). decompress.py MUST "
+                        "use this exact same value -- it's auto-read from meta.json, no separate "
+                        "flag there.")
     args = p.parse_args()
 
     jax.config.update("jax_platform_name", args.device)
@@ -144,7 +204,18 @@ def main() -> None:
 
     model = load_model(args.ckpt)   # always float32 on disk -- see checkpoint.py's load_model
     raw_bytes = load_bytes(args.input)
-    encode(model, raw_bytes, args.output, device=args.device, dtype=args.dtype)
+
+    file_chunk_bytes = args.file_chunk_bytes
+    if file_chunk_bytes is None:
+        ckpt_meta_path = os.path.join(args.ckpt, "meta.json")
+        if os.path.exists(ckpt_meta_path):
+            with open(ckpt_meta_path) as f:
+                ckpt_meta = json.load(f)
+            file_chunk_bytes = ckpt_meta.get("file_chunk_bytes")   # None if trained pre-chunking
+
+    encode(model, raw_bytes, args.output, device=args.device, dtype=args.dtype,
+           file_chunk_bytes=file_chunk_bytes, warn_padding=(args.file_chunk_bytes is not None),
+           chunk_batch_size=args.chunk_batch_size)
 
 
 if __name__ == "__main__":

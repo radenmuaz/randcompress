@@ -72,12 +72,14 @@ code path -- see enfrac/model.py's module docstring for why (bit-exactness for r
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
+from tqdm import tqdm
 
 from enfrac.codec import quantize_cdf
 from enfrac.model import (
@@ -89,7 +91,10 @@ from enfrac.model import (
     make_byte_embedding,
     rope_cos_sin_for_positions,
     sdpa,
+    flash_attn_causal,
 )
+
+_MEAN_POOL_TARGET_ELEMENTS = 2_097_152   # rows*P target per _chunked_mean_pool scan step -- see its docstring
 
 
 class PlainLinear(eqx.Module):
@@ -153,14 +158,15 @@ class Attn(eqx.Module):
         self.wv = PlainLinear(d_model, d_model, k3)
         self.out = PlainLinear(d_model, d_model, k4)
 
-    def __call__(self, x: jax.Array, cos: jax.Array, sin: jax.Array, mask: jax.Array) -> jax.Array:
+    def __call__(self, x: jax.Array, cos: jax.Array, sin: jax.Array, mask: jax.Array,
+                 use_flash: bool = False) -> jax.Array:
         B, T, D = x.shape
         H, hd = self.n_heads, self.head_dim
         q = self.wq(x).reshape(B, T, H, hd).transpose(0, 2, 1, 3)
         k = self.wk(x).reshape(B, T, H, hd).transpose(0, 2, 1, 3)
         v = self.wv(x).reshape(B, T, H, hd).transpose(0, 2, 1, 3)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-        y = sdpa(q, k, v, mask)
+        y = flash_attn_causal(q, k, v) if use_flash else sdpa(q, k, v, mask)
         return self.out(y.transpose(0, 2, 1, 3).reshape(B, T, D))
 
     def step(self, x: jax.Array, cos_t: jax.Array, sin_t: jax.Array, t: jax.Array,
@@ -223,8 +229,9 @@ class Block(eqx.Module):
         self.ln2 = RMSNorm(d_model)
         self.mlp = SwiGLU(d_model, mlp_mult, k2)
 
-    def __call__(self, x: jax.Array, cos: jax.Array, sin: jax.Array, mask: jax.Array) -> jax.Array:
-        x = x + self.attn(self.ln1(x), cos, sin, mask)
+    def __call__(self, x: jax.Array, cos: jax.Array, sin: jax.Array, mask: jax.Array,
+                 use_flash: bool = False) -> jax.Array:
+        x = x + self.attn(self.ln1(x), cos, sin, mask, use_flash)
         x = x + self.mlp(self.ln2(x))
         return x
 
@@ -252,8 +259,8 @@ def _trunk_forward_jit(trunk: "Trunk", x: jax.Array, rope_base: float) -> jax.Ar
     executable instead of re-tracing/dispatching from scratch. Measured empirically: ~30x faster
     per call than the bare eager `trunk(x, rope_base)` at juz1-scale (d_model=48), even accounting
     for the varying T=1..8 pattern _gen_children actually produces (8 distinct cache entries, not
-    1). This mirrors what generate()'s level-0 step_fn already does for the SAME reason -- the
-    fix that was missing at levels 1+ (see _gen_children's docstring: adding a KV-cache there was
+    1). This is the SAME fix _trunk_step_jit (below) applies to generate()'s level-0 step function
+    -- was missing at levels 1+ (see _gen_children's docstring: adding a KV-cache there was
     tried and reverted as a regression, because the ALGORITHM wasn't the bottleneck, the eager
     DISPATCH overhead was; jit-caching the existing recompute-from-scratch shapes fixes that
     directly, matching how the reference PyTorch FractalGen implementation's own smallest/deepest
@@ -266,6 +273,32 @@ def _trunk_forward_jit(trunk: "Trunk", x: jax.Array, rope_base: float) -> jax.Ar
     call _gen_children, so they see the SAME jit-wrapped computation, keeping range-coding
     correctness intact."""
     return trunk(x, rope_base)
+
+
+@eqx.filter_jit
+def _trunk_step_jit(trunk: "Trunk", x_t: jax.Array, t_arr: jax.Array, rope_base: float, kv_cache: list):
+    """Module-level jit wrapper for Trunk.step, used by generate()'s level-0 decode loop.
+
+    THIS WAS A REAL BUG, found and fixed this session: generate() used to define its own
+    `step_fn` as a LOCAL closure, decorated with @eqx.filter_jit, INSIDE generate()'s own body --
+    e.g. `def generate(...): ... @eqx.filter_jit \\n def step_fn(...): ...`. That closure fixes
+    the O(n^2)/O(n^3) growing-sequence problem WITHIN one generate() call (the fixed-size KV cache
+    written via dynamic_update_slice keeps step_fn's input shapes constant across every t, so one
+    trace/compile is reused for that whole call's n_timesteps steps) -- but it does nothing for
+    the cost of calling generate() itself MULTIPLE TIMES (e.g. once per file chunk in compress.py/
+    decompress.py's per-chunk loop): every fresh call to generate() executes that `def step_fn`
+    statement again, which creates a BRAND NEW Python closure object even though its code and
+    shapes are identical to the previous call's. jax.jit's/eqx.filter_jit's compiled-executable
+    cache is keyed in part on the wrapped callable's own identity, not just input shapes -- a new
+    object is a cache miss regardless of whether JAX has already compiled the exact same
+    computation before, so every generate() call paid a full fresh trace+compile for its first
+    step. Moving step_fn out to MODULE level (here) makes it the same object across every call,
+    the same fix _trunk_forward_jit already applied to _gen_children -- now generate() only
+    compiles once per DISTINCT (n_timesteps, kv_cache shape) combination for the whole process,
+    not once per generate() call. rope_base is a plain float (not a jax.Array), so eqx.filter_jit
+    treats it as a static arg by default -- fine here since it's fixed per model/config, never
+    varies across calls."""
+    return trunk.step(x_t, t_arr, rope_base, kv_cache)
 
 
 class Trunk(eqx.Module):
@@ -281,13 +314,13 @@ class Trunk(eqx.Module):
         self.blocks = [Block(d_model, n_heads, mlp_mult, keys[i]) for i in range(n_layers)]
         self.ln_f = RMSNorm(d_model)
 
-    def __call__(self, x: jax.Array, rope_base: float) -> jax.Array:
+    def __call__(self, x: jax.Array, rope_base: float, use_flash: bool = False) -> jax.Array:
         T = x.shape[1]
         pos = jnp.arange(T)
         cos, sin = rope_cos_sin_for_positions(pos, self.head_dim, rope_base)
         mask = causal_mask(T)
         for blk in self.blocks:
-            x = blk(x, cos, sin, mask)
+            x = blk(x, cos, sin, mask, use_flash)
         return self.ln_f(x)
 
     def init_kv_cache(self, max_len: int, batch: int = 1):
@@ -297,10 +330,18 @@ class Trunk(eqx.Module):
         instead of recompiling at every t (see step()'s docstring). `batch` is the number of
         INDEPENDENT parallel chains sharing this cache's shape -- 1 for level 0 (one file), or
         Bcur (all parents at that level, all their local caches are independent of each other but
-        processed together) for levels 1+."""
+        processed together) for levels 1+. dtype is pinned to self.ln_f.weight's own dtype (not
+        left to jnp.zeros' ambient default) -- REAL BUG found this session: under
+        jax_enable_x64=True (compress.py's dtype="float64" default) with a float32 model
+        (collect_logits_batched's chunk_batch_size>1 path, which never casts to float64), a bare
+        jnp.zeros(...) here defaults to float64 while k_t/v_t computed from the float32 weights
+        stay float32, and jax.lax.dynamic_update_slice in Attn.step then hard-crashes on the
+        dtype mismatch (not a silent corruption, but still a real crash found on real TPU
+        hardware)."""
+        kv_dtype = self.ln_f.weight.dtype
         return [
-            (jnp.zeros((batch, blk.attn.n_heads, max_len, blk.attn.head_dim)),
-             jnp.zeros((batch, blk.attn.n_heads, max_len, blk.attn.head_dim)))
+            (jnp.zeros((batch, blk.attn.n_heads, max_len, blk.attn.head_dim), dtype=kv_dtype),
+             jnp.zeros((batch, blk.attn.n_heads, max_len, blk.attn.head_dim), dtype=kv_dtype))
             for blk in self.blocks
         ]
 
@@ -319,13 +360,16 @@ class Trunk(eqx.Module):
             new_cache.append((k_c, v_c))
         return self.ln_f(x), new_cache
 
-    def forward_remat(self, x: jax.Array, rope_base: float, remat_time: str, remat_depth: str) -> jax.Array:
+    def forward_remat(self, x: jax.Array, rope_base: float, remat_time: str, remat_depth: str,
+                       use_flash: bool = False) -> jax.Array:
         """Level 0's full-sequence forward -- IDENTICAL math to __call__ (real causal attention
         over the whole sequence, no truncation, no detach), just computed under jax.checkpoint
         for memory. remat_depth groups consecutive layers under one checkpoint each (standard
         activation checkpointing). remat_time!="1.0" wraps the WHOLE layer stack (all depth
         groups) in one additional outer jax.checkpoint -- see class docstring in config.py's
-        TrainConfig for why true sub-sequence-only chunking isn't implemented here."""
+        TrainConfig for why true sub-sequence-only chunking isn't implemented here. use_flash:
+        see enfrac.model.flash_attn_causal's docstring -- only sensible once T is bumped well
+        past level 0's default (e.g. >=512, see docs/enwik9_scaling_calcs.md)."""
         T = x.shape[1]
         pos = jnp.arange(T)
         cos, sin = rope_cos_sin_for_positions(pos, self.head_dim, rope_base)
@@ -338,7 +382,7 @@ class Trunk(eqx.Module):
                 group = self.blocks[start:start + depth_group]
                 def run_group(x, group=group):
                     for blk in group:
-                        x = blk(x, cos, sin, mask)
+                        x = blk(x, cos, sin, mask, use_flash)
                     return x
                 x = jax.checkpoint(run_group)(x) if depth_group < len(self.blocks) else run_group(x)
             return x
@@ -358,18 +402,43 @@ class ModelConfig:
     byte_embed_dim: int = 256                     # decoupled from any level's d_model
     rope_preset: str = "qwen3"
     share_trunk: bool = False                      # opt-in alias; requires matching dims
-    patch_in_scheme: str = "mean_pool"             # "mean_pool" (default) or "linear" -- see
-                                                    # module docstring; applied uniformly to every
-                                                    # level (patch_len==1 levels are unaffected --
-                                                    # both schemes reduce to the same plain
+    patch_in_scheme: str | tuple = "mean_pool"     # "mean_pool" (default) or "linear" -- see
+                                                    # module docstring. Either a single string
+                                                    # (broadcast to every level) or a tuple of
+                                                    # length n_levels, one scheme per level (e.g.
+                                                    # ("mean_pool","mean_pool","mean_pool","linear",
+                                                    # "linear","mean_pool") to use the exact
+                                                    # "linear" scheme only at small-patch levels
+                                                    # where it's cheap -- see PatchInLinear's
+                                                    # docstring: cost is patch_len*byte_embed_dim*
+                                                    # d_model, only tractable for small patch_len).
+                                                    # patch_len==1 levels are unaffected either way
+                                                    # (both schemes reduce to the same plain
                                                     # byte-embedding projection there)
     seed: int = 0                                    # drives (trainable) init only -- fully saved
+    use_flash_attn_list: tuple | None = None        # per-level bool, length n_levels; None ->
+                                                    # all False. See enfrac.model.flash_attn_causal's
+                                                    # docstring: only sensible for a level whose
+                                                    # seq_len is >=128 (ideally a clean multiple of
+                                                    # 128) -- levels 1+'s default seq_len=8 gets no
+                                                    # benefit and isn't even supported by the kernel.
+                                                    # TRAINING-forward only; decode never uses this.
 
 
 class ByteFractalGen(eqx.Module):
     cfg: "ModelConfig" = eqx.field(static=True)
     n_levels: int = eqx.field(static=True)
     seq_lens: tuple = eqx.field(static=True)
+    patch_in_scheme: tuple = eqx.field(static=True)   # resolved per-level ("mean_pool"|"linear"),
+                                                        # always length n_levels regardless of
+                                                        # whether cfg.patch_in_scheme was a single
+                                                        # str or a tuple -- embed_patch's memory-
+                                                        # safety check indexes this PER LEVEL, never
+                                                        # cfg.patch_in_scheme directly (comparing a
+                                                        # tuple to the literal "mean_pool" is always
+                                                        # False, which would silently disable the
+                                                        # chunked mean-pool OOM guard at every level).
+    use_flash_attn: tuple = eqx.field(static=True)
     rope_base: float = eqx.field(static=True)
     byte_embed: FrozenEmbedding
     trunks: list
@@ -382,12 +451,20 @@ class ByteFractalGen(eqx.Module):
         assert cfg.patch_len_list[-1] == 1, "last patch_len must be 1 (byte-atomic terminal level)"
         for a, b in zip(cfg.patch_len_list, cfg.patch_len_list[1:]):
             assert a % b == 0, f"patch_len_list must divide evenly level to level, got {a} -> {b}"
-        assert cfg.patch_in_scheme in ("mean_pool", "linear"), \
-            f"patch_in_scheme must be 'mean_pool' or 'linear', got {cfg.patch_in_scheme!r}"
         self.cfg = cfg
         self.n_levels = len(cfg.patch_len_list)
+        self.patch_in_scheme = (cfg.patch_in_scheme,) * self.n_levels \
+            if isinstance(cfg.patch_in_scheme, str) else tuple(cfg.patch_in_scheme)
+        assert len(self.patch_in_scheme) == self.n_levels, \
+            f"patch_in_scheme tuple must have length n_levels={self.n_levels}, got {len(self.patch_in_scheme)}"
+        assert all(s in ("mean_pool", "linear") for s in self.patch_in_scheme), \
+            f"patch_in_scheme entries must be 'mean_pool' or 'linear', got {self.patch_in_scheme!r}"
         self.seq_lens = (0,) + tuple(
             cfg.patch_len_list[l - 1] // cfg.patch_len_list[l] for l in range(1, self.n_levels))
+        self.use_flash_attn = cfg.use_flash_attn_list if cfg.use_flash_attn_list is not None \
+            else (False,) * self.n_levels
+        assert len(self.use_flash_attn) == self.n_levels, \
+            f"use_flash_attn_list must have length n_levels={self.n_levels}, got {len(self.use_flash_attn)}"
         for name, lst in [("d_model_list", cfg.d_model_list), ("n_layers_list", cfg.n_layers_list),
                           ("n_heads_list", cfg.n_heads_list), ("mlp_mult_list", cfg.mlp_mult_list)]:
             assert len(lst) == self.n_levels, f"{name} must have length n_levels={self.n_levels}, got {len(lst)}"
@@ -434,7 +511,7 @@ class ByteFractalGen(eqx.Module):
                 # Both schemes reduce to the same thing when there's only one byte -- just embed
                 # it directly, no flatten/pool needed.
                 self.patch_in.append(PlainLinear(cfg.byte_embed_dim, d_out, patch_in_keys[l]))
-            elif cfg.patch_in_scheme == "linear":
+            elif self.patch_in_scheme[l] == "linear":
                 self.patch_in.append(PatchInLinear(P, cfg.byte_embed_dim, d_out, patch_in_keys[l]))
             else:
                 self.patch_in.append(PatchInMeanPool(cfg.byte_embed_dim, d_out, patch_in_keys[l]))
@@ -456,72 +533,342 @@ class ByteFractalGen(eqx.Module):
     def embed_patch(self, level: int, byte_patch: jax.Array) -> jax.Array:
         """byte_patch: [..., patch_len_list[level]] int32 -> [..., d_model_list[level]]. The one
         place patch_in[level] is ever called from -- keeps __call__/generate/_gen_children using
-        the exact same embedding math (needed for collect_logits()/generate() bit-exactness)."""
+        the exact same embedding math (needed for collect_logits()/generate() bit-exactness).
+        mean_pool is routed through _chunked_mean_pool instead of a plain
+        `self.byte_embed(byte_patch)` whenever the TOTAL element count (leading rows * P) is
+        large -- see that method's docstring for why: the naive call materializes a
+        [..., P, byte_embed_dim] intermediate BEFORE pooling, which can overflow TPU HBM even
+        though the mean-pool scheme's whole point is params/compute independent of P. This isn't
+        only a large-P problem: the LEADING row count also matters, since embed_patch is called
+        from inside _train_recurse's scan body with up to micro_batch*seq_len rows at once --
+        verified a [65536, 32768, 256] intermediate (level 2's own P=32768, with 65536 rows
+        flowing in from a chunked parent level) would have requested ~550GB, an order of
+        magnitude worse than the large-P case this was first written for."""
         P = self.cfg.patch_len_list[level]
         if P == 1:
             emb = self.byte_embed(byte_patch[..., 0])          # [..., Ebyte]
-        else:
-            emb = self.byte_embed(byte_patch)                   # [..., P, Ebyte]
+            return self.patch_in[level](emb)
+        if self.patch_in_scheme[level] == "mean_pool":
+            pooled = self.byte_embed(byte_patch).mean(axis=-2)   # [..., Ebyte] -- direct, unchunked
+            return self.patch_in[level].proj(pooled)
+            # DISABLED (temporary, diagnostic -- see _train_recurse's use_scan ablation for the
+            # sibling experiment): _chunked_mean_pool's own internal jax.lax.scan is one more
+            # nested-scan layer inside _train_recurse's per-level scan -- testing whether skipping
+            # it (now that file chunking bounds `leading*P` far below the pre-chunking scale this
+            # was written for) helps the unresolved scan-fusion OOM.
+            # leading = 1
+            # for s in byte_patch.shape[:-1]:
+            #     leading *= s
+            # if leading * P > _MEAN_POOL_TARGET_ELEMENTS:
+            #     pooled = self._chunked_mean_pool(byte_patch, P)   # [..., Ebyte]
+            #     return self.patch_in[level].proj(pooled)
+        emb = self.byte_embed(byte_patch)                       # [..., P, Ebyte]
         return self.patch_in[level](emb)
 
-    def __call__(self, byte_seq: jax.Array, remat_time: str = "1.0", remat_depth: str = "1.0"
-                 ) -> tuple[jax.Array, dict]:
-        """byte_seq: [n_timesteps, patch_len_list[0]] int32 -- the WHOLE training window's
-        level-0 sequence (n_timesteps = that many patch_len_list[0]-byte patches; see config.py's
-        TrainConfig docstring for the patch-vs-byte distinction). Level 0 is a real causal AR
-        transformer over ALL n_timesteps at once -- teacher-forced, fully parallel, one
-        causally-masked attention computation (see module docstring: no recurrence, no state
-        carry). remat_time/remat_depth control jax.checkpoint granularity for level 0's forward
-        only (see Trunk.forward_remat) -- exact gradients either way, just a memory/recompute
-        tradeoff. Levels 1+ recurse exactly as before: LOCAL attention within one parent patch's
-        own children, batched independently across all n_timesteps parents (no cross-parent
-        causality needed there, so no remat machinery needed there either)."""
-        n_timesteps = byte_seq.shape[0]
+    def _chunked_mean_pool(self, byte_patch: jax.Array, P: int) -> jax.Array:
+        """Computes byte_embed(byte_patch).mean(axis=-2) without ever materializing the full
+        [rows, P, byte_embed_dim] intermediate -- see embed_patch's docstring for why that matters
+        (both large P AND large row counts can make it huge; a first version of this method only
+        bounded P, which left a much larger row-count-driven blowup -- ~550GB at level 2 -- in
+        place; found and fixed before it was ever exercised for real). Chunks over the FLATTENED
+        ROW axis only (never over P): each chunk of `n_chunk` rows, computed and pooled via
+        jax.lax.scan, keeps the per-step intermediate to roughly n_chunk*P*byte_embed_dim
+        elements, and n_chunk is chosen (`_MEAN_POOL_TARGET_ELEMENTS // P`) so that PRODUCT stays
+        around a fixed, small target regardless of P -- i.e. the chunk shrinks automatically for
+        large P, and grows (up to the row count) for small P. Each row's own mean is independent
+        of every other row, so padding rows (added so the row count divides evenly) can just be
+        computed as normal (garbage in, garbage out) and sliced away at the end -- no valid-mask
+        needed, unlike _train_recurse's chunking, since there's no cross-row accumulation here."""
+        leading_shape = byte_patch.shape[:-1]
+        flat = byte_patch.reshape(-1, P)             # [N, P]
+        N = flat.shape[0]
+        n_chunk = max(1, _MEAN_POOL_TARGET_ELEMENTS // P)
 
-        total_ce_nats = jnp.zeros(())
-        total_positions = 0
-        total_correct = jnp.zeros(())
+        if N <= n_chunk:
+            return self.byte_embed(flat).mean(axis=1).reshape(*leading_shape, -1)
 
-        # -- Level 0: full-sequence causal attention, teacher-forced, root_cond fed unprojected --
-        proj0 = self.embed_patch(0, byte_seq)                                        # [n_timesteps, D0]
-        shifted0 = jnp.concatenate([self.root_cond, proj0[:-1]], axis=0)[None, :, :]  # [1, n_timesteps, D0]
-        h0 = self.trunk_at(0).forward_remat(shifted0, self.rope_base, remat_time, remat_depth)
-        cond = h0[0]                                                                   # [n_timesteps, D0]
+        n_groups = -(-N // n_chunk)   # ceil
+        pad = n_groups * n_chunk - N
+        if pad:
+            flat = jnp.concatenate([flat, jnp.zeros((pad, P), flat.dtype)], axis=0)
+        flat_r = flat.reshape(n_groups, n_chunk, P)
 
-        cur_bytes = byte_seq   # [n_timesteps, P0] -- level-0 timesteps' own bytes, recursed into levels 1+
+        def body(carry, x_chunk):
+            e = self.byte_embed(x_chunk)              # [n_chunk, P, Ebyte]
+            return carry, e.mean(axis=1)                # [n_chunk, Ebyte]
 
-        # -- Levels 1+: LOCAL to one parent patch's children, batched over n_timesteps parents --
-        for l in range(1, self.n_levels):
-            seq_len = self.seq_lens[l]
-            child_len = self.cfg.patch_len_list[l]
-            cur_bytes = cur_bytes.reshape(-1, seq_len, child_len)
-            Bcur = cur_bytes.shape[0]
-            D = self.cfg.d_model_list[l]
+        _, pooled_chunks = jax.lax.scan(body, None, flat_r)   # [n_groups, n_chunk, Ebyte]
+        pooled = pooled_chunks.reshape(n_groups * n_chunk, -1)[:N]
+        return pooled.reshape(*leading_shape, -1)
 
-            cond_l = self.cond_proj[l](cond)
-            proj = self.embed_patch(l, cur_bytes)                                  # [Bcur, seq_len, D]
+    def _train_recurse(self, level: int, cond: jax.Array, bytes_flat: jax.Array, valid: jax.Array,
+                        remat_depth: str, micro_batch: int, use_scan: bool = True):
+        """jax.lax.scan-chunked replacement for the old direct "compute this whole level's Bcur-
+        batched forward in one shot" loop body (see git history / enfrac/model.py's identical
+        twin for the pre-chunking version). Necessary because at real corpus scale (enwik8/9) the
+        row count at deep levels -- level l's Bcur == total patch count of patch_len_list[l]-sized
+        patches in the whole file, which reaches the TOTAL RAW BYTE COUNT by the terminal level --
+        can be in the hundreds of millions to billions. Materializing that many rows at once
+        overflows TPU HBM: verified empirically that a plain `cur_bytes.reshape(-1, seq_len,
+        child_len)` on a 125,042,688-row int32 array alone requested 64GB against a v4-8's 34GB
+        HBM (TPU pads the size-8 minor dim up to a 128-tile, a 16x blowup on top of the ~4GB raw
+        data). Fixed by processing `cond`/`bytes_flat` in `micro_batch`-sized chunks via
+        jax.lax.scan -- a REAL loop, compiled ONCE regardless of chunk count (a Python-unrolled
+        loop instead would blow up compile time/graph size at these row counts, since the leaf
+        level alone can have hundreds of thousands of chunks). Each chunk's own trunk call uses
+        plain Trunk.__call__ (NOT forward_remat/jax.checkpoint) -- combining jax.checkpoint with
+        this nested jax.lax.scan structure was tried and hit a real XLA compiler crash on TPU
+        (`windowing_util.cc: VerifyCanonicalBounds` / `RET_CHECK ... CouldLeS32` / SIGABRT),
+        confirmed via a controlled A/B (disabling just the checkpoint call made the crash
+        disappear, replaced by an unrelated, separately-fixed OOM). remat_depth is threaded
+        through the recursion only because __call__'s own signature already carries it for level
+        0's forward_remat call; it does nothing at levels 1+ for now. seq_len is small (8) at
+        every level, so per-chunk activation memory here is bounded by chunk_size (<= micro_batch)
+        regardless -- checkpointing wasn't needed for memory at these levels, only chunking was.
+
+        Non-terminal levels recurse into level+1 IMMEDIATELY for each chunk (depth-first), rather
+        than assembling this level's full [Bcur*seq_len, D] output array first -- for the deepest
+        transitions that output array is itself hundreds of GB, too large to exist even
+        momentarily regardless of how the compute that produced it was chunked. This bounds peak
+        memory by micro_batch at every level simultaneously, not by any level's total row count.
+
+        cond: [B, D_{level-1}] parent conditioning (pre cond_proj[level]) -- for level==1 this is
+        level 0's own output. bytes_flat: [B, patch_len_list[level-1]] this batch's own bytes at
+        the PARENT level's patch granularity (split into this level's (seq_len, child_len)
+        structure per chunk). valid: [B] bool -- False marks rows that are zero-padding (added so
+        B is a multiple of micro_batch), excluded from every returned total. Returns
+        (ce_nats_sum, position_count, correct_sum), all jnp scalars, aggregated over valid rows
+        across the WHOLE subtree from `level` down to the terminal level."""
+        seq_len = self.seq_lens[level]
+        child_len = self.cfg.patch_len_list[level]
+        B = cond.shape[0]
+        D_in = cond.shape[1]
+        parent_len = bytes_flat.shape[1]
+
+        # chunk_size == B (no padding, one chunk) whenever B already fits in one micro_batch --
+        # only pad up to a micro_batch-multiple when B actually EXCEEDS it. Using a fixed
+        # chunk_size=micro_batch unconditionally (padding small B up to it) would inflate every
+        # level's row count by (micro_batch/B)x, and since each level's B multiplies by seq_len
+        # on recursion, that inflation compounds through the WHOLE remaining subtree -- wasting
+        # that same factor of compute at every deeper level too, not just this one.
+        if B <= micro_batch:
+            chunk_size = B
+            n_chunks = 1
+        else:
+            chunk_size = micro_batch
+            n_chunks = -(-B // micro_batch)   # ceil
+        pad = n_chunks * chunk_size - B
+        if pad:
+            cond = jnp.concatenate([cond, jnp.zeros((pad, D_in), cond.dtype)], axis=0)
+            bytes_flat = jnp.concatenate([bytes_flat, jnp.zeros((pad, parent_len), bytes_flat.dtype)], axis=0)
+            valid = jnp.concatenate([valid, jnp.zeros((pad,), dtype=jnp.bool_)], axis=0)
+
+        cond_r = cond.reshape(n_chunks, chunk_size, D_in)
+        bytes_r = bytes_flat.reshape(n_chunks, chunk_size, parent_len)
+        valid_r = valid.reshape(n_chunks, chunk_size)
+
+        def body(carry, xs):
+            ce_acc, pos_acc, correct_acc = carry
+            cond_chunk, bytes_chunk_flat, valid_chunk = xs
+            bytes_chunk = bytes_chunk_flat.reshape(chunk_size, seq_len, child_len)
+            cond_l = self.cond_proj[level](cond_chunk)                        # [m, D]
+            proj = self.embed_patch(level, bytes_chunk)                        # [m, seq_len, D]
 
             if child_len == 1:
                 shifted = jnp.concatenate([cond_l[:, None, :], proj[:, :-1]], axis=1)
-                h = self.trunk_at(l)(shifted, self.rope_base)
-                logits = self.head(h)                                           # [Bcur, seq_len, 256]
-                targets = cur_bytes[..., 0]
+                h = self.trunk_at(level).forward_remat(shifted, self.rope_base, "1.0", remat_depth,
+                                                         self.use_flash_attn[level])
+                logits = self.head(h)                                          # [m, seq_len, 256]
+                targets = bytes_chunk[..., 0]                                   # [m, seq_len]
                 logp = jax.nn.log_softmax(logits, axis=-1)
                 nll = -jnp.take_along_axis(logp, targets[..., None], axis=-1).squeeze(-1)
-                total_ce_nats = total_ce_nats + nll.sum()
-                total_positions += targets.size
-                total_correct = total_correct + (logits.argmax(-1) == targets).sum()
+                row_valid = valid_chunk[:, None].astype(nll.dtype)              # [m, 1]
+                ce_acc = ce_acc + (nll * row_valid).sum()
+                pos_acc = pos_acc + row_valid.sum() * seq_len
+                correct_acc = correct_acc + ((logits.argmax(-1) == targets) * row_valid).sum()
+                return (ce_acc, pos_acc, correct_acc), None
             else:
                 seq = jnp.concatenate([cond_l[:, None, :], proj], axis=1)
-                h = self.trunk_at(l)(seq, self.rope_base)
-                cond_next = h[:, :-1, :]                     # CONTINUOUS -- no softmax at non-terminal levels
-                cur_bytes = cur_bytes.reshape(Bcur * seq_len, child_len)
-                cond = cond_next.reshape(Bcur * seq_len, D)
+                h = self.trunk_at(level).forward_remat(seq, self.rope_base, "1.0", remat_depth,
+                                                         self.use_flash_attn[level])
+                cond_next = h[:, :-1, :].reshape(chunk_size * seq_len, -1)
+                bytes_next = bytes_chunk.reshape(chunk_size * seq_len, child_len)
+                valid_next = jnp.repeat(valid_chunk, seq_len)
+                sub_ce, sub_pos, sub_correct = self._train_recurse(
+                    level + 1, cond_next, bytes_next, valid_next, remat_depth, micro_batch, use_scan)
+                return (ce_acc + sub_ce, pos_acc + sub_pos, correct_acc + sub_correct), None
+
+        init = (jnp.zeros(()), jnp.zeros(()), jnp.zeros(()))
+        if use_scan:
+            (ce_total, pos_total, correct_total), _ = jax.lax.scan(body, init, (cond_r, bytes_r, valid_r))
+        else:
+            # ABLATION (temporary, for diagnosing the scan-fusion OOM): plain Python for-loop
+            # instead of jax.lax.scan -- unrolls n_chunks copies of `body` into the traced graph
+            # instead of one compiled loop. Tests whether jax.lax.scan itself (not the chunk sizes)
+            # is what triggers XLA to fuse the nested per-level structure into one giant HLO --
+            # see docs/enwik9_scaling_calcs.md's unresolved scan-fusion crash notes. NOT a real fix
+            # even if it works (compile time/graph size blow up at real corpus scale with many
+            # chunks) -- diagnostic only.
+            carry = init
+            for i in range(n_chunks):
+                carry, _ = body(carry, (cond_r[i], bytes_r[i], valid_r[i]))
+            ce_total, pos_total, correct_total = carry
+        return ce_total, pos_total, correct_total
+
+    def _train_flat(self, cond: jax.Array, bytes_flat: jax.Array, valid: jax.Array,
+                     remat_depth: str, micro_batch: int,
+                     level_ckpt: bool = os.environ.get("LEVEL_CKPT") == "1"):
+        """FLAT (non-recursive, non-nested-scan) replacement for _train_recurse -- diagnostic for
+        the unresolved scan-fusion OOM (see _train_recurse's docstring / CLAUDE.md). _train_recurse
+        nests one jax.lax.scan inside another (level l's scan body calls _train_recurse(l+1), which
+        itself builds its own jax.lax.scan) -- suspected root cause of an XLA HLO-size blowup that
+        is essentially INDEPENDENT of chunk size (verified empirically: micro_batch 8192->1024->128
+        changed peak HBM by <7% total, while the nested structure itself stayed the same regardless
+        -- a real per-step-data-size cost would have shrunk roughly proportionally). This method
+        instead walks levels 1..n_levels-1 in a plain PYTHON for-loop (trivial -- only ~6 levels,
+        nothing like the hundreds-of-thousands-of-chunks blowup a chunk-level Python loop would
+        cause) with each level's own micro_batch-chunked jax.lax.scan called at the TOP LEVEL, never
+        nested inside another scan's traced body. Non-terminal levels return their next-level
+        cond/bytes/valid as scan OUTPUTS (stacked by jax.lax.scan itself, not accumulated via
+        recursion) and the next level's full [B_next, ...] arrays are assembled via a plain reshape
+        between levels -- feasible now (unlike when _train_recurse was first written) because file
+        chunking already bounds B_next to (at most) one file chunk's own patch count, not the whole
+        file's, at every level -- see enwik9_chunked.py's config docstring for the actual per-level
+        row counts at our current 10MB-chunk scale (max ~10.5M rows, ~tens of GB as a materialized
+        array, not the hundreds-of-GB-to-TB scale that originally forced the depth-first recursive
+        design). Same signature/return contract as _train_recurse(1, ...)."""
+        ce_total = jnp.zeros(())
+        pos_total = jnp.zeros(())
+        correct_total = jnp.zeros(())
+        for level in range(1, self.n_levels):
+            seq_len = self.seq_lens[level]
+            child_len = self.cfg.patch_len_list[level]
+            terminal = (child_len == 1)
+            B = cond.shape[0]
+            D_in = cond.shape[1]
+            parent_len = bytes_flat.shape[1]
+
+            if B <= micro_batch:
+                chunk_size, n_chunks = B, 1
+            else:
+                chunk_size, n_chunks = micro_batch, -(-B // micro_batch)
+            pad = n_chunks * chunk_size - B
+            if pad:
+                cond = jnp.concatenate([cond, jnp.zeros((pad, D_in), cond.dtype)], axis=0)
+                bytes_flat = jnp.concatenate([bytes_flat, jnp.zeros((pad, parent_len), bytes_flat.dtype)], axis=0)
+                valid = jnp.concatenate([valid, jnp.zeros((pad,), dtype=jnp.bool_)], axis=0)
+
+            cond_r = cond.reshape(n_chunks, chunk_size, D_in)
+            bytes_r = bytes_flat.reshape(n_chunks, chunk_size, parent_len)
+            valid_r = valid.reshape(n_chunks, chunk_size)
+
+            def body(carry, xs, level=level, chunk_size=chunk_size, seq_len=seq_len,
+                      child_len=child_len, terminal=terminal):
+                ce_acc, pos_acc, correct_acc = carry
+                cond_chunk, bytes_chunk_flat, valid_chunk = xs
+                bytes_chunk = bytes_chunk_flat.reshape(chunk_size, seq_len, child_len)
+                cond_l = self.cond_proj[level](cond_chunk)
+                proj = self.embed_patch(level, bytes_chunk)
+                if terminal:
+                    shifted = jnp.concatenate([cond_l[:, None, :], proj[:, :-1]], axis=1)
+                    h = self.trunk_at(level).forward_remat(shifted, self.rope_base, "1.0", remat_depth,
+                                                             self.use_flash_attn[level])
+                    logits = self.head(h)
+                    targets = bytes_chunk[..., 0]
+                    logp = jax.nn.log_softmax(logits, axis=-1)
+                    nll = -jnp.take_along_axis(logp, targets[..., None], axis=-1).squeeze(-1)
+                    row_valid = valid_chunk[:, None].astype(nll.dtype)
+                    ce_acc = ce_acc + (nll * row_valid).sum()
+                    pos_acc = pos_acc + row_valid.sum() * seq_len
+                    correct_acc = correct_acc + ((logits.argmax(-1) == targets) * row_valid).sum()
+                    return (ce_acc, pos_acc, correct_acc), None
+                else:
+                    seq = jnp.concatenate([cond_l[:, None, :], proj], axis=1)
+                    h = self.trunk_at(level).forward_remat(seq, self.rope_base, "1.0", remat_depth,
+                                                             self.use_flash_attn[level])
+                    cond_next = h[:, :-1, :].reshape(chunk_size * seq_len, -1)
+                    bytes_next = bytes_chunk.reshape(chunk_size * seq_len, child_len)
+                    valid_next = jnp.repeat(valid_chunk, seq_len)
+                    return (ce_acc, pos_acc, correct_acc), (cond_next, bytes_next, valid_next)
+
+            init = (jnp.zeros(()), jnp.zeros(()), jnp.zeros(()))
+
+            def run_level(cond_r, bytes_r, valid_r):
+                return jax.lax.scan(body, init, (cond_r, bytes_r, valid_r))
+
+            if level_ckpt:
+                # Checkpoint this level's ENTIRE scan (not per-transformer-layer like
+                # forward_remat/remat_depth -- this is a NEW axis of checkpointing, across levels).
+                # Only safe to try now that _train_flat is non-nested -- CLAUDE.md documents that
+                # combining jax.checkpoint with the OLD nested-scan-inside-scan structure crashed
+                # the XLA compiler outright; a checkpoint around one standalone (non-nested) scan
+                # is the ordinary, well-supported usage. Diagnostic for the ~156G fixed cost that
+                # persisted regardless of micro_batch even after de-nesting -- consistent with that
+                # cost being LIVE per-level activations kept for backprop, which per-level
+                # checkpointing (recompute forward during backward instead of storing) targets
+                # directly.
+                (ce_l, pos_l, correct_l), ys = jax.checkpoint(run_level)(cond_r, bytes_r, valid_r)
+            else:
+                (ce_l, pos_l, correct_l), ys = run_level(cond_r, bytes_r, valid_r)
+            ce_total, pos_total, correct_total = ce_total + ce_l, pos_total + pos_l, correct_total + correct_l
+            if terminal:
+                break
+            cond_chunks, bytes_chunks, valid_chunks = ys
+            cond = cond_chunks.reshape(n_chunks * chunk_size * seq_len, -1)
+            bytes_flat = bytes_chunks.reshape(n_chunks * chunk_size * seq_len, child_len)
+            valid = valid_chunks.reshape(n_chunks * chunk_size * seq_len)
+        return ce_total, pos_total, correct_total
+
+    def __call__(self, byte_seq: jax.Array, remat_time: str = "1.0", remat_depth: str = "1.0",
+                 micro_batch: int = 8192,
+                 use_scan: bool = os.environ.get("DISABLE_SCAN") != "1",
+                 flat_scan: bool = os.environ.get("FLAT_SCAN") == "1") -> tuple[jax.Array, dict]:
+        """byte_seq: [B, n_timesteps, patch_len_list[0]] int32 -- B independent FILE CHUNKS
+        (weight-shared, never attending across each other), each a training window's own
+        level-0 sequence (n_timesteps = that many patch_len_list[0]-byte patches; see config.py's
+        TrainConfig docstring for the patch-vs-byte distinction). B=1 (the whole file as one
+        chunk) is the long-standing special case -- see train.py's make_file_chunks/TrainConfig's
+        file_chunk_bytes docstring for the general B>1 case (real minibatch training over chunks
+        of one file, not the whole file every step). Level 0 is a real causal AR transformer over
+        ALL n_timesteps at once PER CHUNK -- teacher-forced, fully parallel, one causally-masked
+        attention computation per chunk (see module docstring: no recurrence, no state carry;
+        chunks are independent along the batch axis, ordinary batched attention already keeps
+        them from attending to each other -- no extra masking needed). remat_time/remat_depth
+        control jax.checkpoint granularity for level 0's forward (see Trunk.forward_remat) --
+        exact gradients either way, just a memory/recompute tradeoff. Levels 1+ recurse via
+        _train_recurse (see its docstring): LOCAL attention within one parent patch's own
+        children, processed in micro_batch-sized jax.lax.scan chunks (not one Bcur-sized batch --
+        Bcur reaches B*n_raw_bytes-per-chunk by the terminal level, which can overflow TPU HBM at
+        real corpus scale) with remat_depth checkpointing applied at every level, not just level 0.
+        Returned loss/metrics are AGGREGATE over the whole batch B (sum of nats / sum of
+        positions) -- call with B=1 (a single chunk) to get that one chunk's own bpb, which is
+        exactly what train.py's per-epoch full-pass evaluation does to report per-chunk numbers."""
+        B, n_timesteps, P0 = byte_seq.shape
+
+        # -- Level 0: full-sequence causal attention per chunk, teacher-forced, root_cond fed
+        # unprojected and broadcast across the B independent chunks --
+        proj0 = self.embed_patch(0, byte_seq)                                          # [B, n_timesteps, D0]
+        root = jnp.broadcast_to(self.root_cond, (B, 1, self.root_cond.shape[-1]))      # [B, 1, D0]
+        shifted0 = jnp.concatenate([root, proj0[:, :-1]], axis=1)                       # [B, n_timesteps, D0]
+        h0 = self.trunk_at(0).forward_remat(shifted0, self.rope_base, remat_time, remat_depth,
+                                             self.use_flash_attn[0])                     # [B, n_timesteps, D0]
+        cond = h0.reshape(B * n_timesteps, -1)                                          # flatten (B,T)->rows for levels 1+
+
+        # -- Levels 1+: LOCAL to one parent patch's children, chunked over B*n_timesteps parents --
+        byte_seq_flat = byte_seq.reshape(B * n_timesteps, P0)
+        valid0 = jnp.ones((B * n_timesteps,), dtype=jnp.bool_)
+        if flat_scan:
+            total_ce_nats, total_positions, total_correct = self._train_flat(
+                cond, byte_seq_flat, valid0, remat_depth, micro_batch)
+        else:
+            total_ce_nats, total_positions, total_correct = self._train_recurse(
+                1, cond, byte_seq_flat, valid0, remat_depth, micro_batch, use_scan)
 
         mean_loss = total_ce_nats / total_positions
         metrics = {
             "loss": mean_loss, "bpb": mean_loss / math.log(2),
             "byte_acc": total_correct / total_positions,
+            "ce_nats": total_ce_nats, "positions": total_positions, "correct": total_correct,
         }
         return mean_loss, metrics
 
@@ -538,38 +885,73 @@ class ByteFractalGen(eqx.Module):
         masking) that isn't offset by any actual FLOP savings. Simple recompute (concatenate the
         real, actually-short-so-far sequence and rerun the trunk) is at least as fast and simpler.
         Bounded, small attention -- no remat/KV-cache machinery needed here, only level 0 spans a
-        long, growing sequence."""
-        B = cond.shape[0]
-        seq_len = self.seq_lens[level]
-        child_len = self.cfg.patch_len_list[level]
-        cond_l = self.cond_proj[level](cond)                  # [B, D]
-        out = [[] for _ in range(B)]
-        seq_in = [cond_l[:, None, :]]                          # [B, 1, D]
-        if child_len == 1:
-            for i in range(seq_len):
-                x = jnp.concatenate(seq_in, axis=1)
-                h = _trunk_forward_jit(self.trunk_at(level), x, self.rope_base)
-                logits = self.head(h[:, -1, :])                 # [B, 256]
-                syms = symbol_fn(logits)                        # list[int], len B
-                for b in range(B):
-                    out[b].append(syms[b])
-                if i < seq_len - 1:
-                    sym_t = jnp.array(syms, dtype=jnp.int32)[:, None]   # [B, 1]
-                    seq_in.append(self.embed_patch(level, sym_t)[:, None, :])
-        else:
-            for i in range(seq_len):
-                x = jnp.concatenate(seq_in, axis=1)
-                h = _trunk_forward_jit(self.trunk_at(level), x, self.rope_base)
-                cond_i = h[:, -1, :]                            # [B, D] CONTINUOUS, passed to child unchanged
-                child_bytes = self._gen_children(level + 1, cond_i, symbol_fn)   # list of B lists, len child_len
-                for b in range(B):
-                    out[b].extend(child_bytes[b])
-                if i < seq_len - 1:
-                    child_t = jnp.array(child_bytes, dtype=jnp.int32)   # [B, child_len]
-                    seq_in.append(self.embed_patch(level, child_t)[:, None, :])
-        return out
+        long, growing sequence.
 
-    def generate(self, n_timesteps: int, symbol_fn) -> list[int]:
+        ITERATIVE, not Python-recursive: an explicit stack of frames stands in for the call stack
+        (each frame = one in-progress "call" to this method, at some level, paused mid-loop while
+        its child subtree is being generated). Produces the EXACT SAME sequence of
+        _trunk_forward_jit/symbol_fn calls, in the EXACT SAME order, as the old recursive version
+        -- this is a pure control-flow rewrite, not a behavior change (verified bit-exact against
+        the prior recursive implementation). Done specifically so this can later be driven by
+        jax.lax.scan/fori_loop/while_loop (which need flat, statically-bounded iteration, not
+        Python call-stack recursion of varying depth) instead of a bare Python loop -- not yet
+        done here, this step only removes the recursion as a blocker for that."""
+        def make_frame(lvl: int, c: jax.Array) -> dict:
+            b = c.shape[0]
+            cond_l = self.cond_proj[lvl](c)                     # [b, D]
+            return {
+                "level": lvl,
+                "seq_len": self.seq_lens[lvl],
+                "child_len": self.cfg.patch_len_list[lvl],
+                "seq_in": [cond_l[:, None, :]],                  # [b, 1, D], grows each step
+                "i": 0,
+                "out": [[] for _ in range(b)],
+                "B": b,
+            }
+
+        stack = [make_frame(level, cond)]
+        child_result: list[list[int]] | None = None   # set when a child frame just finished
+
+        while stack:
+            frame = stack[-1]
+
+            if child_result is not None:
+                # Resuming a frame that just recursed: fold the child's output in, advance i.
+                for b in range(frame["B"]):
+                    frame["out"][b].extend(child_result[b])
+                if frame["i"] < frame["seq_len"] - 1:
+                    child_t = jnp.array(child_result, dtype=jnp.int32)   # [B, child_len]
+                    frame["seq_in"].append(self.embed_patch(frame["level"], child_t)[:, None, :])
+                frame["i"] += 1
+                child_result = None
+                if frame["i"] >= frame["seq_len"]:
+                    stack.pop()
+                    child_result = frame["out"]
+                    continue
+
+            i = frame["i"]
+            x = jnp.concatenate(frame["seq_in"], axis=1)
+            h = _trunk_forward_jit(self.trunk_at(frame["level"]), x, self.rope_base)
+
+            if frame["child_len"] == 1:
+                logits = self.head(h[:, -1, :])                  # [B, 256]
+                syms = symbol_fn(logits)                         # list[int], len B
+                for b in range(frame["B"]):
+                    frame["out"][b].append(syms[b])
+                if i < frame["seq_len"] - 1:
+                    sym_t = jnp.array(syms, dtype=jnp.int32)[:, None]   # [B, 1]
+                    frame["seq_in"].append(self.embed_patch(frame["level"], sym_t)[:, None, :])
+                frame["i"] += 1
+                if frame["i"] >= frame["seq_len"]:
+                    stack.pop()
+                    child_result = frame["out"]
+            else:
+                cond_i = h[:, -1, :]                              # [B, D] CONTINUOUS, passed to child unchanged
+                stack.append(make_frame(frame["level"] + 1, cond_i))
+
+        return child_result
+
+    def generate(self, n_timesteps: int, symbol_fn, batch_size: int = 1) -> list[list[int]]:
         """Generate n_timesteps level-0 patches (patch_len_list[0] bytes each -- n_timesteps
         patches, NOT n_timesteps bytes) autoregressively -- the whole point being that level 0's
         causal attention genuinely spans every already-decoded timestep (see module/class
@@ -579,33 +961,52 @@ class ByteFractalGen(eqx.Module):
         init_kv_cache/step docstrings) -- each new timestep is O(t) (attends 1 query against t
         cached keys) instead of recomputing full causal attention over the whole growing
         sequence from scratch (O(t^2) per step, O(n_timesteps^3) total, the old approach). The
-        step function is JIT-compiled ONCE (cache shape is constant across steps -- only the
-        traced position `t` changes) and reused for the entire run.
+        step function (_trunk_step_jit, MODULE level -- see its docstring for a real bug found
+        and fixed this session: a local closure here compiled once per generate() CALL, not once
+        per process, since JAX's jit cache keys on the wrapped callable's identity and a local
+        closure is a new object every call) is JIT-compiled ONCE PER PROCESS per distinct
+        (n_timesteps, batch_size) and reused for every generate() call with that shape.
 
-        Returns the flat list of all decoded bytes (n_timesteps * patch_len_list[0], the last
-        timestep possibly containing padding -- trimmed by the caller via n_raw_bytes)."""
+        batch_size>1: generate batch_size INDEPENDENT chains in LOCKSTEP -- e.g. batch_size
+        independent file chunks (see train.py's make_file_chunks), never attending across each
+        other (level 0's KV-cache batch dim is batch_size; _gen_children is already
+        batch-generic -- its `cond` argument's leading dim IS the batch, so this needed no changes
+        there at all, only here). Still fully sequential in TIME within each chain (real
+        autoregression, unavoidable -- future bytes genuinely unknown), but the batch_size chains
+        advance together, so the dominant per-timestep cost (the deep, Python-dispatched
+        _gen_children recursion -- levels 1+, O(seq_len) individual calls per timestep,
+        independent of batch_size) is now paid ONCE per timestep for the WHOLE batch instead of
+        once per chain -- a real, measured ~Bx reduction in total dispatch count, not just
+        smaller-per-call overhead. symbol_fn now receives logits shaped [batch_size, 256] and
+        must return a list of batch_size symbols, one per chain (e.g. decompress.py uses
+        batch_size separate RCDecoder objects, one per chain's own independent range-coder
+        state -- "stateful between chains" is handled by keeping that many separate decoder
+        objects, not by the model, which has no state of its own beyond the KV cache).
+
+        Returns a list of batch_size flat byte-lists (each n_timesteps * patch_len_list[0] long,
+        the last timestep possibly containing padding -- trimmed by the caller via n_raw_bytes).
+        batch_size=1 (default) still returns a length-1 list -- callers that only ever used
+        batch_size=1 (e.g. collect_logits()) already index/ignore the return value in a way
+        that's unaffected by this."""
         trunk0 = self.trunk_at(0)
-        kv_cache = trunk0.init_kv_cache(n_timesteps)
+        kv_cache = trunk0.init_kv_cache(n_timesteps, batch=batch_size)
         rope_base = self.rope_base
 
-        @eqx.filter_jit
-        def step_fn(x_t, t_arr, kv_cache):
-            return trunk0.step(x_t, t_arr, rope_base, kv_cache)
+        x_t = jnp.broadcast_to(self.root_cond, (batch_size, 1, self.root_cond.shape[-1]))   # [B, 1, D0]
+        all_bytes: list[list[int]] = [[] for _ in range(batch_size)]
 
-        x_t = self.root_cond[None, :, :]      # [1, 1, D0]
-        all_bytes: list[int] = []
+        for t in tqdm(range(n_timesteps), desc="generate (level-0 timesteps)", unit="timestep"):
+            h_t, kv_cache = _trunk_step_jit(trunk0, x_t, jnp.asarray(t, dtype=jnp.int32), rope_base, kv_cache)
+            cond_t = h_t[:, -1, :]            # [B, D0] -- condition for THIS timestep's children
 
-        for t in range(n_timesteps):
-            h_t, kv_cache = step_fn(x_t, jnp.asarray(t, dtype=jnp.int32), kv_cache)
-            cond_t = h_t[:, -1, :]            # [1, D0] -- condition for THIS timestep's children
-
-            child_bytes = self._gen_children(1, cond_t, symbol_fn)   # list of 1 list, len P0
-            patch_bytes = child_bytes[0]
-            all_bytes.extend(patch_bytes)
+            child_bytes = self._gen_children(1, cond_t, symbol_fn)   # list of B lists, each len P0
+            for b in range(batch_size):
+                all_bytes[b].extend(child_bytes[b])
 
             if t < n_timesteps - 1:
-                proj_next = self.embed_patch(0, jnp.asarray(patch_bytes, dtype=jnp.int32)[None, :])   # [1, D0]
-                x_t = proj_next[:, None, :]   # [1, 1, D0]
+                patch_batch = jnp.array(child_bytes, dtype=jnp.int32)          # [B, P0]
+                proj_next = self.embed_patch(0, patch_batch)                    # [B, D0]
+                x_t = proj_next[:, None, :]   # [B, 1, D0]
         return all_bytes
 
     def collect_logits(self, byte_seq: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -644,6 +1045,47 @@ class ByteFractalGen(eqx.Module):
 
         self.generate(n_timesteps, symbol_fn)
         return jnp.array(flat_symbols, dtype=jnp.int32), jnp.stack(flat_logits)
+
+    def collect_logits_batched(self, byte_seq: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """Batched-across-CHUNKS sibling of collect_logits() -- compress.py's chunk_batch_size>1
+        path. byte_seq: [B, n_timesteps, patch_len_list[0]] -- B independent file chunks (see
+        train.py's make_file_chunks), teacher-forced through generate(batch_size=B) exactly like
+        collect_logits() teacher-forces through generate(batch_size=1).
+
+        THIS IS NOT THE SAME KIND OF BATCHING collect_logits()'s docstring warns is unsafe.
+        That warning is about collapsing generate()'s SEQUENTIAL timestep loop into one
+        non-sequential call (_gen_children with B=n_timesteps, skipping the loop entirely by
+        exploiting teacher-forcing) -- a STRUCTURALLY DIFFERENT computation from generate()'s own
+        step-by-step reference, which only approximately matched it (~1e-6 divergence, enough to
+        flip ~1.6% of quantized CDF bins at realistic scale). This method changes NOTHING about
+        that: the timestep loop inside generate() stays exactly sequential, one t at a time: only
+        the BATCH axis (independent chunks, not timesteps) grows from 1 to B. Compress
+        (teacher-forced, this method) and decompress (real decoding, decompress.py's own
+        generate(batch_size=B) call) both run the IDENTICAL generate()/_gen_children/
+        _trunk_step_jit code path at the SAME batch_size -- same code, same shapes, same weights
+        -- so their logits are bit-identical BY CONSTRUCTION, exactly like batch_size=1 already
+        relies on today. batch_size becomes a correctness invariant of the same kind as
+        device/dtype/file_chunk_bytes (compress.py records it in meta.json, decompress.py reads
+        it back automatically -- see their module docstrings).
+
+        Returns (symbols[B, n_timesteps*P0], logits[B, n_timesteps*P0, 256])."""
+        B, n_timesteps, P0 = byte_seq.shape
+        true_bytes = np.asarray(jax.device_get(byte_seq)).reshape(B, n_timesteps * P0)   # [B, T*P0]
+        flat_logits_per_chain = [[] for _ in range(B)]
+        pos_counter = [0]
+
+        def symbol_fn(logits_batch):   # [B, 256]
+            p = pos_counter[0]
+            for b in range(B):
+                flat_logits_per_chain[b].append(logits_batch[b])
+            syms = [int(true_bytes[b, p]) for b in range(B)]
+            pos_counter[0] += 1
+            return syms
+
+        self.generate(n_timesteps, symbol_fn, batch_size=B)
+        logits = jnp.stack([jnp.stack(flat_logits_per_chain[b]) for b in range(B)])   # [B, T*P0, 256]
+        symbols = jnp.asarray(true_bytes, dtype=jnp.int32)                              # [B, T*P0]
+        return symbols, logits
 
     def cast_dtype(self, dtype) -> "ByteFractalGen":
         """Returns a copy of this model with every inexact (float) array leaf cast to `dtype`

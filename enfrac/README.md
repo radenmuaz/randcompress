@@ -52,35 +52,33 @@ Unknown field names in a config file raise immediately (typo protection) rather 
 silently ignored. `enfrac_zero.train`/`.compress` take the same `--config` flag against
 their own (HiRA-free) `ModelConfig` -- point them at `enfrac_zero/configs/*.py` instead.
 
-## Multi-device (TPU pod slice / multi-GPU) training
+## Single-device training (no pmap currently)
 
-`enfrac.train.train()` auto-detects `jax.local_device_count()` and switches from the default
-single-chunk-per-step path to a `jax.pmap`'d data-parallel step when more than one device is
-visible -- no flag needed, and `enfrac_zero.train` inherits this for free since it calls the
-same `train()`. Each step then consumes `n_devices * per_device_batch` chunks (`per_device_batch`
-is a `TrainConfig` field, default `1`): every device computes its own gradient on its shard,
-`jax.lax.pmean` averages them across devices, and every replica applies the identical averaged
-update -- the standard "replicate params, average grads" recipe. Verified locally by simulating
-4 CPU devices (`XLA_FLAGS=--xla_force_host_platform_device_count=4`) and diffing every device's
-trainable leaves after 50 steps: **zero drift**, confirming replicas stay bit-identical rather
-than silently diverging.
-
-```bash
-# on a TPU host, e.g. a v4-8 (4 chips visible to jax.local_devices()):
-uv run python -m enfrac.train --config enfrac/configs/quran_uthmani.py \
-    --log_dir logs/enfrac/quran_uthmani --per_device_batch 2   # 4 devices * 2 = batch of 8/step
-```
+**Correction, this no longer describes the current code**: an earlier version of this section
+documented an auto-detecting `jax.pmap`'d data-parallel training path (`per_device_batch`,
+`jax.lax.pmean` gradient averaging across devices). That code is gone -- `enfrac.train.train()` is
+now a single `eqx.filter_jit` call with no `jax.pmap`/sharding anywhere (verified by grep: zero
+references to `pmap`/`per_device_batch`/`local_device_count` in `enfrac/`/`enfrac_zero/`). On a
+multi-chip host (e.g. a v4-8 with 4 `TpuDevice`s visible via `jax.local_devices()`), training
+currently runs on only the one device JAX places arrays on by default -- the other chips are idle.
+See `CLAUDE.md`'s "Single-device training" section for the same note plus a related real bug
+(training silently falling back to CPU when `jax[tpu]` isn't installed, with only a warning, not
+an error) and "Training-time memory chunking at real corpus scale" for how large single-device
+training runs (enwik8/9) are kept within one TPU chip's HBM despite processing the whole file's
+recursion in one `eqx.filter_jit` call.
 
 Installing JAX for an actual TPU host (this repo's `pyproject.toml` pins plain `jax`/`jaxlib`,
-the CPU wheels) needs the TPU extra instead: `pip install -U "jax[tpu]"` (or the pinned version
-matching this repo's `jax==0.11.1`) -- see https://docs.jax.dev/en/latest/installation.html for
-the current install command, which changes across JAX releases.
+the CPU wheels) needs the TPU extra instead:
+`uv pip install -U "jax[tpu]" -f https://storage.googleapis.com/jax-releases/libtpu_releases.html`
+-- see https://docs.jax.dev/en/latest/installation.html for the current install command, which
+changes across JAX releases. **Install this before the first training run, not just before
+compress/decompress** -- see the CLAUDE.md note above for why.
 
 **compress.py/decompress.py stay single-device on purpose.** Their cost is dominated by many
 small host<->device dispatches from `generate()`'s python-level autoregressive recursion (see
 `model.py`'s determinism-contract docstring for why the recursion can't be batched away --
 bit-exactness with the training-time computation is required for range coding), not raw FLOPs,
-so `pmap`-ing them would need a much larger rewrite (sharding *inside* the recursion, across
+so sharding them would need a much larger rewrite (sharding *inside* the recursion, across
 levels with different batch sizes) for comparatively little payoff at the model sizes this
 package targets.
 

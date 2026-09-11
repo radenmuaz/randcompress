@@ -48,6 +48,32 @@ class TrainConfig:
                                         # not bytes) per remat group
     remat_depth: str = "1.0"          # fraction OR exact count of transformer layers per remat group
     n_epochs: int = 5                 # full passes over the whole file
+    micro_batch: int = 8192           # levels-1+ jax.lax.scan chunk size (rows) -- see
+                                        # model.py's ByteFractalGen._train_recurse docstring.
+                                        # Bounds peak memory independent of file size; only
+                                        # matters (and only needs lowering) once a level's total
+                                        # patch count exceeds a few million (real enwik8/9 scale).
+    file_chunk_bytes: int | None = None   # split the file into independent, WEIGHT-SHARED chunks
+                                        # of this many bytes each (see train.py's
+                                        # make_file_chunks/resolve_file_chunk_bytes) -- at most
+                                        # one of file_chunk_bytes/file_chunk_count may be set; both
+                                        # None (the default) means exactly one chunk = the whole
+                                        # file, byte-for-byte the same as this codebase's behavior
+                                        # before file chunking existed. Must be a multiple of
+                                        # patch_len_list[0] (auto-rounded up, see
+                                        # resolve_file_chunk_bytes). Chunks never attend across
+                                        # each other -- only level 0's OWN (now much shorter)
+                                        # sequence length shrinks; levels 1+ are unaffected.
+    file_chunk_count: int | None = None   # alternative to file_chunk_bytes: split into (about)
+                                        # this many chunks instead of a fixed byte size -- at most
+                                        # one of the two may be set.
+    chunk_batch_size: int = 16        # when file_chunk_bytes/file_chunk_count>1: how many chunks
+                                        # to sample WITH REPLACEMENT per training step (ordinary
+                                        # minibatch SGD, not epoch-exhaustive) -- capped at 128 and
+                                        # at n_file_chunks regardless of this setting. Every EPOCH
+                                        # (not every step) a separate full pass walks every chunk
+                                        # once (B=1, no gradient) to report each chunk's own bpb
+                                        # and the exact whole-file bpb -- see train.py's train().
     seed: int = 0
 
 
@@ -89,11 +115,17 @@ def build_config(cls, file_path: str | None, file_names: tuple[str, ...], overri
 def add_dataclass_args(parser: argparse.ArgumentParser, cls) -> None:
     """Adds one --<field> per dataclass field, default=None (so build_config can tell 'unset'
     apart from 'explicitly passed'), type inferred from the field's default's type (tuples are
-    parsed as comma-separated; bools accept true/false)."""
+    parsed as comma-separated; bools accept true/false). A field whose default is itself None
+    (e.g. `file_chunk_bytes: int | None = None`) can't be type-inferred from the default's
+    runtime type -- REAL BUG found and fixed this session (a None-default int|None field silently
+    fell through to type=str, so `--file_chunk_bytes 128` arrived as the STRING "128", crashing
+    the first `>= 1` comparison downstream) -- falls back to inspecting the field's own type
+    ANNOTATION STRING (e.g. "int | None", "bool | None") for these None-default cases instead."""
     for f in dataclasses.fields(cls):
         if f.name in {a.dest for a in parser._actions}:
             continue  # already added (e.g. shared between ModelConfig/TrainConfig)
         default = f.default
+        type_str = f.type if isinstance(f.type, str) else ""
         if isinstance(default, bool) or f.type == "bool":
             parser.add_argument(f"--{f.name}", type=lambda x: str(x).lower() != "false", default=None)
         elif isinstance(default, tuple):
@@ -101,6 +133,12 @@ def add_dataclass_args(parser: argparse.ArgumentParser, cls) -> None:
         elif isinstance(default, int):
             parser.add_argument(f"--{f.name}", type=int, default=None)
         elif isinstance(default, float):
+            parser.add_argument(f"--{f.name}", type=float, default=None)
+        elif default is None and "bool" in type_str:
+            parser.add_argument(f"--{f.name}", type=lambda x: str(x).lower() != "false", default=None)
+        elif default is None and "int" in type_str:
+            parser.add_argument(f"--{f.name}", type=int, default=None)
+        elif default is None and "float" in type_str:
             parser.add_argument(f"--{f.name}", type=float, default=None)
         else:
             parser.add_argument(f"--{f.name}", type=str, default=None)

@@ -9,12 +9,12 @@ description = "Random compression utilities"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [{name = "Raden Muaz Munim"}]
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "torch",
     "numpy",
     "tqdm",
-    "jax>=0.6.2",
+    "jax>=0.11.1",
     "equinox>=0.13.8",
     "optax>=0.2.8",
 ]
@@ -22,9 +22,8 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 
 [project.optional-dependencies]
