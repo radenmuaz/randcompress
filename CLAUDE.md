@@ -142,6 +142,21 @@ If you ever add a new "must match" parameter to this pipeline, follow the same p
 into `meta.json` at compress time, read it back automatically at decompress time, don't expose a
 decode-side flag that could silently disagree with what was actually used to encode.
 
+## Operational rule: `queued-resources`, never the direct `tpu-vm` API
+
+This project's TPUs are provisioned under the TRC (TPU Research Cloud) program. **Always** use
+`gcloud compute tpus queued-resources ssh <tpu-name> --project raden-tpu --zone <zone>
+[--command=...]` (and `queued-resources scp` for file transfer) — **never**
+`gcloud compute tpus tpu-vm ssh/scp <node-id>` (the direct Cloud TPU API), even though it reaches
+the same VM and works. Per the user: TRC's terms are understood (not independently verified, but
+treated as a hard constraint regardless) to require `queued-resources` specifically to avoid
+billing/quota risk. The **queued-resource name** (`tpu5`, `tpu6`, ...) is distinct from the
+underlying **node-id** (`tpunode5`, `tpunode6`, ...) — `queued-resources ssh`/`scp` take the
+`tpu<N>` name, not the node-id; see `TPU.md` for the provisioning/list/describe/delete commands.
+Direct `ssh -i ~/.ssh/google_compute_engine muaz@<external-ip>` to the VM (see below) is still
+fine for speed — this constraint is specifically about which `gcloud` subcommand family is used
+to reach the TPU, not about avoiding the external IP once key access is established.
+
 ## Operational lesson: TPU jobs need `tmux`, not backgrounded SSH
 
 Queued-resource TPU VMs (`gcloud compute tpus queued-resources ...`) drop idle SSH connections
@@ -174,17 +189,17 @@ mean the remote job died, only that the local multiplexed socket did. Re-issue t
 fresh (a new connection reconnects fine); the tmux session on the far end is unaffected.
 
 **After launching (or relaunching) a TPU training run, always give the user the direct SSH +
-tmux-attach one-liner for it** — `gcloud compute tpus tpu-vm ssh` is slow (re-resolves/auths every
-call); a direct `ssh -i ~/.ssh/google_compute_engine muaz@<external IP> -t "tmux attach -t
-<session>"` is instant and is what the user actually wants to run themselves. The `-i
+tmux-attach one-liner for it** — `gcloud compute tpus queued-resources ssh` is slow (re-resolves/
+auths every call); a direct `ssh -i ~/.ssh/google_compute_engine muaz@<external IP> -t "tmux
+attach -t <session>"` is instant and is what the user actually wants to run themselves. The `-i
 ~/.ssh/google_compute_engine` key is REQUIRED -- plain `ssh muaz@<ip>` fails, since that's not the
 user's default key. This key is auto-generated and its public half auto-pushed to the instance's
-metadata the first time `gcloud compute tpus tpu-vm ssh`/`queued-resources ssh` connects to that
-node (see TPU_WORKFLOW.md) -- direct ssh only works AFTER that first gcloud-wrapped connection has
-happened at least once per node. Get the external IP with `gcloud compute tpus tpu-vm describe
-<node> --zone=... --project=... --format="value(networkEndpoints[0].accessConfig.externalIp)"`
-once per node (IPs are stable across a node's lifetime unless it's reimaged/recreated). Give it
-plain, one line per node, no table.
+metadata the first time `gcloud compute tpus queued-resources ssh` connects to that node (see
+TPU_WORKFLOW.md) -- direct ssh only works AFTER that first gcloud-wrapped connection has happened
+at least once per node. Get the external IP with `gcloud compute tpus queued-resources describe
+<tpu-name> --zone=... --project=...` (read the external IP from its output) once per node (IPs
+are stable across a node's lifetime unless it's reimaged/recreated). Give it plain, one line per
+node, no table.
 
 ## Datasets
 

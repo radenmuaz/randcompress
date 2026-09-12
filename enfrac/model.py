@@ -650,19 +650,14 @@ class ByteFractalGen(eqx.Module):
             emb = self.byte_embed(byte_patch[..., 0])          # [..., Ebyte]
             return self.patch_in[level](emb)
         if self.patch_in_scheme[level] == "mean_pool":
-            pooled = self.byte_embed(byte_patch).mean(axis=-2)   # [..., Ebyte] -- direct, unchunked
+            leading = 1
+            for s in byte_patch.shape[:-1]:
+                leading *= s
+            if leading * P > _MEAN_POOL_TARGET_ELEMENTS:
+                pooled = self._chunked_mean_pool(byte_patch, P)   # [..., Ebyte]
+            else:
+                pooled = self.byte_embed(byte_patch).mean(axis=-2)   # [..., Ebyte] -- direct, small enough
             return self.patch_in[level].proj(pooled)
-            # DISABLED (temporary, diagnostic -- see _train_recurse's use_scan ablation for the
-            # sibling experiment): _chunked_mean_pool's own internal jax.lax.scan is one more
-            # nested-scan layer inside _train_recurse's per-level scan -- testing whether skipping
-            # it (now that file chunking bounds `leading*P` far below the pre-chunking scale this
-            # was written for) helps the unresolved scan-fusion OOM.
-            # leading = 1
-            # for s in byte_patch.shape[:-1]:
-            #     leading *= s
-            # if leading * P > _MEAN_POOL_TARGET_ELEMENTS:
-            #     pooled = self._chunked_mean_pool(byte_patch, P)   # [..., Ebyte]
-            #     return self.patch_in[level].proj(pooled)
         emb = self.byte_embed(byte_patch)                       # [..., P, Ebyte]
         return self.patch_in[level](emb)
 
@@ -900,7 +895,7 @@ class ByteFractalGen(eqx.Module):
     def __call__(self, byte_seq: jax.Array, remat_time: str = "1.0", remat_depth: str = "1.0",
                  micro_batch: int = 8192,
                  use_scan: bool = os.environ.get("DISABLE_SCAN") != "1",
-                 flat_scan: bool = os.environ.get("FLAT_SCAN") == "1") -> tuple[jax.Array, dict]:
+                 flat_scan: bool = os.environ.get("FLAT_SCAN") != "0") -> tuple[jax.Array, dict]:
         """byte_seq: [B, n_timesteps, patch_len_list[0]] int32 -- B independent FILE CHUNKS
         (weight-shared, never attending across each other), each a training window's own
         level-0 sequence (n_timesteps = that many patch_len_list[0]-byte patches -- see

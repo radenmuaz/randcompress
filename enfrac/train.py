@@ -282,30 +282,46 @@ def train(model, chunks: np.ndarray, lr: float, grad_clip: float, remat_time: st
             loss_v, acc_v = float(loss[0]), float(acc[0])   # every device holds the identical pmean'd value
             pbar.set_postfix(loss=f"{loss_v:.4f}", acc=f"{acc_v:.2%}")
         pbar.close()
-        trainable = jax.tree_util.tree_map(lambda x: x[0], trainable_r)   # collapse for eval below
-        opt_state = jax.tree_util.tree_map(lambda x: x[0], opt_state_r)   # collapse for checkpointing below
+        # collapse for eval/checkpointing below -- x[0] on a pmap output can still carry that
+        # array's PmapSharding (a real bug hit this session: flash attention's Pallas/Mosaic
+        # kernel lowers fine inside pmap's own REPLICATED lowering, but a later plain
+        # eqx.filter_jit call (eval_fn below) whose inputs still carry PmapSharding metadata makes
+        # XLA try to auto-partition that same kernel via the SPMD path instead, which Mosaic
+        # doesn't support -- "NotImplementedError: Mosaic kernels cannot be automatically
+        # partitioned. Please wrap the call in a shard_map." jax.device_put onto a single device
+        # strips that stale sharding, giving eval_fn a genuinely plain, single-device array.
+        single_device = jax.devices()[0]
+        trainable = jax.tree_util.tree_map(lambda x: jax.device_put(x[0], single_device), trainable_r)
+        opt_state = jax.tree_util.tree_map(lambda x: jax.device_put(x[0], single_device), opt_state_r)
 
-        # -- Full pass, every epoch: B=1 per chunk (same compiled shape reused for all of them),
-        # accumulates exact sums for the whole-file bpb. At real scale (hundreds-to-thousands of
-        # file chunks) printing every chunk every epoch is pure log spam (e.g. 1000 chunks * 20
-        # epochs = 20,000 lines) -- CHUNK_LOG_EVERY prints only a bounded number of representative
-        # chunks to stdout (~20/epoch regardless of n_file_chunks), while the full per-chunk bpb
-        # list for every chunk still goes to a compact JSON line in <log_dir>/chunk_bpbs.jsonl
-        # (one line per epoch) if log_dir is given -- nothing is lost, just not spammed to stdout.
-        chunk_log_every = max(1, n_file_chunks // 20)
+        # -- Full pass, every epoch: BATCHED (eval_group chunks per eval_fn call, not B=1 --
+        # see CLAUDE.md's audit note: a B=1-per-chunk Python loop over n_file_chunks (thousands at
+        # real scale) was measured to cost ~half of every epoch's wall time in pure per-call
+        # dispatch overhead, not compute). Groups of eval_group chunks share ONE compiled shape
+        # (reused every group, like training's chunk_batch_size shape); a smaller final group (if
+        # n_file_chunks isn't a multiple of eval_group) compiles one extra shape, once. ce_nats/
+        # positions/correct sums stay EXACT (summing a batch's aggregate == summing its rows'
+        # individual aggregates -- no precision loss from batching, only fewer Python-dispatched
+        # calls). The tradeoff: chunk_bpbs' resolution is now per-GROUP, not per-chunk (outlier
+        # detection is coarser), which is what pays for the wall-clock win.
+        eval_group = max(1, min(chunk_batch_size, n_file_chunks))
+        chunk_log_every = max(1, -(-n_file_chunks // eval_group) // 20)
         total_ce = total_pos = total_correct = 0.0
         chunk_bpbs = []
-        for c in range(n_file_chunks):
-            _, m_c = eval_fn(trainable, static, chunks_jnp[c:c + 1], remat_time, remat_depth, micro_batch)
+        g = 0
+        for start in range(0, n_file_chunks, eval_group):
+            end = min(start + eval_group, n_file_chunks)
+            _, m_c = eval_fn(trainable, static, chunks_jnp[start:end], remat_time, remat_depth, micro_batch)
             ce_c, pos_c, corr_c = float(m_c["ce_nats"]), float(m_c["positions"]), float(m_c["correct"])
             total_ce += ce_c
             total_pos += pos_c
             total_correct += corr_c
             chunk_bpb = (ce_c / pos_c) / math.log(2)
             chunk_bpbs.append(chunk_bpb)
-            if c % chunk_log_every == 0 or c == n_file_chunks - 1:
-                print(f"[epoch {epoch}/{n_epochs}]  chunk {c}/{n_file_chunks - 1}  bpb={chunk_bpb:.4f}  "
-                      f"acc={corr_c / pos_c:.2%}")
+            if g % chunk_log_every == 0 or end == n_file_chunks:
+                print(f"[epoch {epoch}/{n_epochs}]  chunks {start}-{end - 1}/{n_file_chunks - 1}  "
+                      f"bpb={chunk_bpb:.4f}  acc={corr_c / pos_c:.2%}")
+            g += 1
         whole_loss = total_ce / total_pos
         whole_acc = total_correct / total_pos
         bpb, est_rc_bytes, est_total, est_ratio = size_est(whole_loss)
